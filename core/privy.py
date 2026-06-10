@@ -1,7 +1,6 @@
 """
-Privy server-side wallet management.
-
-Docs: https://docs.privy.io/guide/server/wallets
+Privy server-side wallet management (Server Wallets API).
+Docs: https://docs.privy.io/wallets/server-wallets/api-reference
 """
 
 import httpx
@@ -24,60 +23,48 @@ class PrivyClient:
 
     async def create_wallet(self, telegram_id: int) -> dict:
         """
-        Create an embedded wallet for a user identified by their Telegram ID.
-        Returns {"user_id": str, "wallet_address": str}.
+        Create a server-controlled wallet.
+        Returns {"privy_user_id": str, "wallet_address": str}.
         """
-        async with httpx.AsyncClient() as client:
-            # 1. Create (or find) a Privy user linked to this Telegram ID
+        async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
-                f"{PRIVY_BASE_URL}/users",
-                auth=self._auth,
-                headers=self._headers,
-                json={
-                    "linked_accounts": [
-                        {
-                            "type": "custom_auth",
-                            "custom_user_id": f"tg:{telegram_id}",
-                        }
-                    ]
-                },
-            )
-            resp.raise_for_status()
-            user_data = resp.json()
-            privy_user_id: str = user_data["id"]
-
-            # 2. Create an embedded wallet for that user
-            wallet_resp = await client.post(
                 f"{PRIVY_BASE_URL}/wallets",
                 auth=self._auth,
                 headers=self._headers,
-                json={
-                    "user_id": privy_user_id,
-                    "chain_type": "ethereum",  # EVM — covers Polygon
-                },
+                json={"chain_type": "ethereum"},
             )
-            wallet_resp.raise_for_status()
-            wallet_data = wallet_resp.json()
-            wallet_address: str = wallet_data["address"]
+            if not resp.is_success:
+                log.error("privy_wallet_create_failed",
+                          status=resp.status_code, body=resp.text)
+                resp.raise_for_status()
 
-            log.info("privy_wallet_created", telegram_id=telegram_id, address=wallet_address)
-            return {"privy_user_id": privy_user_id, "wallet_address": wallet_address}
+            wallet = resp.json()
+            wallet_id: str = wallet["id"]
+            wallet_address: str = wallet["address"]
+
+            log.info("privy_wallet_created",
+                     telegram_id=telegram_id,
+                     wallet_id=wallet_id,
+                     address=wallet_address)
+
+            return {
+                "privy_user_id": wallet_id,   # store wallet_id in privy_user_id column
+                "wallet_address": wallet_address,
+            }
 
     async def sign_and_send_transaction(
         self,
-        privy_user_id: str,
+        privy_user_id: str,   # this is actually the wallet_id
         wallet_address: str,
         tx: dict,
     ) -> str:
         """
-        Ask Privy to sign and broadcast a pre-built EVM transaction.
+        Sign and broadcast a pre-built EVM transaction via Privy.
         Returns the tx hash.
-
-        tx format: {"to": str, "data": str, "value": "0x0", "chainId": 137}
         """
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
-                f"{PRIVY_BASE_URL}/wallets/{wallet_address}/rpc",
+                f"{PRIVY_BASE_URL}/wallets/{privy_user_id}/rpc",
                 auth=self._auth,
                 headers=self._headers,
                 json={
@@ -86,7 +73,11 @@ class PrivyClient:
                     "caip2": f"eip155:{settings.polymarket_chain_id}",
                 },
             )
-            resp.raise_for_status()
+            if not resp.is_success:
+                log.error("privy_tx_failed",
+                          status=resp.status_code, body=resp.text)
+                resp.raise_for_status()
+
             data = resp.json()
             tx_hash: str = data["data"]["hash"]
             log.info("tx_sent", wallet=wallet_address, tx_hash=tx_hash)
