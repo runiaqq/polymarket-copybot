@@ -15,10 +15,10 @@ def get_donor_by_address(address: str) -> dict | None:
         sb.table("donor_wallets")
         .select("*")
         .eq("address", address.lower())
-        .single()
+        .maybe_single()
         .execute()
     )
-    return res.data
+    return res.data if res else None
 
 
 def get_active_subscribers() -> list[dict]:
@@ -42,10 +42,10 @@ def get_user_by_telegram_id(telegram_id: int) -> dict | None:
         sb.table("users")
         .select("*")
         .eq("telegram_id", telegram_id)
-        .single()
+        .maybe_single()
         .execute()
     )
-    return res.data
+    return res.data if res else None
 
 
 def upsert_user(telegram_id: int) -> dict:
