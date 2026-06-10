@@ -1,0 +1,11 @@
+[build]
+builder = "dockerfile"
+
+[[services]]
+name = "api"
+dockerfilePath = "api/Dockerfile"
+healthcheckPath = "/health"
+
+[[services]]
+name = "worker"
+dockerfilePath = "worker/Dockerfile"
