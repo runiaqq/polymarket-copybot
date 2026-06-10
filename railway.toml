@@ -1,11 +1,9 @@
 [build]
-builder = "dockerfile"
-
-[[services]]
-name = "api"
+builder = "DOCKERFILE"
 dockerfilePath = "api/Dockerfile"
-healthcheckPath = "/health"
 
-[[services]]
-name = "worker"
-dockerfilePath = "worker/Dockerfile"
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
