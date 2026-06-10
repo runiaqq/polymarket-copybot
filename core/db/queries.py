@@ -1,48 +1,120 @@
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import datetime, timezone
 
-from core.db.models import DonorWallet, SubTier, User
+from core.db.session import get_supabase
 
 
-async def get_active_donor_addresses(session: AsyncSession) -> set[str]:
-    result = await session.execute(
-        select(DonorWallet.address).where(DonorWallet.active == True)  # noqa: E712
+def get_active_donor_addresses() -> set[str]:
+    sb = get_supabase()
+    res = sb.table("donor_wallets").select("address").eq("active", True).execute()
+    return {row["address"].lower() for row in res.data}
+
+
+def get_donor_by_address(address: str) -> dict | None:
+    sb = get_supabase()
+    res = (
+        sb.table("donor_wallets")
+        .select("*")
+        .eq("address", address.lower())
+        .single()
+        .execute()
     )
-    return {row[0].lower() for row in result.all()}
+    return res.data
 
 
-async def get_donor_by_address(session: AsyncSession, address: str) -> DonorWallet | None:
-    result = await session.execute(
-        select(DonorWallet).where(DonorWallet.address == address.lower())
+def get_active_subscribers() -> list[dict]:
+    sb = get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+    res = (
+        sb.table("users")
+        .select("*")
+        .neq("sub_tier", "free")
+        .gt("sub_expires_at", now)
+        .eq("copy_active", True)
+        .not_.is_("wallet_address", "null")
+        .execute()
     )
-    return result.scalar_one_or_none()
+    return res.data
 
 
-async def get_active_subscribers(session: AsyncSession) -> list[User]:
-    """Return users with an active paid subscription and copy_active=True."""
-    from datetime import datetime, timezone
-
-    now = datetime.now(timezone.utc)
-    result = await session.execute(
-        select(User).where(
-            User.sub_tier != SubTier.FREE,
-            User.sub_expires_at > now,
-            User.copy_active == True,  # noqa: E712
-            User.wallet_address != None,  # noqa: E711
-        )
+def get_user_by_telegram_id(telegram_id: int) -> dict | None:
+    sb = get_supabase()
+    res = (
+        sb.table("users")
+        .select("*")
+        .eq("telegram_id", telegram_id)
+        .single()
+        .execute()
     )
-    return list(result.scalars().all())
+    return res.data
 
 
-async def get_user_by_telegram_id(session: AsyncSession, telegram_id: int) -> User | None:
-    result = await session.execute(select(User).where(User.telegram_id == telegram_id))
-    return result.scalar_one_or_none()
+def upsert_user(telegram_id: int) -> dict:
+    sb = get_supabase()
+    existing = get_user_by_telegram_id(telegram_id)
+    if existing:
+        return existing
+    res = (
+        sb.table("users")
+        .insert({"telegram_id": telegram_id})
+        .execute()
+    )
+    return res.data[0]
 
 
-async def upsert_user(session: AsyncSession, telegram_id: int) -> User:
-    user = await get_user_by_telegram_id(session, telegram_id)
-    if not user:
-        user = User(telegram_id=telegram_id)
-        session.add(user)
-        await session.flush()
-    return user
+def update_user(telegram_id: int, data: dict) -> dict:
+    sb = get_supabase()
+    res = (
+        sb.table("users")
+        .update(data)
+        .eq("telegram_id", telegram_id)
+        .execute()
+    )
+    return res.data[0]
+
+
+def insert_trade_signal(signal: dict) -> dict:
+    sb = get_supabase()
+    res = sb.table("trade_signals").insert(signal).execute()
+    return res.data[0]
+
+
+def insert_copy_trade(trade: dict) -> dict:
+    sb = get_supabase()
+    res = sb.table("copy_trades").insert(trade).execute()
+    return res.data[0]
+
+
+def update_copy_trade(trade_id: int, data: dict) -> None:
+    sb = get_supabase()
+    sb.table("copy_trades").update(data).eq("id", trade_id).execute()
+
+
+def get_user_open_positions(user_id: int) -> list[dict]:
+    sb = get_supabase()
+    res = (
+        sb.table("copy_trades")
+        .select("*, trade_signals(*)")
+        .eq("user_id", user_id)
+        .eq("status", "confirmed")
+        .is_("pnl_usdc", "null")
+        .order("created_at", desc=True)
+        .limit(10)
+        .execute()
+    )
+    return res.data
+
+
+def get_user_pnl_stats(user_id: int) -> dict:
+    sb = get_supabase()
+    res = (
+        sb.table("copy_trades")
+        .select("size_usdc, pnl_usdc")
+        .eq("user_id", user_id)
+        .eq("status", "confirmed")
+        .execute()
+    )
+    rows = res.data
+    total = len(rows)
+    volume = sum(r["size_usdc"] or 0 for r in rows)
+    pnl = sum(r["pnl_usdc"] or 0 for r in rows)
+    return {"total": total, "volume": volume, "pnl": pnl}
