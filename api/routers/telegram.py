@@ -30,14 +30,24 @@ log = structlog.get_logger(__name__)
 def _main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("💼 Кошелёк", callback_data="wallet"),
-            InlineKeyboardButton("📊 Позиции", callback_data="positions"),
+            InlineKeyboardButton("💼 Кошелёк",  callback_data="wallet"),
+            InlineKeyboardButton("📊 Позиции",  callback_data="positions"),
         ],
         [
-            InlineKeyboardButton("💰 P&L", callback_data="pnl"),
+            InlineKeyboardButton("💰 P&L",      callback_data="pnl"),
             InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
         ],
         [InlineKeyboardButton("❓ Помощь", callback_data="help")],
+    ])
+
+
+def _wallet_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Обновить баланс", callback_data="wallet_balance"),
+            InlineKeyboardButton("💸 Вывод",           callback_data="withdraw_start"),
+        ],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
     ])
 
 
@@ -121,7 +131,9 @@ HELP_TEXT = (
     "📋 <b>Команды</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n"
     "/start — 🏠 Главное меню\n"
-    "/wallet — 💼 Кошелёк и пополнение\n"
+    "/wallet — 💼 Кошелёк, баланс, вывод\n"
+    "/balance — 💵 Быстрая проверка баланса\n"
+    "/withdraw — 💸 Вывод USDC на другой адрес\n"
     "/positions — 📊 Открытые позиции\n"
     "/pnl — 💰 Статистика P&L\n"
     "/settings — ⚙️ Настройки\n"
@@ -153,7 +165,9 @@ HELP_TEXT = (
 async def _set_commands(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("start",    "🏠 Главное меню"),
-        BotCommand("wallet",   "💼 Мой кошелёк"),
+        BotCommand("wallet",   "💼 Кошелёк и баланс"),
+        BotCommand("balance",  "💵 Проверить баланс"),
+        BotCommand("withdraw", "💸 Вывод средств"),
         BotCommand("positions","📊 Открытые позиции"),
         BotCommand("pnl",      "💰 Статистика P&L"),
         BotCommand("settings", "⚙️ Настройки"),
@@ -173,8 +187,10 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("settings",  cmd_settings))
     app.add_handler(CommandHandler("stop",      cmd_stop))
     app.add_handler(CommandHandler("resume",    cmd_resume))
+    app.add_handler(CommandHandler("balance",   cmd_balance))
+    app.add_handler(CommandHandler("withdraw",  cmd_withdraw))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    # Must be last — catches free-text input (e.g. custom position size)
+    # Must be last — catches free-text input
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     return app
 
@@ -230,6 +246,27 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _wallet_text(addr: str, balances: dict | None = None) -> str:
+    addr_short = f"{addr[:6]}…{addr[-4:]}"
+    text = (
+        f"💼 <b>Твой кошелёк</b>\n\n"
+        f"<code>{addr}</code>\n\n"
+    )
+    if balances is not None:
+        total = balances.get("total_usdc", 0)
+        matic = balances.get("matic", 0)
+        text += (
+            f"💵 Баланс USDC: <b>${total:.2f}</b>\n"
+            f"⛽️ MATIC (газ): <b>{matic:.4f}</b>\n\n"
+        )
+    text += (
+        f"🔗 <a href=\"https://polygonscan.com/address/{addr}\">Polygonscan</a>\n\n"
+        "📌 Пополняй <b>USDC</b> в сети <b>Polygon</b>.\n"
+        "⚠️ Только Polygon — не Ethereum, не BSC!"
+    )
+    return text
+
+
 async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tg_user = update.effective_user
     if not tg_user:
@@ -239,16 +276,59 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Сначала отправь /start", parse_mode="HTML")  # type: ignore[union-attr]
         return
     addr = db_user["wallet_address"]
+    from core.polygon import get_balances
+    balances = get_balances(addr)
     await update.message.reply_text(  # type: ignore[union-attr]
-        f"💼 <b>Твой кошелёк</b>\n\n"
-        f"<code>{addr}</code>\n\n"
-        f"🔗 <a href=\"https://polygonscan.com/address/{addr}\">Посмотреть на Polygonscan</a>\n\n"
-        "📌 Для пополнения переведи <b>USDC</b> в сети <b>Polygon</b> на этот адрес.\n"
-        "⚠️ Не отправляй токены из других сетей — средства будут потеряны.",
+        _wallet_text(addr, balances),
         parse_mode="HTML",
         disable_web_page_preview=True,
+        reply_markup=_wallet_kb(),
+    )
+
+
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_user = update.effective_user
+    if not tg_user:
+        return
+    db_user = get_user_by_telegram_id(tg_user.id)
+    if not db_user or not db_user.get("wallet_address"):
+        await update.message.reply_text("Сначала отправь /start", parse_mode="HTML")  # type: ignore[union-attr]
+        return
+    addr = db_user["wallet_address"]
+    msg = await update.message.reply_text("⏳ Проверяю баланс…", parse_mode="HTML")  # type: ignore[union-attr]
+    from core.polygon import get_balances
+    balances = get_balances(addr)
+    total = balances.get("total_usdc", 0)
+    matic = balances.get("matic", 0)
+    await msg.edit_text(  # type: ignore[union-attr]
+        f"💵 <b>Баланс кошелька</b>\n\n"
+        f"USDC: <b>${total:.2f}</b>\n"
+        f"MATIC: <b>{matic:.4f}</b>\n\n"
+        f"<code>{addr}</code>",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
+            InlineKeyboardButton("💸 Вывод", callback_data="withdraw_start"),
+            InlineKeyboardButton("🏠 Меню",  callback_data="menu"),
+        ]]),
+    )
+
+
+async def cmd_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_user = update.effective_user
+    if not tg_user:
+        return
+    db_user = get_user_by_telegram_id(tg_user.id)
+    if not db_user or not db_user.get("wallet_address"):
+        await update.message.reply_text("Сначала отправь /start", parse_mode="HTML")  # type: ignore[union-attr]
+        return
+    context.user_data["withdraw_step"] = "address"
+    await update.message.reply_text(  # type: ignore[union-attr]
+        "💸 <b>Вывод USDC</b>\n\n"
+        "Введи адрес кошелька Polygon для вывода:\n\n"
+        "<i>Пример: 0x1234…abcd</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена", callback_data="withdraw_cancel")
         ]]),
     )
 
@@ -389,14 +469,91 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tg_user = update.effective_user
-    if not tg_user or not context.user_data.get("awaiting_max_pos"):
+    if not tg_user:
+        return
+
+    text = (update.message.text or "").strip()  # type: ignore[union-attr]
+
+    # ── Withdraw flow ──────────────────────────────────────────────────────────
+    withdraw_step = context.user_data.get("withdraw_step")
+
+    if withdraw_step == "address":
+        from core.polygon import is_valid_address
+        if not is_valid_address(text):
+            await update.message.reply_text(  # type: ignore[union-attr]
+                "⚠️ Неверный адрес. Укажи корректный адрес Polygon (0x…).\n\nПопробуй ещё раз или нажми Отмена:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data="withdraw_cancel")
+                ]]),
+            )
+            return
+
+        context.user_data["withdraw_to"] = text
+        context.user_data["withdraw_step"] = "amount"
+
+        db_user = get_user_by_telegram_id(tg_user.id) or {}
+        addr = db_user.get("wallet_address", "")
+
+        from core.polygon import get_balances
+        balances = get_balances(addr) if addr else {}
+        total = balances.get("total_usdc", 0)
+
+        await update.message.reply_text(  # type: ignore[union-attr]
+            f"💵 <b>Сколько USDC вывести?</b>\n\n"
+            f"Баланс: <b>${total:.2f} USDC</b>\n"
+            f"На адрес: <code>{text[:10]}…{text[-6:]}</code>\n\n"
+            "Введи сумму (например: <code>25</code>):",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data="withdraw_cancel")
+            ]]),
+        )
+        return
+
+    if withdraw_step == "amount":
+        amount_text = text.replace("$", "").replace(",", ".")
+        try:
+            amount = float(amount_text)
+        except ValueError:
+            await update.message.reply_text(  # type: ignore[union-attr]
+                "⚠️ Неверный формат. Введи число, например: <code>25</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        if amount < 1:
+            await update.message.reply_text("⚠️ Минимум <b>$1 USDC</b>", parse_mode="HTML")  # type: ignore[union-attr]
+            return
+
+        context.user_data["withdraw_amount"] = amount
+        context.user_data["withdraw_step"] = "confirm"
+        to_addr = context.user_data.get("withdraw_to", "")
+
+        await update.message.reply_text(  # type: ignore[union-attr]
+            f"📋 <b>Подтверди вывод:</b>\n\n"
+            f"💵 Сумма: <b>${amount:.2f} USDC</b>\n"
+            f"📬 На адрес: <code>{to_addr}</code>\n"
+            f"🌐 Сеть: <b>Polygon</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Подтвердить", callback_data="withdraw_confirm"),
+                    InlineKeyboardButton("❌ Отмена",      callback_data="withdraw_cancel"),
+                ]
+            ]),
+        )
+        return
+
+    # ── Custom position size ───────────────────────────────────────────────────
+    if not context.user_data.get("awaiting_max_pos"):
         return
 
     context.user_data["awaiting_max_pos"] = False
-    text = (update.message.text or "").strip().replace("$", "").replace(",", ".")
+    clean = text.replace("$", "").replace(",", ".")
 
     try:
-        val = float(text)
+        val = float(clean)
     except ValueError:
         await update.message.reply_text(  # type: ignore[union-attr]
             "⚠️ Неверный формат. Введи число, например: <code>75</code>",
@@ -405,16 +562,10 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if val < 5:
-        await update.message.reply_text(  # type: ignore[union-attr]
-            "⚠️ Минимальное значение — <b>$5 USDC</b>",
-            parse_mode="HTML",
-        )
+        await update.message.reply_text("⚠️ Минимальное значение — <b>$5 USDC</b>", parse_mode="HTML")  # type: ignore[union-attr]
         return
     if val > 10_000:
-        await update.message.reply_text(  # type: ignore[union-attr]
-            "⚠️ Максимальное значение — <b>$10 000 USDC</b>",
-            parse_mode="HTML",
-        )
+        await update.message.reply_text("⚠️ Максимальное значение — <b>$10 000 USDC</b>", parse_mode="HTML")  # type: ignore[union-attr]
         return
 
     update_user(tg_user.id, {"max_position_usdc": val})
@@ -422,7 +573,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     copy_active = db_user.get("copy_active", False)
 
     await update.message.reply_text(  # type: ignore[union-attr]
-        f"✅ <b>Готово!</b> Макс. позиция установлена: <b>${val:.0f} USDC</b>",
+        f"✅ <b>Готово!</b> Макс. позиция: <b>${val:.0f} USDC</b>",
         parse_mode="HTML",
         reply_markup=_settings_kb(copy_active, val),
     )
@@ -461,24 +612,93 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    if data == "wallet":
+    if data in ("wallet", "wallet_balance"):
         db_user = get_user_by_telegram_id(tg_user.id)
         if not db_user or not db_user.get("wallet_address"):
             await query.answer("Кошелёк не найден. Отправь /start", show_alert=True)
             return
         addr = db_user["wallet_address"]
+        await query.answer("⏳ Загружаю баланс…")
+        from core.polygon import get_balances
+        balances = get_balances(addr)
         await query.edit_message_text(
-            f"💼 <b>Твой кошелёк</b>\n\n"
-            f"<code>{addr}</code>\n\n"
-            f"🔗 <a href=\"https://polygonscan.com/address/{addr}\">Polygonscan</a>\n\n"
-            "📌 Пополняй <b>USDC</b> в сети <b>Polygon</b>.\n"
-            "⚠️ Только Polygon — не Ethereum, не BSC!",
+            _wallet_text(addr, balances),
             parse_mode="HTML",
             disable_web_page_preview=True,
+            reply_markup=_wallet_kb(),
+        )
+        return
+
+    if data == "withdraw_start":
+        context.user_data["withdraw_step"] = "address"
+        await query.edit_message_text(
+            "💸 <b>Вывод USDC</b>\n\n"
+            "Введи адрес кошелька Polygon для вывода:\n\n"
+            "<i>Пример: 0x742d35Cc…</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data="withdraw_cancel")
+            ]]),
+        )
+        return
+
+    if data == "withdraw_cancel":
+        context.user_data.pop("withdraw_step", None)
+        context.user_data.pop("withdraw_to", None)
+        context.user_data.pop("withdraw_amount", None)
+        await query.edit_message_text(
+            "❌ Вывод отменён.",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
             ]]),
         )
+        return
+
+    if data == "withdraw_confirm":
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user or not db_user.get("wallet_private_key_enc"):
+            await query.answer("Кошелёк не найден", show_alert=True)
+            return
+
+        to_addr   = context.user_data.get("withdraw_to", "")
+        amount    = float(context.user_data.get("withdraw_amount", 0))
+        context.user_data.pop("withdraw_step", None)
+
+        await query.edit_message_text(
+            "⏳ <b>Выполняю транзакцию…</b>\n\nЭто займёт 5–15 секунд.",
+            parse_mode="HTML",
+        )
+
+        try:
+            from core.polygon import transfer_usdc
+            tx_hash = transfer_usdc(
+                private_key_enc=db_user["wallet_private_key_enc"],
+                wallet_address=db_user["wallet_address"],
+                to_address=to_addr,
+                amount_usdc=amount,
+            )
+            await query.edit_message_text(
+                f"✅ <b>Вывод выполнен!</b>\n\n"
+                f"💵 <b>${amount:.2f} USDC</b>\n"
+                f"📬 На: <code>{to_addr}</code>\n\n"
+                f"🔗 <a href=\"https://polygonscan.com/tx/{tx_hash}\">Посмотреть транзакцию</a>",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
+                ]]),
+            )
+            log.info("withdrawal_ok", user_id=tg_user.id, amount=amount, tx=tx_hash[:20])
+        except Exception as exc:
+            await query.edit_message_text(
+                f"❌ <b>Ошибка вывода</b>\n\n<code>{str(exc)[:200]}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
+                ]]),
+            )
+            log.exception("withdrawal_failed", user_id=tg_user.id)
         return
 
     if data == "positions":
