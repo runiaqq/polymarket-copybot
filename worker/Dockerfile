@@ -7,4 +7,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["celery", "-A", "worker.celery_app.celery_app", "worker", "--loglevel=info", "--queues=trades,ai,periodic"]
+CMD ["python", "-m", "worker.entrypoint"]
