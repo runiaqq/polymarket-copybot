@@ -17,13 +17,13 @@ _seen_trades: dict[str, set[str]] = {}
 
 @celery_app.task(name="worker.tasks.poll_donor_trades", queue="periodic")
 def poll_donor_trades() -> dict:
-    from core.db import get_active_donors_with_stats, get_active_subscribers, get_supabase
+    from core.db import get_active_donor_addresses, get_active_subscribers, get_supabase
     from core.polymarket import fetch_donor_recent_trades
     from worker.tasks import execute_copy_trade, run_ai_analysis
 
     sb = get_supabase()
     res = sb.table("donor_wallets").select("*").eq("active", True).execute()
-    donors = res.data
+    donors = res.data or []
 
     if not donors:
         log.debug("no_active_donors")
