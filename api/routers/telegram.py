@@ -52,67 +52,74 @@ def _stop_resume_kb(copy_active: bool) -> InlineKeyboardMarkup:
 def _dashboard_text(db_user: dict, first_name: str) -> str:
     addr = db_user.get("wallet_address", "—")
     addr_short = f"{addr[:6]}…{addr[-4:]}" if addr != "—" else "—"
-    copy_icon = "▶️ Включено" if db_user.get("copy_active") else "⏸ Приостановлено"
+    copy_icon = "▶️ Активно" if db_user.get("copy_active") else "⏸ Приостановлено"
     max_pos = db_user.get("max_position_usdc") or 25
     return (
         f"👋 <b>Привет, {first_name}!</b>\n\n"
-        "🤖 <b>Polymarket AI Copy-Trader</b>\n\n"
+        "🧠 <b>PolyMind AI</b> — твой торговый интеллект\n\n"
         f"💼 Кошелёк: <code>{addr_short}</code>\n"
         f"🔄 Копирование: {copy_icon}\n"
         f"💵 Макс. позиция: <b>${max_pos:.0f} USDC</b>\n\n"
-        "Используй кнопки ниже для управления ботом 👇"
+        "Управляй ботом через кнопки ниже 👇"
     )
 
 
 def _new_user_text(addr: str) -> str:
     return (
-        "🎉 <b>Кошелёк создан!</b>\n\n"
+        "🧠 <b>Добро пожаловать в PolyMind AI!</b>\n\n"
+        "✅ Твой кошелёк создан:\n"
         f"<code>{addr}</code>\n\n"
-        "📌 <b>Следующий шаг:</b> пополни кошелёк в сети <b>Polygon</b>\n"
-        "Принимается: <b>USDC</b> (минимум $10)\n\n"
-        "⚡️ После пополнения бот автоматически начнёт отслеживать "
-        "сделки топ-трейдеров и копировать лучшие из них.\n\n"
-        "Нажми <b>💼 Кошелёк</b> чтобы увидеть детали для пополнения 👇"
+        "📌 <b>Следующий шаг — пополни кошелёк:</b>\n"
+        "• Сеть: <b>Polygon</b>\n"
+        "• Токен: <b>USDC</b>\n"
+        "• Минимум: <b>$10</b>\n\n"
+        "⚡️ Как только USDC поступит — PolyMind начнёт автоматически "
+        "копировать лучшие сделки топ-трейдеров за тебя.\n\n"
+        "👇 Нажми <b>💼 Кошелёк</b> чтобы скопировать адрес для пополнения"
     )
 
 
 HELP_TEXT = (
-    "❓ <b>Инструкция по использованию</b>\n\n"
+    "🧠 <b>PolyMind AI — Инструкция</b>\n\n"
 
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "⚡️ <b>Как работает бот</b>\n"
+    "⚡️ <b>Как работает PolyMind</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "1️⃣ Бот отслеживает сделки топ-трейдеров Polymarket в реальном времени\n"
-    "2️⃣ ИИ анализирует каждую сделку и оценивает риск\n"
-    "3️⃣ Одобренные сделки автоматически копируются на твой кошелёк\n\n"
+    "1️⃣ <b>Отслеживание</b> — PolyMind мониторит сделки "
+    "проверенных топ-трейдеров Polymarket в реальном времени\n\n"
+    "2️⃣ <b>Анализ</b> — ИИ оценивает каждую сделку: риск, "
+    "размер позиции, репутацию трейдера\n\n"
+    "3️⃣ <b>Копирование</b> — одобренные сделки мгновенно "
+    "исполняются на твоём кошельке\n\n"
 
     "━━━━━━━━━━━━━━━━━━━━━\n"
     "📋 <b>Команды</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "/start — 🏠 Главное меню и статус\n"
-    "/wallet — 💼 Данные кошелька и пополнение\n"
-    "/positions — 📊 Текущие открытые позиции\n"
-    "/pnl — 💰 Статистика прибыли и убытков\n"
-    "/settings — ⚙️ Настройки копирования\n"
-    "/stop — ⏸ Приостановить копирование\n"
-    "/resume — ▶️ Возобновить копирование\n"
+    "/start — 🏠 Главное меню\n"
+    "/wallet — 💼 Кошелёк и пополнение\n"
+    "/positions — 📊 Открытые позиции\n"
+    "/pnl — 💰 Статистика P&L\n"
+    "/settings — ⚙️ Настройки\n"
+    "/stop — ⏸ Приостановить\n"
+    "/resume — ▶️ Возобновить\n"
     "/help — ❓ Эта инструкция\n\n"
 
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "⚙️ <b>Настройки</b>\n"
+    "⚙️ <b>Настройки позиций</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "<code>/settings max 50</code> — макс. размер позиции $50 USDC\n"
-    "<code>/settings max 100</code> — макс. размер позиции $100 USDC\n\n"
+    "<code>/settings max 25</code> — макс. $25 на сделку\n"
+    "<code>/settings max 50</code> — макс. $50 на сделку\n"
+    "<code>/settings max 100</code> — макс. $100 на сделку\n\n"
 
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "💡 <b>Важно знать</b>\n"
+    "🔐 <b>Безопасность</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "• Минимальный баланс для торговли: <b>$10 USDC</b>\n"
-    "• Сеть: <b>Polygon</b> (не Ethereum!)\n"
-    "• /stop не закрывает открытые позиции — только прекращает новые сделки\n"
-    "• Средства всегда на твоём кошельке — бот только исполняет сделки\n\n"
+    "• Кошелёк принадлежит <b>тебе</b> — PolyMind только исполняет сделки\n"
+    "• /stop немедленно останавливает новые сделки\n"
+    "• Открытые позиции при /stop не закрываются\n"
+    "• Сеть: <b>Polygon</b> — не отправляй из других сетей!\n\n"
 
-    "💬 Вопросы? Напиши администратору."
+    "💬 Есть вопросы? Напиши администратору."
 )
 
 
@@ -174,10 +181,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except Exception:
             log.exception("wallet_create_failed", telegram_id=tg_user.id)
-            await update.message.reply_text(  # type: ignore[union-attr]
-                "❌ Не удалось создать кошелёк. Попробуй ещё раз через минуту.",
-                parse_mode="HTML",
-            )
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "❌ <b>Не удалось создать кошелёк.</b>\n\nПопробуй ещё раз через минуту или обратись в поддержку.",
+            parse_mode="HTML",
+        )
     else:
         await update.message.reply_text(  # type: ignore[union-attr]
             _dashboard_text(db_user, tg_user.first_name),
@@ -353,8 +360,8 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     update_user(tg_user.id, {"copy_active": True})
     await update.message.reply_text(  # type: ignore[union-attr]
-        "▶️ <b>Копирование возобновлено!</b>\n\n"
-        "Бот снова отслеживает сделки топ-трейдеров и копирует лучшие из них.\n\n"
+        "▶️ <b>PolyMind снова в игре!</b>\n\n"
+        "🧠 ИИ отслеживает топ-трейдеров и копирует лучшие сделки.\n\n"
         "Убедись что на кошельке есть <b>USDC</b> для открытия позиций.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
@@ -515,8 +522,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         update_user(tg_user.id, {"copy_active": True})
         await query.edit_message_text(
-            "▶️ <b>Копирование возобновлено!</b>\n\n"
-            "Бот снова отслеживает топ-трейдеров и копирует лучшие сделки.\n\n"
+            "▶️ <b>PolyMind снова в игре!</b>\n\n"
+            "🧠 ИИ отслеживает топ-трейдеров и копирует лучшие сделки.\n\n"
             "Убедись что на кошельке есть <b>USDC</b>.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
