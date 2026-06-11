@@ -9,6 +9,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from core.config import settings
@@ -45,6 +47,29 @@ def _stop_resume_kb(copy_active: bool) -> InlineKeyboardMarkup:
     else:
         btn = InlineKeyboardButton("▶️ Возобновить", callback_data="resume")
     return InlineKeyboardMarkup([[btn], [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")]])
+
+
+def _settings_kb(copy_active: bool, current_max: float) -> InlineKeyboardMarkup:
+    def _label(val: int) -> str:
+        mark = " ✓" if abs(current_max - val) < 0.5 else ""
+        return f"${val}{mark}"
+
+    toggle_btn = (
+        InlineKeyboardButton("⏸ Приостановить", callback_data="stop")
+        if copy_active
+        else InlineKeyboardButton("▶️ Возобновить", callback_data="resume")
+    )
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(_label(10),  callback_data="setmax_10"),
+            InlineKeyboardButton(_label(25),  callback_data="setmax_25"),
+            InlineKeyboardButton(_label(50),  callback_data="setmax_50"),
+            InlineKeyboardButton(_label(100), callback_data="setmax_100"),
+        ],
+        [InlineKeyboardButton("✏️ Своё значение", callback_data="setmax_custom")],
+        [toggle_btn],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
+    ])
 
 
 # ─── Text builders ────────────────────────────────────────────────────────────
@@ -149,6 +174,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("stop",      cmd_stop))
     app.add_handler(CommandHandler("resume",    cmd_resume))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    # Must be last — catches free-text input (e.g. custom position size)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     return app
 
 
@@ -291,6 +318,18 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _settings_text(db_user: dict) -> str:
+    copy_active = db_user.get("copy_active", False)
+    max_pos = db_user.get("max_position_usdc") or 25
+    copy_status = "▶️ Активно" if copy_active else "⏸ Приостановлено"
+    return (
+        f"⚙️ <b>Настройки</b>\n\n"
+        f"🔄 Копирование: {copy_status}\n"
+        f"💵 Макс. позиция: <b>${max_pos:.0f} USDC</b>\n\n"
+        "Выбери максимальный размер одной позиции 👇"
+    )
+
+
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tg_user = update.effective_user
     if not tg_user:
@@ -299,36 +338,12 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not db_user:
         await update.message.reply_text("Сначала отправь /start", parse_mode="HTML")  # type: ignore[union-attr]
         return
-
-    if context.args:
-        arg0 = context.args[0]
-        if arg0 == "max" and len(context.args) > 1:
-            try:
-                val = float(context.args[1])
-                if val < 5:
-                    await update.message.reply_text("⚠️ Минимум $5 USDC", parse_mode="HTML")  # type: ignore[union-attr]
-                    return
-                update_user(tg_user.id, {"max_position_usdc": val})
-                await update.message.reply_text(  # type: ignore[union-attr]
-                    f"✅ Макс. размер позиции обновлён: <b>${val:.0f} USDC</b>",
-                    parse_mode="HTML",
-                )
-            except ValueError:
-                await update.message.reply_text("⚠️ Укажи число. Например: <code>/settings max 50</code>", parse_mode="HTML")  # type: ignore[union-attr]
-        return
-
     copy_active = db_user.get("copy_active", False)
-    max_pos = db_user.get("max_position_usdc") or 25
-    copy_status = "▶️ Включено" if copy_active else "⏸ Приостановлено"
+    max_pos = float(db_user.get("max_position_usdc") or 25)
     await update.message.reply_text(  # type: ignore[union-attr]
-        f"⚙️ <b>Настройки</b>\n\n"
-        f"🔄 Копирование: {copy_status}\n"
-        f"💵 Макс. позиция: <b>${max_pos:.0f} USDC</b>\n\n"
-        f"<i>Изменить макс. позицию:</i>\n"
-        f"<code>/settings max 50</code>\n"
-        f"<code>/settings max 100</code>",
+        _settings_text(db_user),
         parse_mode="HTML",
-        reply_markup=_stop_resume_kb(copy_active),
+        reply_markup=_settings_kb(copy_active, max_pos),
     )
 
 
@@ -367,6 +382,49 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
         ]]),
+    )
+
+
+# ─── Free-text input handler (custom position size) ──────────────────────────
+
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_user = update.effective_user
+    if not tg_user or not context.user_data.get("awaiting_max_pos"):
+        return
+
+    context.user_data["awaiting_max_pos"] = False
+    text = (update.message.text or "").strip().replace("$", "").replace(",", ".")
+
+    try:
+        val = float(text)
+    except ValueError:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "⚠️ Неверный формат. Введи число, например: <code>75</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if val < 5:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "⚠️ Минимальное значение — <b>$5 USDC</b>",
+            parse_mode="HTML",
+        )
+        return
+    if val > 10_000:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "⚠️ Максимальное значение — <b>$10 000 USDC</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    update_user(tg_user.id, {"max_position_usdc": val})
+    db_user = get_user_by_telegram_id(tg_user.id) or {}
+    copy_active = db_user.get("copy_active", False)
+
+    await update.message.reply_text(  # type: ignore[union-attr]
+        f"✅ <b>Готово!</b> Макс. позиция установлена: <b>${val:.0f} USDC</b>",
+        parse_mode="HTML",
+        reply_markup=_settings_kb(copy_active, val),
     )
 
 
@@ -488,16 +546,50 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Отправь /start", show_alert=True)
             return
         copy_active = db_user.get("copy_active", False)
-        max_pos = db_user.get("max_position_usdc") or 25
-        copy_status = "▶️ Включено" if copy_active else "⏸ Приостановлено"
+        max_pos = float(db_user.get("max_position_usdc") or 25)
         await query.edit_message_text(
-            f"⚙️ <b>Настройки</b>\n\n"
-            f"🔄 Копирование: {copy_status}\n"
-            f"💵 Макс. позиция: <b>${max_pos:.0f} USDC</b>\n\n"
-            f"<i>Изменить макс. позицию:</i>\n"
-            f"<code>/settings max 50</code>",
+            _settings_text(db_user),
             parse_mode="HTML",
-            reply_markup=_stop_resume_kb(copy_active),
+            reply_markup=_settings_kb(copy_active, max_pos),
+        )
+        return
+
+    if data.startswith("setmax_"):
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user:
+            await query.answer("Отправь /start", show_alert=True)
+            return
+
+        suffix = data[len("setmax_"):]
+
+        if suffix == "custom":
+            context.user_data["awaiting_max_pos"] = True
+            await query.answer()
+            await query.edit_message_text(
+                "✏️ <b>Введи сумму в долларах</b>\n\n"
+                "Напиши число в чат, например: <code>75</code>\n\n"
+                "<i>Допустимый диапазон: $5 — $10 000</i>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("↩️ Назад", callback_data="settings")
+                ]]),
+            )
+            return
+
+        try:
+            val = float(suffix)
+        except ValueError:
+            await query.answer("Ошибка", show_alert=True)
+            return
+
+        update_user(tg_user.id, {"max_position_usdc": val})
+        db_user = get_user_by_telegram_id(tg_user.id) or db_user
+        copy_active = db_user.get("copy_active", False)
+        await query.answer(f"✅ Позиция: ${val:.0f} USDC")
+        await query.edit_message_text(
+            _settings_text(db_user),
+            parse_mode="HTML",
+            reply_markup=_settings_kb(copy_active, val),
         )
         return
 
