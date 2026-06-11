@@ -7,7 +7,7 @@ celery_app = Celery(
     "copybot",
     broker=settings.redis_url,
     backend=settings.redis_url,
-    include=["worker.tasks"],
+    include=["worker.tasks", "worker.main"],
 )
 
 celery_app.conf.update(

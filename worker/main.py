@@ -1,28 +1,26 @@
 """
-Worker entry point.
-Runs the Polymarket WebSocket listener in an asyncio event loop
-alongside the Celery worker process.
+Starts the Polymarket WebSocket listener when the Celery worker becomes ready.
 """
 
 import asyncio
 import threading
 
 import structlog
+from celery.signals import worker_ready
 
 log = structlog.get_logger(__name__)
 
 
-def start_ws_listener_thread() -> None:
-    """Run the WebSocket listener in a background thread with its own event loop."""
+def _run_ws_loop() -> None:
     from core.polymarket import run_ws_listener
-
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    log.info("ws_listener_thread_starting")
+    log.info("ws_listener_starting")
     loop.run_until_complete(run_ws_listener())
 
 
-# Start the WS listener when the worker process boots
-_ws_thread = threading.Thread(target=start_ws_listener_thread, daemon=True)
-_ws_thread.start()
-log.info("ws_listener_thread_started")
+@worker_ready.connect
+def start_ws_listener(**kwargs) -> None:  # type: ignore[no-untyped-def]
+    t = threading.Thread(target=_run_ws_loop, daemon=True)
+    t.start()
+    log.info("ws_listener_thread_started")
