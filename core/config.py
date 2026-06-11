@@ -40,8 +40,8 @@ class Settings(BaseSettings):
     # App
     app_env: str = "development"
     webhook_base_url: str
-    min_trade_size_usdc: float = 50.0
-    min_market_hours_to_close: int = 48
+    min_trade_size_usdc: float = 5.0
+    min_market_hours_to_close: float = 0.0
     ai_risk_warn_threshold: int = 7
 
 

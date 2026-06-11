@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import structlog
 
+from core.config import settings
 from worker.celery_app import celery_app
 
 log = structlog.get_logger(__name__)
@@ -59,8 +60,21 @@ def poll_donor_trades() -> dict:
             size_usdc = price * size
             side = (trade.get("side") or "BUY").upper()
 
-            if size_usdc < 50:
+            if size_usdc < settings.min_trade_size_usdc:
                 continue
+
+            # Filter by market closing time if configured
+            if settings.min_market_hours_to_close > 0:
+                end_date = trade.get("end_date_iso") or trade.get("endDate") or trade.get("end_date")
+                if end_date:
+                    from dateutil.parser import parse as parse_dt
+                    try:
+                        closes_at = parse_dt(end_date).replace(tzinfo=timezone.utc) if parse_dt(end_date).tzinfo is None else parse_dt(end_date)
+                        hours_left = (closes_at - datetime.now(timezone.utc)).total_seconds() / 3600
+                        if hours_left < settings.min_market_hours_to_close:
+                            continue
+                    except Exception:
+                        pass
 
             # Only copy BUY-side trades for MVP
             if side not in ("BUY",):
