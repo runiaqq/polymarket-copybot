@@ -11,7 +11,7 @@ celery_app = Celery(
     "copybot",
     broker=_redis_url,
     backend=_redis_url,
-    include=["worker.tasks", "worker.main"],
+    include=["worker.tasks", "worker.tasks.poll_donors"],
 )
 
 # Upstash Redis uses TLS — Celery needs explicit SSL config for rediss://
@@ -31,12 +31,18 @@ celery_app.conf.update(
     task_routes={
         "worker.tasks.execute_copy_trade": {"queue": "trades"},
         "worker.tasks.run_ai_analysis": {"queue": "ai"},
+        "worker.tasks.poll_donor_trades": {"queue": "periodic"},
         "worker.tasks.refresh_donor_stats": {"queue": "periodic"},
+        "worker.tasks.deactivate_underperforming_donors": {"queue": "periodic"},
     },
     beat_schedule={
+        "poll-donor-trades": {
+            "task": "worker.tasks.poll_donor_trades",
+            "schedule": 30.0,
+        },
         "refresh-donor-stats-nightly": {
             "task": "worker.tasks.refresh_donor_stats",
-            "schedule": crontab(hour=3, minute=0),  # 03:00 UTC nightly
+            "schedule": crontab(hour=3, minute=0),
         },
         "deactivate-bad-donors": {
             "task": "worker.tasks.deactivate_underperforming_donors",
