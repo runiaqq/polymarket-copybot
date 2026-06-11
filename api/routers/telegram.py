@@ -21,7 +21,7 @@ from core.db import (
     update_user,
     upsert_user,
 )
-from core.privy import privy_client
+from core.wallet import generate_wallet
 
 log = structlog.get_logger(__name__)
 
@@ -190,14 +190,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not db_user.get("wallet_address"):
         await update.message.reply_text(  # type: ignore[union-attr]
-            "⏳ Создаём твой кошелёк… (5–10 секунд)",
+            "⏳ Создаём твой кошелёк…",
             parse_mode="HTML",
         )
         try:
-            wallet_data = await privy_client.create_wallet(tg_user.id)
+            wallet = generate_wallet()
             update_user(tg_user.id, {
-                "privy_user_id": wallet_data["privy_user_id"],
-                "wallet_address": wallet_data["wallet_address"],
+                "wallet_address":       wallet["address"],
+                "wallet_private_key_enc": wallet["private_key_enc"],
             })
             db_user = get_user_by_telegram_id(tg_user.id) or db_user
             addr = db_user.get("wallet_address", "—")
@@ -208,10 +208,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except Exception:
             log.exception("wallet_create_failed", telegram_id=tg_user.id)
-        await update.message.reply_text(  # type: ignore[union-attr]
-            "❌ <b>Не удалось создать кошелёк.</b>\n\nПопробуй ещё раз через минуту или обратись в поддержку.",
-            parse_mode="HTML",
-        )
+            await update.message.reply_text(  # type: ignore[union-attr]
+                "❌ <b>Не удалось создать кошелёк.</b>\n\nПопробуй ещё раз через минуту или обратись в поддержку.",
+                parse_mode="HTML",
+            )
     else:
         await update.message.reply_text(  # type: ignore[union-attr]
             _dashboard_text(db_user, tg_user.first_name),

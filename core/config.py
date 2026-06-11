@@ -17,9 +17,12 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str
 
-    # Privy
-    privy_app_id: str
-    privy_app_secret: str
+    # Wallet encryption (Fernet key — generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+    encryption_key: str
+
+    # Privy (legacy — kept for reference, not used for new wallets)
+    privy_app_id: str = ""
+    privy_app_secret: str = ""
 
     # OpenAI
     openai_api_key: str

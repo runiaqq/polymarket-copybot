@@ -53,25 +53,31 @@ def poll_donor_trades() -> dict:
 
             _seen_trades[address].add(trade_id)
 
-            # Parse trade
+            # Parse trade fields
             price = float(trade.get("price", 0))
             size = float(trade.get("size", 0))
             size_usdc = price * size
+            side = (trade.get("side") or "BUY").upper()
 
             if size_usdc < 50:
                 continue
 
+            # Only copy BUY-side trades for MVP
+            if side not in ("BUY",):
+                continue
+
             signal = {
-                "market_id": trade.get("market", trade.get("condition_id", "")),
-                "side": trade.get("side", "YES").upper(),
-                "price": price,
-                "size_usdc": size_usdc,
+                "market_id":    trade.get("market") or trade.get("condition_id", ""),
+                "token_id":     trade.get("asset_id") or trade.get("token_id"),  # outcome token
+                "side":         side,
+                "price":        price,
+                "size_usdc":    size_usdc,
                 "donor_address": address,
-                "donor_db_id": donor.get("id", 1),
-                "donor_label": donor.get("label") or address[:8],
+                "donor_db_id":  donor.get("id", 1),
+                "donor_label":  donor.get("label") or address[:8],
                 "donor_win_rate": donor.get("win_rate_30d"),
-                "donor_roi": donor.get("roi_30d"),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "donor_roi":    donor.get("roi_30d"),
+                "timestamp":    datetime.now(timezone.utc).isoformat(),
             }
 
             log.info("signal_found", market=signal["market_id"],

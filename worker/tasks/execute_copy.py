@@ -1,6 +1,6 @@
 """
-Fast-path task: copy a donor trade to a single subscriber.
-No AI gate — executes immediately when dispatched.
+Fast-path Celery task: copy a donor trade to a subscriber's wallet.
+Uses Polymarket CLOB v2 for real order placement.
 """
 
 import asyncio
@@ -26,88 +26,120 @@ class ExecuteCopyTask(Task):
     queue="trades",
 )
 def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dict:
+    from core.clob import generate_api_creds, get_market_token_id, place_order
     from core.db import get_supabase, insert_copy_trade, insert_trade_signal
-    from core.privy import privy_client
 
     sb = get_supabase()
 
-    # Load user by id
+    # Load user
     res = sb.table("users").select("*").eq("id", user_id).maybe_single().execute()
     user = res.data if res else None
 
-    if not user or not user.get("wallet_address") or not user.get("privy_user_id"):
+    if not user or not user.get("wallet_private_key_enc"):
         log.warning("skip_no_wallet", user_id=user_id)
         return {"skipped": True, "reason": "no_wallet"}
 
-    size_usdc = min(float(signal["size_usdc"]), float(user.get("max_position_usdc", 25)))
+    size_usdc = min(
+        float(signal["size_usdc"]),
+        float(user.get("max_position_usdc") or 25),
+    )
 
-    # Save signal
+    # Only copy BUY signals — SELL requires owning the token first
+    if signal.get("side", "").upper() in ("SELL", "NO"):
+        log.debug("skip_sell_signal", user_id=user_id)
+        return {"skipped": True, "reason": "sell_not_supported"}
+
+    # Ensure CLOB API credentials exist
+    api_creds = {
+        "clob_api_key":    user.get("clob_api_key"),
+        "clob_secret":     user.get("clob_secret"),
+        "clob_passphrase": user.get("clob_passphrase"),
+    }
+    if not api_creds["clob_api_key"]:
+        try:
+            api_creds = generate_api_creds(user["wallet_private_key_enc"])
+            sb.table("users").update(api_creds).eq("id", user_id).execute()
+            log.info("clob_creds_generated", user_id=user_id)
+        except Exception as exc:
+            log.exception("clob_creds_failed", user_id=user_id)
+            raise self.retry(exc=exc)
+
+    # Resolve token_id
+    token_id: str | None = signal.get("token_id")
+    if not token_id:
+        token_id = get_market_token_id(signal["market_id"], signal.get("side", "YES"))
+    if not token_id:
+        log.warning("skip_no_token_id", market_id=signal["market_id"])
+        return {"skipped": True, "reason": "no_token_id"}
+
+    # Save signal + trade record
     sig_row = insert_trade_signal({
-        "donor_id": signal.get("donor_db_id", 1),
+        "donor_id":  signal.get("donor_db_id", 1),
         "market_id": signal["market_id"],
-        "side": signal["side"],
-        "price": signal["price"],
+        "side":      signal["side"],
+        "price":     signal["price"],
         "size_usdc": size_usdc,
     })
-
-    # Save copy trade as executing
     trade_row = insert_copy_trade({
-        "user_id": user["id"],
+        "user_id":   user["id"],
         "signal_id": sig_row["id"],
-        "status": "executing",
+        "status":    "executing",
         "size_usdc": size_usdc,
     })
 
     try:
-        # Sign + submit via Privy
-        tx_hash = asyncio.get_event_loop().run_until_complete(
-            privy_client.sign_and_send_transaction(
-                privy_user_id=user["privy_user_id"],
-                wallet_address=user["wallet_address"],
-                tx={
-                    "to": "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",  # Polymarket exchange
-                    "data": "0x",
-                    "value": "0x0",
-                    "chainId": 137,
-                },
-            )
+        result = place_order(
+            private_key_enc=user["wallet_private_key_enc"],
+            api_creds=api_creds,
+            token_id=token_id,
+            side=signal["side"],
+            price=signal["price"],
+            size_usdc=size_usdc,
         )
 
+        order_id = result.get("orderID") or result.get("order_id") or ""
         sb.table("copy_trades").update({
-            "tx_hash": tx_hash,
-            "status": "confirmed",
+            "status":   "confirmed",
+            "order_id": order_id,
         }).eq("id", trade_row["id"]).execute()
 
-        log.info("copy_trade_confirmed", user_id=user_id, tx=tx_hash)
+        log.info("copy_trade_ok", user_id=user_id, order_id=order_id)
+        _notify(user["telegram_id"], signal, order_id)
 
-        # Notify user
-        _notify(user["telegram_id"], signal, tx_hash)
-
-        return {"tx_hash": tx_hash, "user_id": user_id}
+        return {"order_id": order_id, "user_id": user_id}
 
     except Exception as exc:
         sb.table("copy_trades").update({
-            "status": "failed",
+            "status":    "failed",
             "error_msg": str(exc)[:500],
         }).eq("id", trade_row["id"]).execute()
         log.exception("copy_trade_failed", user_id=user_id)
         raise self.retry(exc=exc)
 
 
-def _notify(telegram_id: int, signal: dict, tx_hash: str) -> None:
+def _notify(telegram_id: int, signal: dict, order_id: str) -> None:
+    """Send async Telegram notification from sync Celery context."""
     from telegram import Bot
     from core.config import settings
 
     async def _send() -> None:
         bot = Bot(token=settings.telegram_bot_token)
+        side_icon = "🟢" if signal["side"].upper() in ("BUY", "YES") else "🔴"
+        roi = (signal.get("donor_roi") or 0) * 100
         msg = (
-            f"Сделка исполнена\n"
-            f"Рынок: `{signal['market_id'][:40]}`\n"
-            f"Направление: {signal['side']} @ {signal['price']:.4f}\n"
-            f"Донор: {signal.get('donor_label', '?')} "
-            f"(ROI {(signal.get('donor_roi') or 0)*100:+.0f}%)\n"
-            f"TX: [Polygonscan](https://polygonscan.com/tx/{tx_hash})"
+            f"⚡️ <b>Сделка скопирована!</b>\n\n"
+            f"{side_icon} {signal['side']} @ <code>{signal['price']:.4f}</code>\n"
+            f"💵 Объём: <b>${signal['size_usdc']:.2f} USDC</b>\n"
+            f"🎯 Донор: {signal.get('donor_label', '?')} (ROI {roi:+.0f}%)\n\n"
+            f"📋 Order ID: <code>{order_id[:20] if order_id else '—'}</code>"
         )
-        await bot.send_message(chat_id=telegram_id, text=msg, parse_mode="Markdown")
+        await bot.send_message(
+            chat_id=telegram_id,
+            text=msg,
+            parse_mode="HTML",
+        )
 
-    asyncio.get_event_loop().run_until_complete(_send())
+    try:
+        asyncio.get_event_loop().run_until_complete(_send())
+    except Exception:
+        log.exception("notify_failed", telegram_id=telegram_id)
