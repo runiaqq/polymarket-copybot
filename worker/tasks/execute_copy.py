@@ -111,7 +111,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     except Exception as exc:
         sb.table("copy_trades").update({
             "status":    "failed",
-            "error_msg": str(exc)[:500],
+            "error_msg": str(exc)[:1000],
         }).eq("id", trade_row["id"]).execute()
         log.exception("copy_trade_failed", user_id=user_id)
         raise self.retry(exc=exc)

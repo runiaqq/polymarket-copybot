@@ -367,7 +367,7 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         lines.append(
             f"{i}. {st_icon} <b>{title}</b>\n"
             f"   {side} @ {price:.4f} · <b>${size:.2f}</b>"
-            + (f"\n   ⚠️ <i>{err[:60]}</i>" if err and status == "failed" else "")
+            + (f"\n   ⚠️ <i>{err[:120]}</i>" if err and status == "failed" else "")
         )
     await update.message.reply_text(  # type: ignore[union-attr]
         "\n\n".join(lines),
@@ -736,7 +736,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             lines.append(
                 f"{i}. {st_icon} <b>{title}</b>\n"
                 f"   {side} @ {price:.4f} · <b>${size:.2f}</b>"
-                + (f"\n   ⚠️ <i>{err[:60]}</i>" if err and status == "failed" else "")
+                + (f"\n   ⚠️ <i>{err[:120]}</i>" if err and status == "failed" else "")
             )
         await query.edit_message_text(
             "\n\n".join(lines),
