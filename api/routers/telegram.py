@@ -87,76 +87,72 @@ def _settings_kb(copy_active: bool, current_max: float) -> InlineKeyboardMarkup:
 def _dashboard_text(db_user: dict, first_name: str) -> str:
     addr = db_user.get("wallet_address", "—")
     addr_short = f"{addr[:6]}…{addr[-4:]}" if addr != "—" else "—"
-    copy_icon = "▶️ Активно" if db_user.get("copy_active") else "⏸ Приостановлено"
+    copy_active = db_user.get("copy_active")
+    copy_icon = "🟢 Работает" if copy_active else "⏸ Пауза"
     max_pos = db_user.get("max_position_usdc") or 25
     return (
         f"👋 <b>Привет, {first_name}!</b>\n\n"
-        "🧠 <b>PolyMind AI</b> — твой торговый интеллект\n\n"
+        "🧠 <b>PolyMind AI</b> — интеллектуальный копитрейдинг\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
         f"💼 Кошелёк: <code>{addr_short}</code>\n"
-        f"🔄 Копирование: {copy_icon}\n"
-        f"💵 Макс. позиция: <b>${max_pos:.0f} USDC</b>\n\n"
-        "Управляй ботом через кнопки ниже 👇"
+        f"🔄 Автокопирование: {copy_icon}\n"
+        f"💵 Макс. позиция: <b>${max_pos:.0f} USDC</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👇 Управляй через кнопки"
     )
 
 
 def _new_user_text(addr: str) -> str:
     return (
         "🧠 <b>Добро пожаловать в PolyMind AI!</b>\n\n"
-        "✅ Твой кошелёк создан:\n"
-        f"<code>{addr}</code>\n\n"
-        "📌 <b>Следующий шаг — пополни кошелёк:</b>\n"
-        "• Сеть: <b>Polygon</b>\n"
-        "• Токен: <b>USDC</b>\n"
-        "• Минимум: <b>$10</b>\n\n"
-        "⚡️ Как только USDC поступит — PolyMind начнёт автоматически "
-        "копировать лучшие сделки топ-трейдеров за тебя.\n\n"
-        "👇 Нажми <b>💼 Кошелёк</b> чтобы скопировать адрес для пополнения"
+        "Твой персональный торговый кошелёк создан и готов к работе.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "📬 <b>Адрес для пополнения:</b>\n"
+        f"<code>{addr}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⚡️ <b>Как начать зарабатывать:</b>\n"
+        "1️⃣ Пополни баланс в USDC (сеть Polygon)\n"
+        "2️⃣ PolyMind автоматически скопирует сделки топ-трейдеров\n"
+        "3️⃣ Отслеживай позиции и P&L в боте\n\n"
+        "⚠️ Только <b>Polygon</b> — не Ethereum, не BSC!"
     )
 
 
 HELP_TEXT = (
-    "🧠 <b>PolyMind AI — Инструкция</b>\n\n"
+    "🧠 <b>PolyMind AI — Руководство</b>\n\n"
 
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "⚡️ <b>Как работает PolyMind</b>\n"
+    "⚡️ <b>Принцип работы</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "1️⃣ <b>Отслеживание</b> — PolyMind мониторит сделки "
-    "проверенных топ-трейдеров Polymarket в реальном времени\n\n"
-    "2️⃣ <b>Анализ</b> — ИИ оценивает каждую сделку: риск, "
-    "размер позиции, репутацию трейдера\n\n"
-    "3️⃣ <b>Копирование</b> — одобренные сделки мгновенно "
-    "исполняются на твоём кошельке\n\n"
+    "1️⃣ <b>Мониторинг</b> — PolyMind каждые 30 секунд "
+    "отслеживает сделки проверенных трейдеров Polymarket\n\n"
+    "2️⃣ <b>ИИ-анализ</b> — нейросеть оценивает риск каждой "
+    "сделки и фильтрует нежелательные позиции\n\n"
+    "3️⃣ <b>Автокопирование</b> — прошедшие проверку сделки "
+    "мгновенно дублируются на твоём кошельке\n\n"
 
     "━━━━━━━━━━━━━━━━━━━━━\n"
     "📋 <b>Команды</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n"
     "/start — 🏠 Главное меню\n"
-    "/wallet — 💼 Кошелёк, баланс, вывод\n"
+    "/wallet — 💼 Кошелёк и баланс\n"
     "/balance — 💵 Быстрая проверка баланса\n"
-    "/withdraw — 💸 Вывод USDC на другой адрес\n"
-    "/positions — 📊 Открытые позиции\n"
-    "/pnl — 💰 Статистика P&L\n"
-    "/settings — ⚙️ Настройки\n"
-    "/stop — ⏸ Приостановить\n"
-    "/resume — ▶️ Возобновить\n"
-    "/help — ❓ Эта инструкция\n\n"
+    "/positions — 📊 Активные позиции\n"
+    "/pnl — 💰 Статистика прибыли\n"
+    "/settings — ⚙️ Размер позиций\n"
+    "/withdraw — 💸 Вывод средств\n"
+    "/stop — ⏸ Пауза копирования\n"
+    "/resume — ▶️ Возобновить\n\n"
 
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "⚙️ <b>Настройки позиций</b>\n"
+    "💡 <b>Советы</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "<code>/settings max 25</code> — макс. $25 на сделку\n"
-    "<code>/settings max 50</code> — макс. $50 на сделку\n"
-    "<code>/settings max 100</code> — макс. $100 на сделку\n\n"
+    "• Рекомендуемый баланс: <b>$50–200 USDC</b>\n"
+    "• Оптимальный размер позиции: <b>$5–25 USDC</b>\n"
+    "• Используй /stop чтобы взять паузу в любой момент\n"
+    "• Кошелёк полностью в твоём управлении\n\n"
 
-    "━━━━━━━━━━━━━━━━━━━━━\n"
-    "🔐 <b>Безопасность</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━━\n"
-    "• Кошелёк принадлежит <b>тебе</b> — PolyMind только исполняет сделки\n"
-    "• /stop немедленно останавливает новые сделки\n"
-    "• Открытые позиции при /stop не закрываются\n"
-    "• Сеть: <b>Polygon</b> — не отправляй из других сетей!\n\n"
-
-    "💬 Есть вопросы? Напиши администратору."
+    "💬 Вопросы? Обратись к администратору."
 )
 
 
@@ -248,21 +244,22 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _wallet_text(addr: str, balances: dict | None = None) -> str:
-    addr_short = f"{addr[:6]}…{addr[-4:]}"
     text = (
-        f"💼 <b>Твой кошелёк</b>\n\n"
+        f"💼 <b>Кошелёк PolyMind</b>\n\n"
         f"<code>{addr}</code>\n\n"
     )
     if balances is not None:
         total = balances.get("total_usdc", 0)
-        matic = balances.get("matic", 0)
+        pol = balances.get("matic", 0)
+        status = "✅ Готов к торговле" if total >= 5 else "⚠️ Пополни баланс"
         text += (
-            f"💵 Баланс USDC: <b>${total:.2f}</b>\n"
-            f"⛽️ MATIC (газ): <b>{matic:.4f}</b>\n\n"
+            f"💵 USDC: <b>${total:.2f}</b>\n"
+            f"⛽️ POL (газ): <b>{pol:.4f}</b>\n"
+            f"📊 Статус: {status}\n\n"
         )
     text += (
-        f"🔗 <a href=\"https://polygonscan.com/address/{addr}\">Polygonscan</a>\n\n"
-        "📌 Пополняй <b>USDC</b> в сети <b>Polygon</b>.\n"
+        f"🔗 <a href=\"https://polygonscan.com/address/{addr}\">Посмотреть на Polygonscan</a>\n\n"
+        "📌 Пополняй <b>USDC</b> в сети <b>Polygon</b>\n"
         "⚠️ Только Polygon — не Ethereum, не BSC!"
     )
     return text
@@ -300,11 +297,11 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     from core.polygon import get_balances
     balances = get_balances(addr)
     total = balances.get("total_usdc", 0)
-    matic = balances.get("matic", 0)
+    pol = balances.get("matic", 0)
     await msg.edit_text(  # type: ignore[union-attr]
         f"💵 <b>Баланс кошелька</b>\n\n"
         f"USDC: <b>${total:.2f}</b>\n"
-        f"MATIC: <b>{matic:.4f}</b>\n\n"
+        f"POL (газ): <b>{pol:.4f}</b>\n\n"
         f"<code>{addr}</code>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
@@ -354,22 +351,21 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             ]]),
         )
         return
-    lines = ["📊 <b>Мои сделки</b>\n"]
-    status_icons = {"confirmed": "✅", "executing": "⏳", "failed": "❌"}
+    lines = [f"📊 <b>Активные позиции</b> ({len(positions)})\n"]
+    total_invested = 0.0
     for i, trade in enumerate(positions, 1):
         sig = trade.get("trade_signals") or {}
-        title = sig.get("title") or str(sig.get("market_id", "—"))[:35]
-        side = sig.get("side", "BUY")
+        title = sig.get("title") or str(sig.get("market_id", "—"))[:40]
         price = float(sig.get("price") or 0)
         size = float(trade.get("size_usdc") or 0)
+        total_invested += size
         status = trade.get("status", "—")
-        st_icon = status_icons.get(status, "❓")
-        err = trade.get("error_msg") or ""
+        st_icon = "✅" if status == "confirmed" else "⏳"
         lines.append(
             f"{i}. {st_icon} <b>{title}</b>\n"
-            f"   {side} @ {price:.4f} · <b>${size:.2f}</b>"
-            + (f"\n   ⚠️ <i>{err[:120]}</i>" if err and status == "failed" else "")
+            f"   BUY @ {price:.3f} · <b>${size:.2f} USDC</b>"
         )
+    lines.append(f"\n💼 <b>Итого вложено: ${total_invested:.2f} USDC</b>")
     await update.message.reply_text(  # type: ignore[union-attr]
         "\n\n".join(lines),
         parse_mode="HTML",
@@ -455,9 +451,9 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
     except ValueError as exc:
         await msg.edit_text(  # type: ignore[union-attr]
-            f"⛽️ <b>Нужен MATIC для газа</b>\n\n"
+            f"⛽️ <b>Нужен POL для газа</b>\n\n"
             f"{exc}\n\n"
-            f"Отправь хотя бы <b>0.1 MATIC</b> на кошелёк и повтори /register\n\n"
+            f"Отправь хотя бы <b>0.1 POL</b> на кошелёк и повтори /register\n\n"
             f"<code>{db_user.get('wallet_address', '')}</code>",
             parse_mode="HTML",
         )
@@ -760,22 +756,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 ]]),
             )
             return
-        lines = ["📊 <b>Мои сделки</b>\n"]
-        status_icons = {"confirmed": "✅", "executing": "⏳", "failed": "❌"}
+        lines = [f"📊 <b>Активные позиции</b> ({len(positions)})\n"]
+        total_invested = 0.0
         for i, trade in enumerate(positions, 1):
             sig = trade.get("trade_signals") or {}
-            title = sig.get("title") or str(sig.get("market_id", "—"))[:35]
-            side = sig.get("side", "BUY")
+            title = sig.get("title") or str(sig.get("market_id", "—"))[:40]
             price = float(sig.get("price") or 0)
             size = float(trade.get("size_usdc") or 0)
+            total_invested += size
             status = trade.get("status", "—")
-            st_icon = status_icons.get(status, "❓")
-            err = trade.get("error_msg") or ""
+            st_icon = "✅" if status == "confirmed" else "⏳"
             lines.append(
                 f"{i}. {st_icon} <b>{title}</b>\n"
-                f"   {side} @ {price:.4f} · <b>${size:.2f}</b>"
-                + (f"\n   ⚠️ <i>{err[:120]}</i>" if err and status == "failed" else "")
+                f"   BUY @ {price:.3f} · <b>${size:.2f} USDC</b>"
             )
+        lines.append(f"\n💼 <b>Итого вложено: ${total_invested:.2f} USDC</b>")
         await query.edit_message_text(
             "\n\n".join(lines),
             parse_mode="HTML",

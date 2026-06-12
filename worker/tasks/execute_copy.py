@@ -44,6 +44,18 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         float(user.get("max_position_usdc") or 25),
     )
 
+    # Check USDC balance before attempting trade
+    try:
+        from core.polygon import get_balances
+        balances = get_balances(user["wallet_address"])
+        usdc_balance = balances.get("total_usdc", 0)
+        if usdc_balance < size_usdc:
+            _notify_low_balance(user["telegram_id"], usdc_balance, size_usdc, signal)
+            log.warning("skip_low_balance", user_id=user_id, balance=usdc_balance, needed=size_usdc)
+            return {"skipped": True, "reason": "low_balance"}
+    except Exception:
+        log.warning("balance_check_failed", user_id=user_id)
+
     # Only copy BUY signals — SELL requires owning the token first
     if signal.get("side", "").upper() in ("SELL", "NO"):
         log.debug("skip_sell_signal", user_id=user_id)
@@ -117,6 +129,31 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         }).eq("id", trade_row["id"]).execute()
         log.exception("copy_trade_failed", user_id=user_id)
         raise self.retry(exc=exc)
+
+
+def _notify_low_balance(telegram_id: int, balance: float, needed: float, signal: dict) -> None:
+    from telegram import Bot
+    from core.config import settings
+
+    async def _send() -> None:
+        bot = Bot(token=settings.telegram_bot_token)
+        title = signal.get("title") or "—"
+        await bot.send_message(
+            chat_id=telegram_id,
+            text=(
+                f"⚠️ <b>Недостаточно средств для сделки</b>\n\n"
+                f"📌 {title}\n\n"
+                f"💰 Нужно: <b>${needed:.2f} USDC</b>\n"
+                f"💼 На балансе: <b>${balance:.2f} USDC</b>\n\n"
+                f"Пополни кошелёк через /wallet чтобы не пропускать сделки."
+            ),
+            parse_mode="HTML",
+        )
+
+    try:
+        asyncio.get_event_loop().run_until_complete(_send())
+    except Exception:
+        log.exception("notify_low_balance_failed", telegram_id=telegram_id)
 
 
 def _notify(telegram_id: int, signal: dict, order_id: str) -> None:
