@@ -108,6 +108,6 @@ async def _broadcast(user_ids: list[int], message: str) -> None:
 
     for row in res.data:
         try:
-            await bot.send_message(chat_id=row["telegram_id"], text=message)
+            await bot.send_message(chat_id=row["telegram_id"], text=message, parse_mode="HTML")
         except Exception:
             log.warning("notify_failed", telegram_id=row.get("telegram_id"))

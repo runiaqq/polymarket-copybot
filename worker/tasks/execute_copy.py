@@ -74,11 +74,13 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
 
     # Save signal + trade record
     sig_row = insert_trade_signal({
-        "donor_id":  signal.get("donor_db_id", 1),
-        "market_id": signal["market_id"],
-        "side":      signal["side"],
-        "price":     signal["price"],
-        "size_usdc": size_usdc,
+        "donor_id":       signal.get("donor_db_id", 1),
+        "market_id":      signal["market_id"],
+        "title":          signal.get("title", ""),
+        "side":           signal["side"],
+        "price":          signal["price"],
+        "size_usdc":      size_usdc,
+        "source_tx_hash": signal.get("source_tx_hash", ""),
     })
     trade_row = insert_copy_trade({
         "user_id":   user["id"],

@@ -189,6 +189,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("resume",    cmd_resume))
     app.add_handler(CommandHandler("balance",   cmd_balance))
     app.add_handler(CommandHandler("withdraw",  cmd_withdraw))
+    app.add_handler(CommandHandler("register",  cmd_register))
     app.add_handler(CallbackQueryHandler(callback_handler))
     # Must be last — catches free-text input
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
@@ -429,6 +430,43 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode="HTML",
         reply_markup=_settings_kb(copy_active, max_pos),
     )
+
+
+async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_user = update.effective_user
+    if not tg_user:
+        return
+    db_user = get_user_by_telegram_id(tg_user.id)
+    if not db_user or not db_user.get("wallet_private_key_enc"):
+        await update.message.reply_text("Сначала отправь /start", parse_mode="HTML")  # type: ignore[union-attr]
+        return
+    msg = await update.message.reply_text(  # type: ignore[union-attr]
+        "⏳ <b>Регистрирую кошелёк в Polymarket...</b>\n\nЭто займёт 30-60 секунд.",
+        parse_mode="HTML",
+    )
+    try:
+        from core.clob import register_wallet
+        result = register_wallet(db_user["wallet_private_key_enc"])
+        await msg.edit_text(  # type: ignore[union-attr]
+            "✅ <b>Кошелёк зарегистрирован!</b>\n\n"
+            "Теперь бот может копировать сделки на Polymarket.\n"
+            "Убедись что копирование включено: /resume",
+            parse_mode="HTML",
+        )
+    except ValueError as exc:
+        await msg.edit_text(  # type: ignore[union-attr]
+            f"⛽️ <b>Нужен MATIC для газа</b>\n\n"
+            f"{exc}\n\n"
+            f"Отправь хотя бы <b>0.1 MATIC</b> на кошелёк и повтори /register\n\n"
+            f"<code>{db_user.get('wallet_address', '')}</code>",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        log.exception("register_failed", user=tg_user.id)
+        await msg.edit_text(  # type: ignore[union-attr]
+            f"❌ <b>Ошибка регистрации:</b>\n<code>{str(exc)[:300]}</code>",
+            parse_mode="HTML",
+        )
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

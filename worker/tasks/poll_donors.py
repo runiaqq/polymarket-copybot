@@ -38,21 +38,37 @@ def poll_donor_trades() -> dict:
     user_ids = [u["id"] for u in subscribers]
     signals_dispatched = 0
 
+    # DB-level dedup: load recent tx hashes from DB to survive restarts
+    try:
+        recent_sigs = sb.table("trade_signals") \
+            .select("source_tx_hash") \
+            .not_.is_("source_tx_hash", "null") \
+            .order("created_at", desc=True) \
+            .limit(500) \
+            .execute()
+        db_seen = {r["source_tx_hash"] for r in (recent_sigs.data or [])}
+    except Exception:
+        db_seen = set()
+
     for donor in donors:
         address = donor["address"]
         trades = fetch_donor_recent_trades(address, limit=5)
 
         if address not in _seen_trades:
-            # First poll — seed the cache, don't copy
+            # First poll — seed in-memory cache, don't copy
             _seen_trades[address] = {t.get("id", t.get("trade_id", "")) for t in trades}
             continue
 
         for trade in trades:
             trade_id = trade.get("id") or trade.get("trade_id", "")
-            if not trade_id or trade_id in _seen_trades[address]:
+            if not trade_id:
+                continue
+            # Check both in-memory and DB caches
+            if trade_id in _seen_trades[address] or trade_id in db_seen:
                 continue
 
             _seen_trades[address].add(trade_id)
+            db_seen.add(trade_id)
 
             # Parse trade fields (size_usdc already normalised by fetch_donor_recent_trades)
             price = float(trade.get("price", 0))
@@ -86,6 +102,7 @@ def poll_donor_trades() -> dict:
                 "side":         side,
                 "price":        price,
                 "size_usdc":    size_usdc,
+                "source_tx_hash": trade_id,
                 "donor_address": address,
                 "donor_db_id":  donor.get("id", 1),
                 "donor_label":  donor.get("label") or address[:8],

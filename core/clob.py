@@ -12,6 +12,16 @@ log = structlog.get_logger(__name__)
 CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 
+# Polymarket contract addresses on Polygon
+CTF_EXCHANGE        = "0x4bFb41d5B3570DeFd03C39a9A4D8DE6BD8B8982E"
+NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+NEG_RISK_ADAPTER    = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+USDC_ADDRESS        = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e
+MAX_UINT            = 2**256 - 1
+
+_ERC20_APPROVE_ABI = [{"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}]
+_ERC1155_APPROVAL_ABI = [{"inputs":[{"name":"operator","type":"address"},{"name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"}]
+
 
 def _make_client(private_key: str, api_creds: dict | None = None):
     from py_clob_client_v2 import ApiCreds, ClobClient
@@ -32,10 +42,66 @@ def _make_client(private_key: str, api_creds: dict | None = None):
     )
 
 
+def register_wallet(private_key_enc: str) -> dict:
+    """
+    One-time wallet registration for Polymarket CLOB trading.
+    Approves USDC and CTF contracts so orders can be matched on-chain.
+    Requires a small amount of MATIC for gas (~0.01 MATIC).
+    """
+    from web3 import Web3
+    from core.config import settings
+
+    private_key = decrypt_key(private_key_enc)
+    w3 = Web3(Web3.HTTPProvider(settings.polygon_rpc_url))
+    account = w3.eth.account.from_key(private_key)
+    address = account.address
+
+    matic_balance = w3.eth.get_balance(address)
+    if matic_balance < w3.to_wei(0.005, "ether"):
+        raise ValueError(
+            f"Недостаточно MATIC для регистрации. "
+            f"Нужно минимум 0.005 MATIC, на балансе: "
+            f"{w3.from_wei(matic_balance, 'ether'):.6f} MATIC"
+        )
+
+    gas_price = w3.eth.gas_price
+    nonce = w3.eth.get_transaction_count(address)
+    receipts = []
+
+    def _send_tx(contract_address: str, abi: list, fn_name: str, *args):
+        nonlocal nonce
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(contract_address), abi=abi
+        )
+        fn = getattr(contract.functions, fn_name)(*args)
+        tx = fn.build_transaction({
+            "from": address,
+            "nonce": nonce,
+            "gasPrice": gas_price,
+            "gas": 100_000,
+        })
+        signed = w3.eth.account.sign_transaction(tx, private_key)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        nonce += 1
+        log.info("approval_tx", fn=fn_name, contract=contract_address[:10], tx=tx_hash.hex()[:16])
+        return receipt
+
+    # 1. Approve USDC for CTF Exchange
+    _send_tx(USDC_ADDRESS, _ERC20_APPROVE_ABI, "approve", Web3.to_checksum_address(CTF_EXCHANGE), MAX_UINT)
+    # 2. Approve USDC for Neg Risk CTF Exchange
+    _send_tx(USDC_ADDRESS, _ERC20_APPROVE_ABI, "approve", Web3.to_checksum_address(NEG_RISK_CTF_EXCHANGE), MAX_UINT)
+    # 3. CTF Exchange → Neg Risk Adapter approval
+    _send_tx(CTF_EXCHANGE, _ERC1155_APPROVAL_ABI, "setApprovalForAll", Web3.to_checksum_address(NEG_RISK_ADAPTER), True)
+
+    log.info("wallet_registered", address=address)
+    return {"registered": True, "address": address}
+
+
 def generate_api_creds(private_key_enc: str) -> dict:
     """
     Generate Polymarket CLOB API credentials via L1 (EIP-712) auth.
-    Called once per user wallet.
+    Called once per user wallet. Runs wallet registration first if needed.
     """
     private_key = decrypt_key(private_key_enc)
     client = _make_client(private_key)
