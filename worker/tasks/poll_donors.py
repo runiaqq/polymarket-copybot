@@ -54,10 +54,9 @@ def poll_donor_trades() -> dict:
 
             _seen_trades[address].add(trade_id)
 
-            # Parse trade fields
+            # Parse trade fields (size_usdc already normalised by fetch_donor_recent_trades)
             price = float(trade.get("price", 0))
-            size = float(trade.get("size", 0))
-            size_usdc = price * size
+            size_usdc = float(trade.get("size_usdc") or trade.get("size", 0))
             side = (trade.get("side") or "BUY").upper()
 
             if size_usdc < settings.min_trade_size_usdc:
