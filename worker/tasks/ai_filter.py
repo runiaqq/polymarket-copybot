@@ -15,6 +15,15 @@ from worker.celery_app import celery_app
 log = structlog.get_logger(__name__)
 openai_client = OpenAI(api_key=settings.openai_api_key)
 
+# In-memory rate limiters (reset on worker restart — acceptable)
+# market_id -> last notification timestamp
+_market_notified: dict[str, float] = {}
+# user_id -> list of notification timestamps (last hour)
+_user_hourly: dict[int, list] = {}
+
+MARKET_COOLDOWN_SEC = 900   # 15 min: same market won't spam
+USER_HOURLY_LIMIT   = 5     # max 5 AI alerts per user per hour
+
 RISK_PROMPT = """\
 Ты аналитик предсказательных рынков. Оцени риск скопированной сделки.
 
@@ -78,21 +87,43 @@ def run_ai_analysis(signal: dict, user_ids: list[int]) -> dict:
 
     # Only notify user if risk is HIGH — avoid spamming on every trade
     if score >= settings.ai_risk_warn_threshold:
-        title = signal.get("title") or signal.get("market_id", "—")[:50]
-        donor = signal.get("donor_label") or signal.get("donor_address", "—")[:10]
-        size  = signal.get("size_usdc", 0)
-        side  = signal.get("side", "BUY")
-        price = signal.get("price", 0)
+        import time
+        now = time.time()
+        market_id = signal.get("market_id", "")
 
-        msg = (
-            f"⚠️ <b>ИИ: Высокий риск {score}/10</b>\n\n"
-            f"📌 <b>{title}</b>\n"
-            f"👤 Донор: {donor}\n"
-            f"📈 {side} @ {price:.4f} · <b>${size:.2f}</b>\n\n"
-            f"💬 {reason}\n\n"
-            "Рассмотри закрытие позиции через /positions"
-        )
-        asyncio.get_event_loop().run_until_complete(_broadcast(user_ids, msg))
+        # Check market-level cooldown (same market won't repeat for 15 min)
+        if now - _market_notified.get(market_id, 0) < MARKET_COOLDOWN_SEC:
+            log.debug("ai_notify_skipped_market_cooldown", market=market_id[:20])
+            return {"score": score, "reason": reason, "notified": False}
+        _market_notified[market_id] = now
+
+        # Check per-user hourly limit
+        filtered_users = []
+        for uid in user_ids:
+            recent = [t for t in _user_hourly.get(uid, []) if now - t < 3600]
+            if len(recent) < USER_HOURLY_LIMIT:
+                recent.append(now)
+                _user_hourly[uid] = recent
+                filtered_users.append(uid)
+            else:
+                log.debug("ai_notify_skipped_hourly_limit", user_id=uid)
+
+        if filtered_users:
+            title = signal.get("title") or signal.get("market_id", "—")[:50]
+            donor = signal.get("donor_label") or signal.get("donor_address", "—")[:10]
+            size  = signal.get("size_usdc", 0)
+            side  = signal.get("side", "BUY")
+            price = signal.get("price", 0)
+
+            msg = (
+                f"⚠️ <b>ИИ: Высокий риск {score}/10</b>\n\n"
+                f"📌 <b>{title}</b>\n"
+                f"👤 Донор: {donor}\n"
+                f"📈 {side} @ {price:.4f} · <b>${size:.2f}</b>\n\n"
+                f"💬 {reason}\n\n"
+                "Рассмотри закрытие позиции через /positions"
+            )
+            asyncio.get_event_loop().run_until_complete(_broadcast(filtered_users, msg))
 
     return {"score": score, "reason": reason}
 

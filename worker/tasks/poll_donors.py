@@ -14,6 +14,9 @@ log = structlog.get_logger(__name__)
 
 # In-memory cache of last seen trade IDs per donor to avoid duplicates
 _seen_trades: dict[str, set[str]] = {}
+# Rate limit: market_id -> last signal timestamp (10 min cooldown per market)
+_market_last_signal: dict[str, float] = {}
+MARKET_SIGNAL_COOLDOWN = 600  # seconds
 
 
 @celery_app.task(name="worker.tasks.poll_donor_trades", queue="periodic")
@@ -69,6 +72,15 @@ def poll_donor_trades() -> dict:
 
             _seen_trades[address].add(trade_id)
             db_seen.add(trade_id)
+
+            # Per-market cooldown: skip if same market was signalled recently
+            import time as _time
+            market_id = trade.get("market") or trade.get("condition_id", "")
+            now_ts = _time.time()
+            if now_ts - _market_last_signal.get(market_id, 0) < MARKET_SIGNAL_COOLDOWN:
+                log.debug("skip_market_cooldown", market=market_id[:20])
+                continue
+            _market_last_signal[market_id] = now_ts
 
             # Parse trade fields (size_usdc already normalised by fetch_donor_recent_trades)
             price = float(trade.get("price", 0))
