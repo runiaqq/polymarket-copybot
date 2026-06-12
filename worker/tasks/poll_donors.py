@@ -81,7 +81,8 @@ def poll_donor_trades() -> dict:
 
             signal = {
                 "market_id":    trade.get("market") or trade.get("condition_id", ""),
-                "token_id":     trade.get("asset_id") or trade.get("token_id"),  # outcome token
+                "token_id":     trade.get("asset_id") or trade.get("token_id"),
+                "title":        trade.get("title", ""),
                 "side":         side,
                 "price":        price,
                 "size_usdc":    size_usdc,

@@ -16,18 +16,18 @@ log = structlog.get_logger(__name__)
 openai_client = OpenAI(api_key=settings.openai_api_key)
 
 RISK_PROMPT = """\
-You are a prediction market risk analyst.
+Ты аналитик предсказательных рынков. Оцени риск скопированной сделки.
 
-Market ID: {market_id}
-Direction copied: {side}
-Price at execution: {price}
-Size: ${size_usdc:.2f} USDC
-Donor win rate (30d): {win_rate}
-Donor ROI (30d): {roi}
+Рынок: {title}
+Направление: {side}
+Цена входа: {price}
+Объём: ${size_usdc:.2f} USDC
+Винрейт донора (30д): {win_rate}
+ROI донора (30д): {roi}
 
-Score the risk of this copied trade from 1 (lowest) to 10 (highest).
-Reply with ONLY valid JSON, no extra text:
-{{"score": <integer 1-10>, "reason": "<max 12 words>"}}
+Оцени риск от 1 (минимальный) до 10 (максимальный).
+Ответь ТОЛЬКО валидным JSON без лишнего текста:
+{{"score": <целое число 1-10>, "reason": "<причина на русском, максимум 12 слов>"}}
 """
 
 
@@ -35,12 +35,12 @@ def _call_gpt(signal: dict) -> tuple[int, str]:
     win_rate = signal.get("donor_win_rate")
     roi = signal.get("donor_roi")
     prompt = RISK_PROMPT.format(
-        market_id=signal["market_id"],
+        title=signal.get("title") or signal.get("market_id", "—")[:60],
         side=signal["side"],
         price=signal["price"],
         size_usdc=signal["size_usdc"],
-        win_rate=f"{win_rate*100:.0f}%" if win_rate else "unknown",
-        roi=f"{roi*100:+.0f}%" if roi else "unknown",
+        win_rate=f"{win_rate*100:.0f}%" if win_rate else "неизвестно",
+        roi=f"{roi*100:+.0f}%" if roi else "неизвестно",
     )
     response = openai_client.chat.completions.create(
         model=settings.openai_model,
@@ -76,20 +76,24 @@ def run_ai_analysis(signal: dict, user_ids: list[int]) -> dict:
         "ai_reason": reason,
     }).eq("market_id", signal["market_id"]).execute()
 
-    # Build message
-    if score <= 4:
-        risk_label = "Низкий риск"
-    elif score <= 6:
-        risk_label = "Средний риск"
-    else:
-        risk_label = "Высокий риск"
-
-    msg = f"AI оценка риска: {score}/10 — {risk_label}\nПричина: {reason}"
-
+    # Only notify user if risk is HIGH — avoid spamming on every trade
     if score >= settings.ai_risk_warn_threshold:
-        msg += "\n\nОсторожно: высокий риск.\nРассмотри закрытие позиции через /positions"
+        title = signal.get("title") or signal.get("market_id", "—")[:50]
+        donor = signal.get("donor_label") or signal.get("donor_address", "—")[:10]
+        size  = signal.get("size_usdc", 0)
+        side  = signal.get("side", "BUY")
+        price = signal.get("price", 0)
 
-    asyncio.get_event_loop().run_until_complete(_broadcast(user_ids, msg))
+        msg = (
+            f"⚠️ <b>ИИ: Высокий риск {score}/10</b>\n\n"
+            f"📌 <b>{title}</b>\n"
+            f"👤 Донор: {donor}\n"
+            f"📈 {side} @ {price:.4f} · <b>${size:.2f}</b>\n\n"
+            f"💬 {reason}\n\n"
+            "Рассмотри закрытие позиции через /positions"
+        )
+        asyncio.get_event_loop().run_until_complete(_broadcast(user_ids, msg))
+
     return {"score": score, "reason": reason}
 
 

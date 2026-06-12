@@ -353,20 +353,24 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             ]]),
         )
         return
-    lines = ["📊 <b>Открытые позиции</b>\n"]
+    lines = ["📊 <b>Мои сделки</b>\n"]
+    status_icons = {"confirmed": "✅", "executing": "⏳", "failed": "❌"}
     for i, trade in enumerate(positions, 1):
         sig = trade.get("trade_signals") or {}
-        market = str(sig.get("market_id", "—"))[:28]
-        side = sig.get("side", "—")
-        price = sig.get("price", 0)
-        size = trade.get("size_usdc", 0)
-        side_icon = "🟢" if side == "YES" else "🔴"
+        title = sig.get("title") or str(sig.get("market_id", "—"))[:35]
+        side = sig.get("side", "BUY")
+        price = float(sig.get("price") or 0)
+        size = float(trade.get("size_usdc") or 0)
+        status = trade.get("status", "—")
+        st_icon = status_icons.get(status, "❓")
+        err = trade.get("error_msg") or ""
         lines.append(
-            f"{i}. {side_icon} <b>{side}</b> @ <code>{price:.4f}</code>\n"
-            f"   💵 ${size:.2f} USDC | <i>{market}…</i>"
+            f"{i}. {st_icon} <b>{title}</b>\n"
+            f"   {side} @ {price:.4f} · <b>${size:.2f}</b>"
+            + (f"\n   ⚠️ <i>{err[:60]}</i>" if err and status == "failed" else "")
         )
     await update.message.reply_text(  # type: ignore[union-attr]
-        "\n".join(lines),
+        "\n\n".join(lines),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
@@ -718,20 +722,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 ]]),
             )
             return
-        lines = ["📊 <b>Открытые позиции</b>\n"]
+        lines = ["📊 <b>Мои сделки</b>\n"]
+        status_icons = {"confirmed": "✅", "executing": "⏳", "failed": "❌"}
         for i, trade in enumerate(positions, 1):
             sig = trade.get("trade_signals") or {}
-            side = sig.get("side", "—")
-            price = sig.get("price", 0)
-            size = trade.get("size_usdc", 0)
-            market = str(sig.get("market_id", "—"))[:28]
-            side_icon = "🟢" if side == "YES" else "🔴"
+            title = sig.get("title") or str(sig.get("market_id", "—"))[:35]
+            side = sig.get("side", "BUY")
+            price = float(sig.get("price") or 0)
+            size = float(trade.get("size_usdc") or 0)
+            status = trade.get("status", "—")
+            st_icon = status_icons.get(status, "❓")
+            err = trade.get("error_msg") or ""
             lines.append(
-                f"{i}. {side_icon} <b>{side}</b> @ <code>{price:.4f}</code>\n"
-                f"   💵 ${size:.2f} USDC | <i>{market}…</i>"
+                f"{i}. {st_icon} <b>{title}</b>\n"
+                f"   {side} @ {price:.4f} · <b>${size:.2f}</b>"
+                + (f"\n   ⚠️ <i>{err[:60]}</i>" if err and status == "failed" else "")
             )
         await query.edit_message_text(
-            "\n".join(lines),
+            "\n\n".join(lines),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🏠 Главное меню", callback_data="menu")

@@ -125,13 +125,15 @@ def _notify(telegram_id: int, signal: dict, order_id: str) -> None:
     async def _send() -> None:
         bot = Bot(token=settings.telegram_bot_token)
         side_icon = "🟢" if signal["side"].upper() in ("BUY", "YES") else "🔴"
-        roi = (signal.get("donor_roi") or 0) * 100
+        donor = signal.get("donor_label") or signal.get("donor_address", "—")[:10]
+        title = signal.get("title") or "—"
         msg = (
             f"⚡️ <b>Сделка скопирована!</b>\n\n"
+            f"📌 <b>{title}</b>\n\n"
             f"{side_icon} {signal['side']} @ <code>{signal['price']:.4f}</code>\n"
-            f"💵 Объём: <b>${signal['size_usdc']:.2f} USDC</b>\n"
-            f"🎯 Донор: {signal.get('donor_label', '?')} (ROI {roi:+.0f}%)\n\n"
-            f"📋 Order ID: <code>{order_id[:20] if order_id else '—'}</code>"
+            f"💵 Вложено: <b>${signal['size_usdc']:.2f} USDC</b>\n"
+            f"👤 Донор: <b>{donor}</b>\n\n"
+            f"📋 <code>{order_id[:24] if order_id else '—'}</code>"
         )
         await bot.send_message(
             chat_id=telegram_id,
