@@ -25,7 +25,7 @@ def monitor_deposits() -> dict:
 
     # Only users with wallets and active subscriptions
     res = sb.table("users").select(
-        "id, telegram_id, wallet_address, balance_usdc"
+        "id, telegram_id, wallet_address, wallet_private_key_enc, balance_usdc"
     ).not_.is_("wallet_address", "null").execute()
 
     users = res.data or []
@@ -42,6 +42,17 @@ def monitor_deposits() -> dict:
             old_balance = float(user.get("balance_usdc") or 0.0)
             diff = new_balance - old_balance
 
+            # Auto-wrap any USDC.e into tradeable pUSD (needs POL for gas).
+            usdc_e = balances.get("usdc_e", 0.0)
+            if usdc_e >= 1.0 and balances.get("matic", 0.0) >= 0.01 and user.get("wallet_private_key_enc"):
+                try:
+                    from core.polygon import wrap_usdce_to_pusd
+                    if wrap_usdce_to_pusd(user["wallet_private_key_enc"], addr):
+                        _notify_wrapped(user["telegram_id"], usdc_e)
+                        notified += 1
+                except Exception:
+                    log.warning("auto_wrap_failed", user_id=user["id"])
+
             # Update stored balance
             sb.table("users").update({"balance_usdc": new_balance}).eq("id", user["id"]).execute()
 
@@ -57,6 +68,28 @@ def monitor_deposits() -> dict:
 
     log.info("deposit_monitor_done", users=len(users), notified=notified)
     return {"users": len(users), "notified": notified}
+
+
+def _notify_wrapped(telegram_id: int, amount: float) -> None:
+    from telegram import Bot
+    from core.config import settings
+
+    async def _send() -> None:
+        bot = Bot(token=settings.telegram_bot_token)
+        await bot.send_message(
+            chat_id=telegram_id,
+            text=(
+                f"♻️ <b>Конвертация выполнена</b>\n\n"
+                f"<b>${amount:.2f} USDC.e → pUSD</b>\n\n"
+                f"Средства готовы к торговле. ▶️ PolyMind копирует сделки!"
+            ),
+            parse_mode="HTML",
+        )
+
+    try:
+        asyncio.get_event_loop().run_until_complete(_send())
+    except Exception:
+        log.exception("wrapped_notify_failed", telegram_id=telegram_id)
 
 
 def _notify_deposit(telegram_id: int, new_balance: float, amount: float) -> None:

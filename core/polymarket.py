@@ -1,51 +1,407 @@
 """
-Polymarket data-api polling — polls donor activity every 30 seconds.
-Uses data-api.polymarket.com/activity?user= which correctly filters by wallet.
+Polymarket data access for the whale-tracking strategy.
+
+Two data sources are used:
+  * Gamma API  (gamma-api.polymarket.com/markets)  — list of "fast" markets that
+    resolve soon, plus per-market trading metadata (tick size, neg-risk, min size).
+  * Data API   (data-api.polymarket.com/trades)     — a GLOBAL feed of recent trades
+    with server-side cash filtering, used to detect large ("whale") buys.
+
+The legacy per-donor poller (`fetch_donor_recent_trades`) is kept for the optional
+donor-copy mode but is no longer the primary signal source.
 """
+
+import json
+import time
+from datetime import datetime, timezone
 
 import httpx
 import structlog
 
+from core.config import settings
+
 log = structlog.get_logger(__name__)
 
-DATA_API_URL = "https://data-api.polymarket.com/activity"
+GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+DATA_API_TRADES_URL = "https://data-api.polymarket.com/trades"
+DATA_API_ACTIVITY_URL = "https://data-api.polymarket.com/activity"
+DATA_API_POSITIONS_URL = "https://data-api.polymarket.com/positions"
+CLOB_BOOK_URL = "https://clob.polymarket.com/book"
+CLOB_FEE_RATE_URL = "https://clob.polymarket.com/fee-rate"
+EVENT_URL_BASE = "https://polymarket.com/event/"
+
+_HEADERS = {"User-Agent": "polymarket-copybot/1.0"}
+
+
+def event_url(event_slug: str | None) -> str | None:
+    """Public Polymarket event page URL for a given event slug."""
+    return f"{EVENT_URL_BASE}{event_slug}" if event_slug else None
+
+# ── Fast-markets cache ──────────────────────────────────────────────────────────
+# condition_id -> market metadata dict
+_fast_markets: dict[str, dict] = {}
+_fast_markets_ts: float = 0.0
+_GAMMA_PAGE = 100
+_GAMMA_MAX_MARKETS = 1000
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        from dateutil.parser import parse as parse_dt
+
+        dt = parse_dt(value)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _hours_until(end_iso: str | None) -> float | None:
+    end = _parse_iso(end_iso)
+    if end is None:
+        return None
+    return (end - datetime.now(timezone.utc)).total_seconds() / 3600
+
+
+def _parse_tokens(m: dict) -> list[str]:
+    raw = m.get("clobTokenIds")
+    if not raw:
+        return []
+    try:
+        toks = json.loads(raw) if isinstance(raw, str) else raw
+        return [str(t) for t in toks if t]
+    except Exception:
+        return []
+
+
+def _build_market_meta(m: dict) -> dict | None:
+    """Normalise a Gamma market into the metadata we need, or None if untradeable."""
+    if not m.get("acceptingOrders") or not m.get("enableOrderBook"):
+        return None
+    if m.get("closed") or not m.get("active"):
+        return None
+
+    condition_id = m.get("conditionId")
+    if not condition_id:
+        return None
+
+    end_iso = m.get("endDateIso") or m.get("endDate")
+    hours_left = _hours_until(end_iso)
+    if hours_left is None or hours_left <= 0:
+        return None
+    if hours_left > settings.market_max_hours_to_resolve:
+        return None
+    # Skip ultra-fast markets (thin books, HFT-dominated) per strategy config.
+    if hours_left < settings.market_min_hours_to_resolve:
+        return None
+
+    liquidity = float(m.get("liquidityNum") or 0)
+    if settings.market_min_liquidity_usdc > 0 and liquidity < settings.market_min_liquidity_usdc:
+        return None
+
+    tokens = _parse_tokens(m)
+    if not tokens:
+        return None
+
+    events = m.get("events") or []
+    event_slug = (events[0].get("slug") if events else None) or m.get("slug")
+
+    return {
+        "condition_id": condition_id,
+        "title": m.get("question", ""),
+        "end_date_iso": end_iso,
+        "hours_to_resolve": round(hours_left, 2),
+        "tick_size": str(m.get("orderPriceMinTickSize") or "0.01"),
+        "min_size": float(m.get("orderMinSize") or 5),
+        "neg_risk": bool(m.get("negRisk", False)),
+        "liquidity": liquidity,
+        "tokens": tokens,
+        "event_slug": event_slug,
+    }
+
+
+def refresh_fast_markets() -> dict[str, dict]:
+    """Rebuild the fast-markets cache from Gamma. Returns condition_id -> meta."""
+    now = datetime.now(timezone.utc)
+    end_max = now.timestamp() + settings.market_max_hours_to_resolve * 3600
+    params_base = {
+        "closed": "false",
+        "active": "true",
+        "end_date_min": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end_date_max": datetime.fromtimestamp(end_max, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+        "order": "volume24hr",
+        "ascending": "false",
+        "limit": _GAMMA_PAGE,
+    }
+
+    markets: dict[str, dict] = {}
+    offset = 0
+    try:
+        with httpx.Client(timeout=15.0, headers=_HEADERS) as client:
+            while offset < _GAMMA_MAX_MARKETS:
+                params = dict(params_base, offset=offset)
+                resp = client.get(GAMMA_MARKETS_URL, params=params)
+                resp.raise_for_status()
+                batch = resp.json()
+                if not isinstance(batch, list) or not batch:
+                    break
+                for m in batch:
+                    meta = _build_market_meta(m)
+                    if meta:
+                        markets[meta["condition_id"]] = meta
+                if len(batch) < _GAMMA_PAGE:
+                    break
+                offset += _GAMMA_PAGE
+    except Exception:
+        log.exception("refresh_fast_markets_failed")
+        # Keep the previous cache on failure
+        return _fast_markets
+
+    log.info("fast_markets_refreshed", count=len(markets))
+    return markets
+
+
+def get_fast_markets(force: bool = False) -> dict[str, dict]:
+    """Return the cached fast-markets map, refreshing it if stale."""
+    global _fast_markets, _fast_markets_ts
+    now = time.time()
+    if force or not _fast_markets or (now - _fast_markets_ts) > settings.fast_markets_refresh_sec:
+        _fast_markets = refresh_fast_markets()
+        _fast_markets_ts = now
+    return _fast_markets
+
+
+def get_watch_markets() -> dict[str, dict]:
+    """
+    Build a token_id -> market-meta map for every tradeable fast market in range.
+    Used by the WebSocket listener to know what to subscribe to and how to size/guard.
+    Capped at watch_max_markets (markets ordered by Gamma volume24hr).
+    """
+    markets = list(get_fast_markets().values())
+    # Already ordered by volume from Gamma; cap the universe.
+    markets = markets[: settings.watch_max_markets]
+
+    token_map: dict[str, dict] = {}
+    for meta in markets:
+        for token_id in meta.get("tokens", []):
+            token_map[token_id] = {**meta, "token_id": token_id}
+    return token_map
+
+
+def normalize_book(raw: dict) -> dict:
+    """
+    Normalise a CLOB /book (or WS book) payload to sorted bids/asks (best first)
+    plus best_bid / best_ask. Sizes/prices are floats.
+    """
+    def _levels(side: list, *, descending: bool) -> list[dict]:
+        out = []
+        for lvl in side or []:
+            try:
+                out.append({"price": float(lvl["price"]), "size": float(lvl["size"])})
+            except (KeyError, TypeError, ValueError):
+                continue
+        out.sort(key=lambda x: x["price"], reverse=descending)
+        return out
+
+    bids = _levels(raw.get("bids", []), descending=True)   # best (highest) first
+    asks = _levels(raw.get("asks", []), descending=False)  # best (lowest) first
+    return {
+        "bids": bids,
+        "asks": asks,
+        "best_bid": bids[0]["price"] if bids else None,
+        "best_ask": asks[0]["price"] if asks else None,
+        "tick_size": str(raw.get("tick_size") or "0.01"),
+        "neg_risk": bool(raw.get("neg_risk", False)),
+        "min_order_size": float(raw.get("min_order_size") or 1),
+    }
+
+
+def get_order_book(token_id: str) -> dict | None:
+    """Fetch and normalise the live order book for a token via CLOB REST."""
+    try:
+        resp = httpx.get(CLOB_BOOK_URL, params={"token_id": token_id}, timeout=10.0,
+                         headers=_HEADERS)
+        resp.raise_for_status()
+        return normalize_book(resp.json())
+    except Exception:
+        log.exception("get_order_book_failed", token=token_id[:18])
+        return None
+
+
+def get_fee_rate(token_id: str) -> float:
+    """Return the market's base fee (basis points). Falls back to 0 on error."""
+    try:
+        resp = httpx.get(CLOB_FEE_RATE_URL, params={"token_id": token_id}, timeout=10.0,
+                         headers=_HEADERS)
+        resp.raise_for_status()
+        return float(resp.json().get("base_fee", 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def fetch_whale_trades(min_usdc: float | None = None, limit: int | None = None) -> list[dict]:
+    """
+    Fetch the most recent large BUY trades across ALL markets via the global feed.
+    Server-side filtered by cash size (filterType=CASH). Returns normalised trades.
+    """
+    min_usdc = min_usdc if min_usdc is not None else settings.whale_min_usdc
+    limit = limit if limit is not None else settings.scan_trades_limit
+    try:
+        resp = httpx.get(
+            DATA_API_TRADES_URL,
+            params={
+                "takerOnly": "true",
+                "filterType": "CASH",
+                "filterAmount": min_usdc,
+                "limit": limit,
+            },
+            timeout=15.0,
+            headers=_HEADERS,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        if not isinstance(raw, list):
+            raw = raw.get("data", []) if isinstance(raw, dict) else []
+
+        trades: list[dict] = []
+        for t in raw:
+            price = float(t.get("price") or 0)
+            shares = float(t.get("size") or 0)
+            usdc_size = round(shares * price, 2)
+            trades.append({
+                "tx_hash": t.get("transactionHash", ""),
+                "condition_id": t.get("conditionId", ""),
+                "token_id": t.get("asset", ""),
+                "side": (t.get("side") or "BUY").upper(),
+                "outcome": t.get("outcome", ""),
+                "price": price,
+                "shares": shares,
+                "size_usdc": usdc_size,
+                "title": t.get("title", ""),
+                "whale_wallet": t.get("proxyWallet", ""),
+                "whale_name": t.get("name") or t.get("pseudonym") or "",
+                "timestamp": t.get("timestamp", 0),
+            })
+        return trades
+    except Exception:
+        log.exception("fetch_whale_trades_failed")
+        return []
+
+
+def get_positions(wallet_address: str) -> list[dict]:
+    """
+    Fetch the wallet's open positions with live P&L from the Polymarket data API.
+    Returns normalised dicts (size in shares, prices/PnL in USDC terms).
+    """
+    try:
+        resp = httpx.get(
+            DATA_API_POSITIONS_URL,
+            params={"user": wallet_address, "limit": 100},
+            timeout=15.0,
+            headers=_HEADERS,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        if not isinstance(raw, list):
+            raw = raw.get("data", []) if isinstance(raw, dict) else []
+
+        out = []
+        for p in raw:
+            out.append({
+                "token_id":     str(p.get("asset", "")),
+                "condition_id": p.get("conditionId", ""),
+                "title":        p.get("title", ""),
+                "outcome":      p.get("outcome", ""),
+                "shares":       float(p.get("size") or 0),
+                "avg_price":    float(p.get("avgPrice") or 0),
+                "cur_price":    float(p.get("curPrice") or 0),
+                "current_value": float(p.get("currentValue") or 0),
+                "cash_pnl":     float(p.get("cashPnl") or 0),
+                "percent_pnl":  float(p.get("percentPnl") or 0),
+                "realized_pnl": float(p.get("realizedPnl") or 0),
+                "redeemable":   bool(p.get("redeemable", False)),
+                "neg_risk":     bool(p.get("negativeRisk", False)),
+                "end_date":     p.get("endDate"),
+                "event_slug":   p.get("eventSlug") or p.get("slug"),
+            })
+        return out
+    except Exception:
+        log.exception("get_positions_failed", wallet=wallet_address[:10])
+        return []
+
+
+def get_closed_positions(wallet_address: str) -> list[dict]:
+    """
+    Fetch settled/flat positions (resolved or fully sold) with realized P&L.
+    cur_price ~1 = won, ~0 = lost; values in between = sold before resolution.
+    `timestamp` is the settlement/close unix time.
+    """
+    try:
+        resp = httpx.get(
+            "https://data-api.polymarket.com/closed-positions",
+            params={"user": wallet_address, "limit": 100},
+            timeout=15.0,
+            headers=_HEADERS,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        if not isinstance(raw, list):
+            raw = raw.get("data", []) if isinstance(raw, dict) else []
+
+        out = []
+        for p in raw:
+            out.append({
+                "token_id":     str(p.get("asset", "")),
+                "condition_id": p.get("conditionId", ""),
+                "title":        p.get("title", ""),
+                "outcome":      p.get("outcome", ""),
+                "realized_pnl": float(p.get("realizedPnl") or 0),
+                "cur_price":    float(p.get("curPrice") or 0),
+                "timestamp":    int(p.get("timestamp") or 0),
+                "event_slug":   p.get("eventSlug") or p.get("slug"),
+            })
+        return out
+    except Exception:
+        log.exception("get_closed_positions_failed", wallet=wallet_address[:10])
+        return []
 
 
 def fetch_donor_recent_trades(maker_address: str, limit: int = 10) -> list[dict]:
     """
-    Fetch recent trades for a donor wallet via Polymarket data API.
-    Returns normalised list of trade dicts ready for poll_donors to consume.
+    Legacy: fetch recent trades for a specific donor wallet (optional donor-copy mode).
     """
     try:
         resp = httpx.get(
-            DATA_API_URL,
+            DATA_API_ACTIVITY_URL,
             params={"user": maker_address, "limit": limit},
             timeout=10.0,
-            headers={"User-Agent": "polymarket-copybot/1.0"},
+            headers=_HEADERS,
         )
         resp.raise_for_status()
-        raw: list[dict] = resp.json()
+        raw = resp.json()
         if not isinstance(raw, list):
-            raw = raw.get("data", [])
+            raw = raw.get("data", []) if isinstance(raw, dict) else []
 
-        # Normalise field names so poll_donors works without change
         normalised = []
         for t in raw:
             if t.get("type") != "TRADE":
                 continue
             normalised.append({
-                "id":          t.get("transactionHash", ""),
-                "trade_id":    t.get("transactionHash", ""),
-                "market":      t.get("conditionId", ""),
+                "id":           t.get("transactionHash", ""),
+                "trade_id":     t.get("transactionHash", ""),
+                "market":       t.get("conditionId", ""),
                 "condition_id": t.get("conditionId", ""),
-                "asset_id":    t.get("asset", ""),
-                "token_id":    t.get("asset", ""),
-                "side":        t.get("side", "BUY"),
-                "price":       float(t.get("price") or 0),
-                "size":        float(t.get("usdcSize") or 0),  # already in USDC
-                "size_usdc":   float(t.get("usdcSize") or 0),
-                "timestamp":   t.get("timestamp", 0),
-                "title":       t.get("title", ""),
+                "asset_id":     t.get("asset", ""),
+                "token_id":     t.get("asset", ""),
+                "side":         t.get("side", "BUY"),
+                "price":        float(t.get("price") or 0),
+                "size":         float(t.get("usdcSize") or 0),
+                "size_usdc":    float(t.get("usdcSize") or 0),
+                "timestamp":    t.get("timestamp", 0),
+                "title":        t.get("title", ""),
             })
         return normalised
     except Exception:

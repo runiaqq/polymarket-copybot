@@ -15,9 +15,12 @@ from telegram.ext import (
 
 from core.config import settings
 from core.db import (
+    create_access_code,
+    get_subscription_status,
     get_user_by_telegram_id,
-    get_user_open_positions,
-    get_user_pnl_stats,
+    get_user_by_username,
+    redeem_access_code,
+    set_subscription,
     update_user,
     upsert_user,
 )
@@ -46,6 +49,10 @@ def _wallet_kb() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("🔄 Обновить баланс", callback_data="wallet_balance"),
             InlineKeyboardButton("💸 Вывод",           callback_data="withdraw_start"),
+        ],
+        [
+            InlineKeyboardButton("♻️ В pUSD", callback_data="wrap"),
+            InlineKeyboardButton("🔐 Регистрация", callback_data="register"),
         ],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
     ])
@@ -84,6 +91,45 @@ def _settings_kb(copy_active: bool, current_max: float) -> InlineKeyboardMarkup:
 
 # ─── Text builders ────────────────────────────────────────────────────────────
 
+MIN_USDC_READY = 5.0
+MIN_POL_READY = 0.05
+
+
+def _checklist(db_user: dict) -> str:
+    """Onboarding checklist with live status of each prerequisite step."""
+    addr = db_user.get("wallet_address")
+    balances = {}
+    if addr:
+        try:
+            from core.polygon import get_balances
+            balances = get_balances(addr)
+        except Exception:
+            balances = {}
+
+    pusd = balances.get("pusd", 0)
+    usdc_e = balances.get("usdc_e", 0)
+    pol = balances.get("matic", 0)
+
+    sub = get_subscription_status(db_user.get("telegram_id")) if db_user.get("telegram_id") else {"active": False}
+    registered = bool(db_user.get("wallet_registered"))
+    copy_active = bool(db_user.get("copy_active"))
+    funded = (pusd + usdc_e) >= MIN_USDC_READY
+
+    def mark(ok: bool) -> str:
+        return "✅" if ok else "⬜️"
+
+    lines = ["📋 <b>Чек-лист запуска</b>\n"]
+    lines.append(f"{mark(funded)} 1. Пополнить <b>USDC.e</b> (Polygon)")
+    lines.append(f"{mark(pol >= MIN_POL_READY)} 2. Пополнить <b>POL</b> для газа (~0.1)")
+    lines.append(f"{mark(registered)} 3. Зарегистрировать кошелёк (/register)")
+    lines.append(f"{mark(pusd >= MIN_USDC_READY)} 4. Конвертация в <b>pUSD</b> (авто / /wrap)")
+    if usdc_e >= MIN_USDC_READY and pusd < MIN_USDC_READY:
+        lines.append("    ♻️ Есть USDC.e — нажми /wrap для конвертации")
+    lines.append(f"{mark(sub.get('active'))} 5. Активная подписка")
+    lines.append(f"{mark(copy_active)} 6. Копирование включено")
+    return "\n".join(lines)
+
+
 def _dashboard_text(db_user: dict, first_name: str) -> str:
     addr = db_user.get("wallet_address", "—")
     addr_short = f"{addr[:6]}…{addr[-4:]}" if addr != "—" else "—"
@@ -92,12 +138,15 @@ def _dashboard_text(db_user: dict, first_name: str) -> str:
     max_pos = db_user.get("max_position_usdc") or 25
     return (
         f"👋 <b>Привет, {first_name}!</b>\n\n"
-        "🧠 <b>PolyMind AI</b> — интеллектуальный копитрейдинг\n\n"
+        "🧠 <b>PolyMind AI</b> — интеллектуальный копитрейдинг\n"
+        "Бот следит за крупными покупками китов на быстрых рынках "
+        "и копирует их на твой кошелёк, а ИИ присылает анализ.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"💼 Кошелёк: <code>{addr_short}</code>\n"
         f"🔄 Автокопирование: {copy_icon}\n"
         f"💵 Макс. позиция: <b>${max_pos:.0f} USDC</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{_checklist(db_user)}\n\n"
         "👇 Управляй через кнопки"
     )
 
@@ -105,16 +154,20 @@ def _dashboard_text(db_user: dict, first_name: str) -> str:
 def _new_user_text(addr: str) -> str:
     return (
         "🧠 <b>Добро пожаловать в PolyMind AI!</b>\n\n"
-        "Твой персональный торговый кошелёк создан и готов к работе.\n\n"
+        "Твой персональный торговый кошелёк создан.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "📬 <b>Адрес для пополнения:</b>\n"
         f"<code>{addr}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "⚡️ <b>Как начать зарабатывать:</b>\n"
-        "1️⃣ Пополни баланс в USDC (сеть Polygon)\n"
-        "2️⃣ PolyMind автоматически скопирует сделки топ-трейдеров\n"
-        "3️⃣ Отслеживай позиции и P&L в боте\n\n"
-        "⚠️ Только <b>Polygon</b> — не Ethereum, не BSC!"
+        "⚡️ <b>Как запустить (по шагам):</b>\n"
+        "1️⃣ Пополни <b>USDC.e</b> в сети <b>Polygon</b> (бот сам сконвертирует в pUSD)\n"
+        "2️⃣ Пополни немного <b>POL</b> (~0.1) — нужен на газ\n"
+        "3️⃣ Нажми <b>🔐 Зарегистрировать кошелёк</b> или /register\n"
+        "4️⃣ Активируй подписку (обратись к администратору)\n"
+        "5️⃣ Готово — бот копирует крупные сделки китов\n\n"
+        "⚠️ Только <b>Polygon</b> и именно <b>USDC.e</b> (bridged) — "
+        "не Ethereum, не BSC, не нативный USDC!\n"
+        "ℹ️ Торговля идёт в <b>pUSD</b> (V2) — конвертация из USDC.e автоматическая."
     )
 
 
@@ -124,12 +177,22 @@ HELP_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━━\n"
     "⚡️ <b>Принцип работы</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "1️⃣ <b>Мониторинг</b> — PolyMind каждые 30 секунд "
-    "отслеживает сделки проверенных трейдеров Polymarket\n\n"
-    "2️⃣ <b>ИИ-анализ</b> — нейросеть оценивает риск каждой "
-    "сделки и фильтрует нежелательные позиции\n\n"
-    "3️⃣ <b>Автокопирование</b> — прошедшие проверку сделки "
-    "мгновенно дублируются на твоём кошельке\n\n"
+    "1️⃣ <b>Мониторинг китов</b> — PolyMind сканирует быстрые рынки "
+    "(резолв 1–2 дня) и ловит крупные покупки (от $5000)\n\n"
+    "2️⃣ <b>Автокопирование</b> — при крупной покупке бот сразу "
+    "открывает позицию на твоём кошельке\n\n"
+    "3️⃣ <b>ИИ-анализ</b> — нейросеть оценивает риск и присылает "
+    "тебе разбор сделки\n\n"
+
+    "━━━━━━━━━━━━━━━━━━━━━\n"
+    "🚀 <b>С чего начать</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n"
+    "1. Пополни <b>USDC.e</b> (Polygon) — бот сконвертирует в pUSD\n"
+    "2. Пополни <b>POL</b> (~0.1) — на газ\n"
+    "3. /register — регистрация кошелька в Polymarket\n"
+    "4. /wrap — конвертация USDC.e → pUSD (если не авто)\n"
+    "5. Активируй подписку у администратора\n"
+    "6. /resume — включи копирование\n\n"
 
     "━━━━━━━━━━━━━━━━━━━━━\n"
     "📋 <b>Команды</b>\n"
@@ -137,6 +200,8 @@ HELP_TEXT = (
     "/start — 🏠 Главное меню\n"
     "/wallet — 💼 Кошелёк и баланс\n"
     "/balance — 💵 Быстрая проверка баланса\n"
+    "/register — 🔐 Регистрация кошелька\n"
+    "/subscription — ⭐️ Статус подписки\n"
     "/positions — 📊 Активные позиции\n"
     "/pnl — 💰 Статистика прибыли\n"
     "/settings — ⚙️ Размер позиций\n"
@@ -145,11 +210,11 @@ HELP_TEXT = (
     "/resume — ▶️ Возобновить\n\n"
 
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "💡 <b>Советы</b>\n"
+    "💡 <b>Важно</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "• Рекомендуемый баланс: <b>$50–200 USDC</b>\n"
+    "• Торговля идёт в <b>pUSD</b> (V2); пополняешь USDC.e, бот конвертирует\n"
+    "• Без <b>POL</b> на газ регистрация, конвертация и вывод не пройдут\n"
     "• Оптимальный размер позиции: <b>$5–25 USDC</b>\n"
-    "• Используй /stop чтобы взять паузу в любой момент\n"
     "• Кошелёк полностью в твоём управлении\n\n"
 
     "💬 Вопросы? Обратись к администратору."
@@ -163,6 +228,9 @@ async def _set_commands(app: Application) -> None:
         BotCommand("start",    "🏠 Главное меню"),
         BotCommand("wallet",   "💼 Кошелёк и баланс"),
         BotCommand("balance",  "💵 Проверить баланс"),
+        BotCommand("register", "🔐 Зарегистрировать кошелёк"),
+        BotCommand("wrap",     "♻️ Конвертировать в pUSD"),
+        BotCommand("subscription", "⭐️ Статус подписки"),
         BotCommand("withdraw", "💸 Вывод средств"),
         BotCommand("positions","📊 Открытые позиции"),
         BotCommand("pnl",      "💰 Статистика P&L"),
@@ -186,6 +254,11 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("balance",   cmd_balance))
     app.add_handler(CommandHandler("withdraw",  cmd_withdraw))
     app.add_handler(CommandHandler("register",  cmd_register))
+    app.add_handler(CommandHandler("wrap",      cmd_wrap))
+    app.add_handler(CommandHandler("subscription", cmd_subscription))
+    app.add_handler(CommandHandler("grant",     cmd_grant))
+    app.add_handler(CommandHandler("newcode",   cmd_newcode))
+    app.add_handler(CommandHandler("codes",     cmd_codes))
     app.add_handler(CallbackQueryHandler(callback_handler))
     # Must be last — catches free-text input
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
@@ -200,6 +273,33 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     db_user = upsert_user(tg_user.id)
+
+    # Keep the stored username fresh so admins can extend by @nick.
+    if tg_user.username and db_user.get("username") != tg_user.username:
+        try:
+            update_user(tg_user.id, {"username": tg_user.username})
+        except Exception:
+            log.warning("username_update_failed", telegram_id=tg_user.id)
+
+    # Deep-link activation: t.me/Bot?start=<code> → /start <code>
+    if context.args:
+        code = (context.args[0] or "").strip()
+        if code:
+            result = redeem_access_code(code, tg_user.id)
+            if result.get("ok"):
+                exp = (result.get("expires_at") or "")[:10]
+                await update.message.reply_text(  # type: ignore[union-attr]
+                    f"✅ <b>Подписка активирована!</b>\n\n"
+                    f"Действует до: <b>{exp}</b>\n\n"
+                    f"Теперь пройди шаги ниже, и бот начнёт копировать сделки.",
+                    parse_mode="HTML",
+                )
+            elif result.get("reason") in ("used", "invalid"):
+                await update.message.reply_text(  # type: ignore[union-attr]
+                    "⚠️ <b>Код недействителен или уже использован.</b>\n"
+                    "Обратись к администратору за новой ссылкой.",
+                    parse_mode="HTML",
+                )
 
     if not db_user.get("wallet_address"):
         await update.message.reply_text(  # type: ignore[union-attr]
@@ -249,17 +349,22 @@ def _wallet_text(addr: str, balances: dict | None = None) -> str:
         f"<code>{addr}</code>\n\n"
     )
     if balances is not None:
-        total = balances.get("total_usdc", 0)
+        pusd = balances.get("pusd", 0)
+        usdc_e = balances.get("usdc_e", 0)
         pol = balances.get("matic", 0)
-        status = "✅ Готов к торговле" if total >= 5 else "⚠️ Пополни баланс"
+        status = "✅ Готов к торговле" if pusd >= 5 else "⚠️ Пополни/сконвертируй баланс"
         text += (
-            f"💵 USDC: <b>${total:.2f}</b>\n"
+            f"💵 pUSD (торговый): <b>${pusd:.2f}</b>\n"
+        )
+        if usdc_e >= 0.01:
+            text += f"♻️ USDC.e (к конвертации): <b>${usdc_e:.2f}</b>\n"
+        text += (
             f"⛽️ POL (газ): <b>{pol:.4f}</b>\n"
             f"📊 Статус: {status}\n\n"
         )
     text += (
         f"🔗 <a href=\"https://polygonscan.com/address/{addr}\">Посмотреть на Polygonscan</a>\n\n"
-        "📌 Пополняй <b>USDC</b> в сети <b>Polygon</b>\n"
+        "📌 Пополняй <b>USDC.e</b> в сети <b>Polygon</b> — бот сам конвертирует в pUSD\n"
         "⚠️ Только Polygon — не Ethereum, не BSC!"
     )
     return text
@@ -296,15 +401,19 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     msg = await update.message.reply_text("⏳ Проверяю баланс…", parse_mode="HTML")  # type: ignore[union-attr]
     from core.polygon import get_balances
     balances = get_balances(addr)
-    total = balances.get("total_usdc", 0)
+    pusd = balances.get("pusd", 0)
+    usdc_e = balances.get("usdc_e", 0)
     pol = balances.get("matic", 0)
+    extra = f"♻️ USDC.e (к конвертации): <b>${usdc_e:.2f}</b>\n" if usdc_e >= 0.01 else ""
     await msg.edit_text(  # type: ignore[union-attr]
         f"💵 <b>Баланс кошелька</b>\n\n"
-        f"USDC: <b>${total:.2f}</b>\n"
+        f"pUSD (торговый): <b>${pusd:.2f}</b>\n"
+        f"{extra}"
         f"POL (газ): <b>{pol:.4f}</b>\n\n"
         f"<code>{addr}</code>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("♻️ В pUSD", callback_data="wrap"),
             InlineKeyboardButton("💸 Вывод", callback_data="withdraw_start"),
             InlineKeyboardButton("🏠 Меню",  callback_data="menu"),
         ]]),
@@ -331,6 +440,120 @@ async def cmd_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+def _build_positions(db_user: dict, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, InlineKeyboardMarkup]:
+    """Render live positions (real P&L from data-api) with per-position close buttons."""
+    wallet = db_user.get("wallet_address")
+    positions = []
+    if wallet:
+        try:
+            from core.polymarket import get_positions
+            positions = [p for p in get_positions(wallet) if p["shares"] > 0]
+        except Exception:
+            positions = []
+
+    # Cache token_ids for the close-by-index callback (callback_data is 64-byte capped).
+    context.user_data["pos_cache"] = [p["token_id"] for p in positions]
+
+    if not positions:
+        return (
+            "📊 <b>Открытые позиции</b>\n\n"
+            "Нет открытых позиций.\n\n"
+            "💡 Позиции появятся здесь, когда бот скопирует сделку.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="menu")]]),
+        )
+
+    lines = [f"📊 <b>Активные позиции</b> ({len(positions)})\n"]
+    buttons: list[list[InlineKeyboardButton]] = []
+    total_value = 0.0
+    total_pnl = 0.0
+    from core.polymarket import event_url
+    for i, p in enumerate(positions):
+        title = (p.get("title") or "—")[:40]
+        outcome = p.get("outcome") or "—"
+        shares = p["shares"]
+        avg = p["avg_price"]
+        cur = p["cur_price"]
+        pnl = p["cash_pnl"]
+        pct = p["percent_pnl"]
+        total_value += p["current_value"]
+        total_pnl += pnl
+        icon = "📈" if pnl >= 0 else "📉"
+        tag = " · ✅ к выводу" if p.get("redeemable") else ""
+        url = event_url(p.get("event_slug"))
+        title_html = f"<a href=\"{url}\">{title}</a>" if url else f"<b>{title}</b>"
+        lines.append(
+            f"{i+1}. {title_html} · {outcome}{tag}\n"
+            f"   {shares:.0f} шт @ {avg:.3f} → {cur:.3f} · {icon} <b>{pnl:+.2f}$</b> ({pct:+.0%})"
+        )
+        buttons.append([InlineKeyboardButton(f"❌ Закрыть #{i+1}", callback_data=f"close_{i}")])
+
+    pnl_icon = "📈" if total_pnl >= 0 else "📉"
+    lines.append(
+        f"\n💼 Стоимость: <b>${total_value:.2f}</b> · {pnl_icon} P&L: <b>{total_pnl:+.2f}$</b>"
+    )
+    buttons.append([InlineKeyboardButton("🏠 Главное меню", callback_data="menu")])
+    return "\n\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+_PNL_WINDOWS = {"day": 86400, "week": 7 * 86400, "month": 30 * 86400, "all": None}
+_PNL_LABELS = {"day": "за день", "week": "за неделю", "month": "за месяц", "all": "за всё время"}
+
+
+def _pnl_kb(active: str) -> InlineKeyboardMarkup:
+    def lbl(p: str, text: str) -> str:
+        return f"• {text} •" if p == active else text
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(lbl("day", "День"), callback_data="pnl_day"),
+            InlineKeyboardButton(lbl("week", "Неделя"), callback_data="pnl_week"),
+            InlineKeyboardButton(lbl("month", "Месяц"), callback_data="pnl_month"),
+            InlineKeyboardButton(lbl("all", "Всё"), callback_data="pnl_all"),
+        ],
+        [InlineKeyboardButton("📊 Позиции", callback_data="positions"),
+         InlineKeyboardButton("🏠 Меню", callback_data="menu")],
+    ])
+
+
+def _build_pnl(db_user: dict, period: str = "day") -> str:
+    """Real P&L: realized over the chosen period + current unrealized snapshot."""
+    import time as _t
+
+    wallet = db_user.get("wallet_address")
+    open_pos, closed = [], []
+    if wallet:
+        try:
+            from core.polymarket import get_closed_positions, get_positions
+            open_pos = [p for p in get_positions(wallet) if p["shares"] > 0]
+            closed = get_closed_positions(wallet)
+        except Exception:
+            pass
+
+    window = _PNL_WINDOWS.get(period)
+    cutoff = (_t.time() - window) if window else 0
+    period_closed = [c for c in closed if c["timestamp"] >= cutoff]
+    realized = sum(c["realized_pnl"] for c in period_closed)
+    wins = sum(1 for c in period_closed if c["realized_pnl"] > 0)
+    losses = sum(1 for c in period_closed if c["realized_pnl"] < 0)
+
+    invested = sum(p["current_value"] for p in open_pos)
+    unrealized = sum(p["cash_pnl"] for p in open_pos)
+
+    r_icon = "📈" if realized >= 0 else "📉"
+    u_icon = "📈" if unrealized >= 0 else "📉"
+    settled_n = len(period_closed)
+    winrate = f" · винрейт {wins}/{settled_n}" if settled_n else ""
+
+    return (
+        f"💰 <b>Статистика P&L · {_PNL_LABELS[period]}</b>\n\n"
+        f"{r_icon} Реализованный {_PNL_LABELS[period]}: <b>{realized:+.2f}$</b>\n"
+        f"📋 Закрыто сделок: <b>{settled_n}</b>{winrate}\n"
+        f"   ✅ {wins} в плюс · ❌ {losses} в минус\n\n"
+        f"📂 Открытых позиций: <b>{len(open_pos)}</b>\n"
+        f"💼 В позициях сейчас: <b>${invested:.2f}</b>\n"
+        f"{u_icon} Нереализованный P&L: <b>{unrealized:+.2f}$</b>"
+    )
+
+
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tg_user = update.effective_user
     if not tg_user:
@@ -339,39 +562,9 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not db_user:
         await update.message.reply_text("Сначала отправь /start", parse_mode="HTML")  # type: ignore[union-attr]
         return
-    positions = get_user_open_positions(db_user["id"])
-    if not positions:
-        await update.message.reply_text(  # type: ignore[union-attr]
-            "📊 <b>Открытые позиции</b>\n\n"
-            "Нет открытых позиций.\n\n"
-            "💡 Позиции появятся здесь когда бот скопирует сделку.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
-            ]]),
-        )
-        return
-    lines = [f"📊 <b>Активные позиции</b> ({len(positions)})\n"]
-    total_invested = 0.0
-    for i, trade in enumerate(positions, 1):
-        sig = trade.get("trade_signals") or {}
-        title = sig.get("title") or str(sig.get("market_id", "—"))[:40]
-        price = float(sig.get("price") or 0)
-        size = float(trade.get("size_usdc") or 0)
-        total_invested += size
-        status = trade.get("status", "—")
-        st_icon = "✅" if status == "confirmed" else "⏳"
-        lines.append(
-            f"{i}. {st_icon} <b>{title}</b>\n"
-            f"   BUY @ {price:.3f} · <b>${size:.2f} USDC</b>"
-        )
-    lines.append(f"\n💼 <b>Итого вложено: ${total_invested:.2f} USDC</b>")
+    text, kb = _build_positions(db_user, context)
     await update.message.reply_text(  # type: ignore[union-attr]
-        "\n\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
-        ]]),
+        text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True
     )
 
 
@@ -383,19 +576,10 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not db_user:
         await update.message.reply_text("Сначала отправь /start", parse_mode="HTML")  # type: ignore[union-attr]
         return
-    stats = get_user_pnl_stats(db_user["id"])
-    pnl: float = stats["pnl"]
-    pnl_icon = "📈" if pnl >= 0 else "📉"
-    pnl_sign = "+" if pnl >= 0 else ""
     await update.message.reply_text(  # type: ignore[union-attr]
-        f"💰 <b>Статистика P&L</b>\n\n"
-        f"📋 Всего сделок: <b>{stats['total']}</b>\n"
-        f"💵 Объём: <b>${stats['volume']:.2f} USDC</b>\n"
-        f"{pnl_icon} P&L: <b>{pnl_sign}{pnl:.2f} USDC</b>",
+        _build_pnl(db_user, "day"),
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
-        ]]),
+        reply_markup=_pnl_kb("day"),
     )
 
 
@@ -428,6 +612,25 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def cmd_wrap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_user = update.effective_user
+    if not tg_user:
+        return
+    db_user = get_user_by_telegram_id(tg_user.id)
+    if not db_user or not db_user.get("wallet_address"):
+        await update.message.reply_text("Сначала отправь /start", parse_mode="HTML")  # type: ignore[union-attr]
+        return
+    try:
+        from worker.tasks import wrap_collateral
+        wrap_collateral.delay(db_user["id"])
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "♻️ <b>Конвертирую USDC.e → pUSD…</b>\n\nРезультат придёт отдельным сообщением.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        await update.message.reply_text("❌ Не удалось запустить конвертацию.", parse_mode="HTML")  # type: ignore[union-attr]
+
+
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tg_user = update.effective_user
     if not tg_user:
@@ -442,7 +645,11 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     try:
         from core.clob import register_wallet
-        result = register_wallet(db_user["wallet_private_key_enc"])
+        register_wallet(db_user["wallet_private_key_enc"])
+        try:
+            update_user(tg_user.id, {"wallet_registered": True})
+        except Exception:
+            log.warning("set_registered_flag_failed", user=tg_user.id)
         await msg.edit_text(  # type: ignore[union-attr]
             "✅ <b>Кошелёк зарегистрирован!</b>\n\n"
             "Теперь бот может копировать сделки на Polymarket.\n"
@@ -463,6 +670,147 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"❌ <b>Ошибка регистрации:</b>\n<code>{str(exc)[:300]}</code>",
             parse_mode="HTML",
         )
+
+
+def _sub_text(status: dict) -> str:
+    if status.get("active"):
+        exp = (status.get("expires_at") or "")[:10]
+        return (
+            f"⭐️ <b>Подписка активна</b>\n\n"
+            f"Действует до: <b>{exp}</b>\n\n"
+            "Бот копирует крупные сделки китов на твой кошелёк."
+        )
+    return (
+        "⛔️ <b>Подписка неактивна</b>\n\n"
+        "Без активной подписки бот не открывает сделки.\n\n"
+        "Для активации обратись к администратору."
+    )
+
+
+async def cmd_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_user = update.effective_user
+    if not tg_user:
+        return
+    status = get_subscription_status(tg_user.id)
+    await update.message.reply_text(  # type: ignore[union-attr]
+        _sub_text(status),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
+        ]]),
+    )
+
+
+async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: grant/extend a subscription by @username or telegram_id.
+    /grant <@username|telegram_id> [days]. Works whether active (extends) or expired (reactivates)."""
+    tg_user = update.effective_user
+    if not tg_user or tg_user.id != settings.admin_telegram_id:
+        return
+    args = context.args or []
+    if len(args) < 1:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Использование: <code>/grant &lt;@username | telegram_id&gt; [days]</code>\n"
+            "days: число дней (по умолчанию 30).\n"
+            "Команда и продлевает активную подписку, и реактивирует истёкшую.",
+            parse_mode="HTML",
+        )
+        return
+
+    ident = args[0]
+    try:
+        days = int(args[1]) if len(args) > 1 else 30
+    except ValueError:
+        days = 30
+
+    # Resolve target: numeric id or @username.
+    target = None
+    if ident.lstrip("@").isdigit() and not ident.startswith("@"):
+        target_id = int(ident)
+        target = get_user_by_telegram_id(target_id) or {"telegram_id": target_id}
+    else:
+        target = get_user_by_username(ident)
+        if not target:
+            await update.message.reply_text(  # type: ignore[union-attr]
+                f"❌ Пользователь <b>{ident}</b> не найден.\n"
+                "Он должен сначала запустить бота (/start), чтобы ник сохранился. "
+                "Либо выдай по числовому Telegram ID.",
+                parse_mode="HTML",
+            )
+            return
+
+    target_id = target["telegram_id"]
+    try:
+        user = set_subscription(target_id, days)
+        exp = (user.get("sub_expires_at") or "")[:10]
+        uname = f"@{target.get('username')}" if target.get("username") else f"<code>{target_id}</code>"
+        await update.message.reply_text(  # type: ignore[union-attr]
+            f"✅ Подписка продлена на <b>{days}</b> дн.\n"
+            f"Пользователь: {uname}\n"
+            f"Действует до: <b>{exp}</b>",
+            parse_mode="HTML",
+        )
+        # Let the user know their subscription was extended.
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=(
+                    f"✅ <b>Подписка продлена!</b>\n\n"
+                    f"Действует до: <b>{exp}</b>\n\n"
+                    f"Спасибо! Бот продолжает копировать сделки."
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            log.info("grant_user_notify_skipped", target_id=target_id)
+    except Exception as exc:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            f"❌ Ошибка: <code>{str(exc)[:200]}</code>", parse_mode="HTML"
+        )
+
+
+async def cmd_newcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: create a one-time access code and return its deep link. /newcode [tier] [days]"""
+    tg_user = update.effective_user
+    if not tg_user or tg_user.id != settings.admin_telegram_id:
+        return
+    args = context.args or []
+    try:
+        days = int(args[0]) if len(args) > 0 else 30
+    except ValueError:
+        days = 30
+    code = create_access_code(days)
+    me = await context.bot.get_me()
+    link = f"https://t.me/{me.username}?start={code}"
+    await update.message.reply_text(  # type: ignore[union-attr]
+        f"🎟 <b>Код создан</b> · <b>{days}</b> дн.\n\n"
+        f"Код: <code>{code}</code>\n\n"
+        f"Ссылка для клиента (одноразовая):\n{link}",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_codes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: list recent access codes and their status."""
+    tg_user = update.effective_user
+    if not tg_user or tg_user.id != settings.admin_telegram_id:
+        return
+    from core.db import get_supabase
+    sb = get_supabase()
+    res = (
+        sb.table("access_codes").select("code,days,used_by,created_at")
+        .order("created_at", desc=True).limit(15).execute()
+    )
+    rows = res.data or []
+    if not rows:
+        await update.message.reply_text("Кодов пока нет. Создай: /newcode 30", parse_mode="HTML")  # type: ignore[union-attr]
+        return
+    lines = ["🎟 <b>Последние коды</b>\n"]
+    for r in rows:
+        status = f"✅ использован ({r['used_by']})" if r.get("used_by") else "🟢 свободен"
+        lines.append(f"<code>{r['code']}</code> · {r['days']}д · {status}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")  # type: ignore[union-attr]
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -667,6 +1015,74 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
+    if data == "register":
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user or not db_user.get("wallet_private_key_enc"):
+            await query.answer("Сначала отправь /start", show_alert=True)
+            return
+        await query.edit_message_text(
+            "⏳ <b>Регистрирую кошелёк в Polymarket...</b>\n\nЭто займёт 30–60 секунд.",
+            parse_mode="HTML",
+        )
+        try:
+            from core.clob import register_wallet
+            register_wallet(db_user["wallet_private_key_enc"])
+            try:
+                update_user(tg_user.id, {"wallet_registered": True})
+            except Exception:
+                log.warning("set_registered_flag_failed", user=tg_user.id)
+            await query.edit_message_text(
+                "✅ <b>Кошелёк зарегистрирован!</b>\n\n"
+                "Теперь бот может копировать сделки.\n"
+                "Включи копирование: /resume",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
+                ]]),
+            )
+        except ValueError as exc:
+            await query.edit_message_text(
+                f"⛽️ <b>Нужен POL для газа</b>\n\n{exc}\n\n"
+                f"Отправь хотя бы <b>0.1 POL</b> на кошелёк и повтори.\n\n"
+                f"<code>{db_user.get('wallet_address', '')}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔁 Повторить", callback_data="register"),
+                    InlineKeyboardButton("🏠 Меню", callback_data="menu"),
+                ]]),
+            )
+        except Exception as exc:
+            log.exception("register_failed_cb", user=tg_user.id)
+            await query.edit_message_text(
+                f"❌ <b>Ошибка регистрации:</b>\n<code>{str(exc)[:300]}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
+                ]]),
+            )
+        return
+
+    if data == "wrap":
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user or not db_user.get("wallet_address"):
+            await query.answer("Сначала отправь /start", show_alert=True)
+            return
+        await query.answer("♻️ Конвертирую…")
+        try:
+            from worker.tasks import wrap_collateral
+            wrap_collateral.delay(db_user["id"])
+            await query.edit_message_text(
+                "♻️ <b>Конвертирую USDC.e → pUSD…</b>\n\nРезультат придёт отдельным сообщением.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💼 Кошелёк", callback_data="wallet"),
+                    InlineKeyboardButton("🏠 Меню", callback_data="menu"),
+                ]]),
+            )
+        except Exception:
+            await query.answer("Не удалось запустить", show_alert=True)
+        return
+
     if data == "withdraw_start":
         context.user_data["withdraw_step"] = "address"
         await query.edit_message_text(
@@ -703,40 +1119,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         amount    = float(context.user_data.get("withdraw_amount", 0))
         context.user_data.pop("withdraw_step", None)
 
-        await query.edit_message_text(
-            "⏳ <b>Выполняю транзакцию…</b>\n\nЭто займёт 5–15 секунд.",
-            parse_mode="HTML",
-        )
-
         try:
-            from core.polygon import transfer_usdc
-            tx_hash = transfer_usdc(
-                private_key_enc=db_user["wallet_private_key_enc"],
-                wallet_address=db_user["wallet_address"],
-                to_address=to_addr,
-                amount_usdc=amount,
-            )
+            from worker.tasks import withdraw_funds
+            withdraw_funds.delay(db_user["id"], to_addr, amount)
             await query.edit_message_text(
-                f"✅ <b>Вывод выполнен!</b>\n\n"
-                f"💵 <b>${amount:.2f} USDC</b>\n"
-                f"📬 На: <code>{to_addr}</code>\n\n"
-                f"🔗 <a href=\"https://polygonscan.com/tx/{tx_hash}\">Посмотреть транзакцию</a>",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
-                ]]),
-            )
-            log.info("withdrawal_ok", user_id=tg_user.id, amount=amount, tx=tx_hash[:20])
-        except Exception as exc:
-            await query.edit_message_text(
-                f"❌ <b>Ошибка вывода</b>\n\n<code>{str(exc)[:200]}</code>",
+                "⏳ <b>Выполняю вывод…</b>\n\n"
+                "При необходимости конвертирую pUSD → USDC.e и отправляю. "
+                "Результат с ссылкой на транзакцию придёт отдельным сообщением.",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
                 ]]),
             )
-            log.exception("withdrawal_failed", user_id=tg_user.id)
+            log.info("withdrawal_queued", user_id=tg_user.id, amount=amount)
+        except Exception:
+            await query.edit_message_text(
+                "❌ <b>Не удалось запустить вывод.</b> Попробуй позже.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
+                ]]),
+            )
+            log.exception("withdrawal_dispatch_failed", user_id=tg_user.id)
         return
 
     if data == "positions":
@@ -744,60 +1148,59 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not db_user:
             await query.answer("Отправь /start", show_alert=True)
             return
-        positions = get_user_open_positions(db_user["id"])
-        if not positions:
-            await query.edit_message_text(
-                "📊 <b>Открытые позиции</b>\n\n"
-                "Нет открытых позиций.\n\n"
-                "💡 Позиции появятся когда бот скопирует сделку.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
-                ]]),
-            )
-            return
-        lines = [f"📊 <b>Активные позиции</b> ({len(positions)})\n"]
-        total_invested = 0.0
-        for i, trade in enumerate(positions, 1):
-            sig = trade.get("trade_signals") or {}
-            title = sig.get("title") or str(sig.get("market_id", "—"))[:40]
-            price = float(sig.get("price") or 0)
-            size = float(trade.get("size_usdc") or 0)
-            total_invested += size
-            status = trade.get("status", "—")
-            st_icon = "✅" if status == "confirmed" else "⏳"
-            lines.append(
-                f"{i}. {st_icon} <b>{title}</b>\n"
-                f"   BUY @ {price:.3f} · <b>${size:.2f} USDC</b>"
-            )
-        lines.append(f"\n💼 <b>Итого вложено: ${total_invested:.2f} USDC</b>")
+        await query.answer("⏳ Загружаю позиции…")
+        text, kb = _build_positions(db_user, context)
         await query.edit_message_text(
-            "\n\n".join(lines),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
-            ]]),
+            text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True
         )
         return
 
-    if data == "pnl":
+    if data.startswith("close_"):
         db_user = get_user_by_telegram_id(tg_user.id)
         if not db_user:
             await query.answer("Отправь /start", show_alert=True)
             return
-        stats = get_user_pnl_stats(db_user["id"])
-        pnl: float = stats["pnl"]
-        pnl_icon = "📈" if pnl >= 0 else "📉"
-        pnl_sign = "+" if pnl >= 0 else ""
+        try:
+            idx = int(data.split("_", 1)[1])
+        except ValueError:
+            await query.answer("Ошибка", show_alert=True)
+            return
+        cache = context.user_data.get("pos_cache") or []
+        if idx >= len(cache):
+            await query.answer("Список устарел, открой /positions заново", show_alert=True)
+            return
+        token_id = cache[idx]
+        await query.answer("⏳ Закрываю позицию…")
+        try:
+            from worker.tasks import close_position
+            close_position.delay(db_user["id"], token_id, "manual")
+            await query.edit_message_text(
+                "⏳ <b>Закрываю позицию…</b>\n\n"
+                "Отправляю ордер на продажу. Результат придёт отдельным сообщением.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📊 Позиции", callback_data="positions"),
+                    InlineKeyboardButton("🏠 Меню", callback_data="menu"),
+                ]]),
+            )
+        except Exception:
+            log.exception("close_dispatch_failed", user=tg_user.id)
+            await query.answer("Не удалось закрыть, попробуй позже", show_alert=True)
+        return
+
+    if data == "pnl" or data.startswith("pnl_"):
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user:
+            await query.answer("Отправь /start", show_alert=True)
+            return
+        period = data[len("pnl_"):] if data.startswith("pnl_") else "day"
+        if period not in _PNL_WINDOWS:
+            period = "day"
+        await query.answer("⏳ Считаю P&L…")
         await query.edit_message_text(
-            f"💰 <b>Статистика P&L</b>\n\n"
-            f"📋 Всего сделок: <b>{stats['total']}</b>\n"
-            f"💵 Объём: <b>${stats['volume']:.2f} USDC</b>\n"
-            f"{pnl_icon} P&L: <b>{pnl_sign}{pnl:.2f} USDC</b>",
+            _build_pnl(db_user, period),
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
-            ]]),
+            reply_markup=_pnl_kb(period),
         )
         return
 
