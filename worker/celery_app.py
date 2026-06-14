@@ -1,7 +1,6 @@
 import ssl
 
 from celery import Celery
-from celery.schedules import crontab
 
 from core.config import settings
 
@@ -19,7 +18,7 @@ celery_app = Celery(
         "worker.tasks.wallet_ops",
         "worker.tasks.poll_donors",
         "worker.tasks.monitor_deposits",
-        "worker.signals",  # registers the worker_ready hook that starts the WS listener
+        # "worker.signals",  # PAUSED for V2 deposit-wallet rework — WS listener disabled
     ],
 )
 
@@ -50,29 +49,7 @@ celery_app.conf.update(
         "worker.tasks.refresh_donor_stats": {"queue": "periodic"},
         "worker.tasks.deactivate_underperforming_donors": {"queue": "periodic"},
     },
-    beat_schedule={
-        # Detection runs in real time over WebSocket (worker/ws_listener.py),
-        # not via periodic polling. The REST scan_whale_trades task remains
-        # available as a manual fallback but is intentionally not scheduled.
-        "monitor-deposits": {
-            "task": "worker.tasks.monitor_deposits",
-            "schedule": 120.0,  # every 2 minutes
-        },
-        "sync-positions": {
-            "task": "worker.tasks.sync_positions",
-            "schedule": float(settings.positions_sync_sec),
-        },
-        "check-subscription-expiry": {
-            "task": "worker.tasks.check_subscription_expiry",
-            "schedule": 21600.0,  # every 6 hours
-        },
-        "refresh-donor-stats-nightly": {
-            "task": "worker.tasks.refresh_donor_stats",
-            "schedule": crontab(hour=3, minute=0),
-        },
-        "deactivate-bad-donors": {
-            "task": "worker.tasks.deactivate_underperforming_donors",
-            "schedule": crontab(hour=4, minute=0),
-        },
-    },
+    # PAUSED for V2 deposit-wallet rework — no periodic tasks run.
+    # Restore monitor-deposits / sync-positions / check-subscription-expiry when re-enabling.
+    beat_schedule={},
 )
