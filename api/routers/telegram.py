@@ -115,6 +115,17 @@ def _checklist(db_user: dict) -> str:
     copy_active = bool(db_user.get("copy_active"))
     funded = (pusd + to_convert) >= MIN_USDC_READY
 
+    steps_done = (
+        pusd >= MIN_USDC_READY
+        and pol >= MIN_POL_READY
+        and registered
+        and sub.get("active")
+        and copy_active
+    )
+    # Hide the checklist once everything is set up.
+    if steps_done:
+        return ""
+
     def mark(ok: bool) -> str:
         return "✅" if ok else "⬜️"
 
@@ -136,6 +147,12 @@ def _dashboard_text(db_user: dict, first_name: str) -> str:
     copy_active = db_user.get("copy_active")
     copy_icon = "🟢 Работает" if copy_active else "⏸ Пауза"
     max_pos = db_user.get("max_position_usdc") or 25
+    checklist = _checklist(db_user)
+    mid = (
+        f"{checklist}\n\n"
+        if checklist
+        else "✅ <b>Всё настроено</b> — бот отслеживает китов и копирует сделки.\n\n"
+    )
     return (
         f"👋 <b>Привет, {first_name}!</b>\n\n"
         "🧠 <b>PolyMind AI</b> — интеллектуальный копитрейдинг\n"
@@ -146,7 +163,7 @@ def _dashboard_text(db_user: dict, first_name: str) -> str:
         f"🔄 Автокопирование: {copy_icon}\n"
         f"💵 Макс. позиция: <b>${max_pos:.0f} USDC</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{_checklist(db_user)}\n\n"
+        f"{mid}"
         "👇 Управляй через кнопки"
     )
 
