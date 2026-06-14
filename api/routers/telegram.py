@@ -107,24 +107,24 @@ def _checklist(db_user: dict) -> str:
             balances = {}
 
     pusd = balances.get("pusd", 0)
-    usdc_e = balances.get("usdc_e", 0)
+    to_convert = balances.get("usdc_e", 0) + balances.get("usdc", 0)
     pol = balances.get("matic", 0)
 
     sub = get_subscription_status(db_user.get("telegram_id")) if db_user.get("telegram_id") else {"active": False}
     registered = bool(db_user.get("wallet_registered"))
     copy_active = bool(db_user.get("copy_active"))
-    funded = (pusd + usdc_e) >= MIN_USDC_READY
+    funded = (pusd + to_convert) >= MIN_USDC_READY
 
     def mark(ok: bool) -> str:
         return "✅" if ok else "⬜️"
 
     lines = ["📋 <b>Чек-лист запуска</b>\n"]
-    lines.append(f"{mark(funded)} 1. Пополнить <b>USDC.e</b> (Polygon)")
+    lines.append(f"{mark(funded)} 1. Пополнить <b>USDC</b> (Polygon)")
     lines.append(f"{mark(pol >= MIN_POL_READY)} 2. Пополнить <b>POL</b> для газа (~0.1)")
     lines.append(f"{mark(registered)} 3. Зарегистрировать кошелёк (/register)")
     lines.append(f"{mark(pusd >= MIN_USDC_READY)} 4. Конвертация в <b>pUSD</b> (авто / /wrap)")
-    if usdc_e >= MIN_USDC_READY and pusd < MIN_USDC_READY:
-        lines.append("    ♻️ Есть USDC.e — нажми /wrap для конвертации")
+    if to_convert >= MIN_USDC_READY and pusd < MIN_USDC_READY:
+        lines.append("    ♻️ Есть USDC — нажми /wrap для конвертации в pUSD")
     lines.append(f"{mark(sub.get('active'))} 5. Активная подписка")
     lines.append(f"{mark(copy_active)} 6. Копирование включено")
     return "\n".join(lines)
@@ -160,14 +160,13 @@ def _new_user_text(addr: str) -> str:
         f"<code>{addr}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
         "⚡️ <b>Как запустить (по шагам):</b>\n"
-        "1️⃣ Пополни <b>USDC.e</b> в сети <b>Polygon</b> (бот сам сконвертирует в pUSD)\n"
+        "1️⃣ Пополни <b>USDC</b> в сети <b>Polygon</b> (бот сам сконвертирует в pUSD)\n"
         "2️⃣ Пополни немного <b>POL</b> (~0.1) — нужен на газ\n"
         "3️⃣ Нажми <b>🔐 Зарегистрировать кошелёк</b> или /register\n"
         "4️⃣ Активируй подписку (обратись к администратору)\n"
         "5️⃣ Готово — бот копирует крупные сделки китов\n\n"
-        "⚠️ Только <b>Polygon</b> и именно <b>USDC.e</b> (bridged) — "
-        "не Ethereum, не BSC, не нативный USDC!\n"
-        "ℹ️ Торговля идёт в <b>pUSD</b> (V2) — конвертация из USDC.e автоматическая."
+        "⚠️ Только сеть <b>Polygon</b> — не Ethereum, не BSC!\n"
+        "ℹ️ Торговля идёт в <b>pUSD</b> (V2) — конвертация из USDC автоматическая."
     )
 
 
@@ -187,10 +186,10 @@ HELP_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━━\n"
     "🚀 <b>С чего начать</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "1. Пополни <b>USDC.e</b> (Polygon) — бот сконвертирует в pUSD\n"
+    "1. Пополни <b>USDC</b> (Polygon) — бот сконвертирует в pUSD\n"
     "2. Пополни <b>POL</b> (~0.1) — на газ\n"
     "3. /register — регистрация кошелька в Polymarket\n"
-    "4. /wrap — конвертация USDC.e → pUSD (если не авто)\n"
+    "4. /wrap — конвертация USDC → pUSD (если не авто)\n"
     "5. Активируй подписку у администратора\n"
     "6. /resume — включи копирование\n\n"
 
@@ -212,7 +211,7 @@ HELP_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━━\n"
     "💡 <b>Важно</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "• Торговля идёт в <b>pUSD</b> (V2); пополняешь USDC.e, бот конвертирует\n"
+    "• Торговля идёт в <b>pUSD</b> (V2); пополняешь USDC, бот конвертирует\n"
     "• Без <b>POL</b> на газ регистрация, конвертация и вывод не пройдут\n"
     "• Оптимальный размер позиции: <b>$5–25 USDC</b>\n"
     "• Кошелёк полностью в твоём управлении\n\n"
@@ -350,22 +349,20 @@ def _wallet_text(addr: str, balances: dict | None = None) -> str:
     )
     if balances is not None:
         pusd = balances.get("pusd", 0)
-        usdc_e = balances.get("usdc_e", 0)
+        to_convert = balances.get("usdc_e", 0) + balances.get("usdc", 0)
         pol = balances.get("matic", 0)
         status = "✅ Готов к торговле" if pusd >= 5 else "⚠️ Пополни/сконвертируй баланс"
-        text += (
-            f"💵 pUSD (торговый): <b>${pusd:.2f}</b>\n"
-        )
-        if usdc_e >= 0.01:
-            text += f"♻️ USDC.e (к конвертации): <b>${usdc_e:.2f}</b>\n"
+        text += f"💵 pUSD (торговый): <b>${pusd:.2f}</b>\n"
+        if to_convert >= 0.01:
+            text += f"♻️ USDC (к конвертации): <b>${to_convert:.2f}</b>\n"
         text += (
             f"⛽️ POL (газ): <b>{pol:.4f}</b>\n"
             f"📊 Статус: {status}\n\n"
         )
     text += (
         f"🔗 <a href=\"https://polygonscan.com/address/{addr}\">Посмотреть на Polygonscan</a>\n\n"
-        "📌 Пополняй <b>USDC.e</b> в сети <b>Polygon</b> — бот сам конвертирует в pUSD\n"
-        "⚠️ Только Polygon — не Ethereum, не BSC!"
+        "📌 Пополняй <b>USDC</b> в сети <b>Polygon</b> — бот сам сконвертирует в pUSD\n"
+        "⚠️ Только сеть <b>Polygon</b> — не Ethereum, не BSC!"
     )
     return text
 
@@ -402,9 +399,9 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     from core.polygon import get_balances
     balances = get_balances(addr)
     pusd = balances.get("pusd", 0)
-    usdc_e = balances.get("usdc_e", 0)
+    to_convert = balances.get("usdc_e", 0) + balances.get("usdc", 0)
     pol = balances.get("matic", 0)
-    extra = f"♻️ USDC.e (к конвертации): <b>${usdc_e:.2f}</b>\n" if usdc_e >= 0.01 else ""
+    extra = f"♻️ USDC (к конвертации): <b>${to_convert:.2f}</b>\n" if to_convert >= 0.01 else ""
     await msg.edit_text(  # type: ignore[union-attr]
         f"💵 <b>Баланс кошелька</b>\n\n"
         f"pUSD (торговый): <b>${pusd:.2f}</b>\n"

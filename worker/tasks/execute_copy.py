@@ -227,14 +227,15 @@ def _notify_needs_wrap(telegram_id: int, balances: dict) -> None:
         bot = Bot(token=settings.telegram_bot_token)
         pusd = balances.get("pusd", 0)
         usdc_e = balances.get("usdc_e", 0)
+        to_convert = usdc_e + balances.get("usdc", 0)
         await bot.send_message(
             chat_id=telegram_id,
             text=(
                 f"♻️ <b>Нужно конвертировать в pUSD</b>\n\n"
                 f"Polymarket V2 торгует в <b>pUSD</b>:\n"
                 f"• pUSD (готово к торговле): <b>${pusd:.2f}</b>\n"
-                f"• USDC.e (надо обернуть): <b>${usdc_e:.2f}</b>\n\n"
-                f"Нажми /wrap чтобы конвертировать USDC.e → pUSD "
+                f"• USDC (надо конвертировать): <b>${to_convert:.2f}</b>\n\n"
+                f"Нажми /wrap чтобы конвертировать USDC → pUSD "
                 f"(нужен POL на газ), и сделки снова будут исполняться."
             ),
             parse_mode="HTML",

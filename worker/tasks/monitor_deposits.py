@@ -42,16 +42,18 @@ def monitor_deposits() -> dict:
             old_balance = float(user.get("balance_usdc") or 0.0)
             diff = new_balance - old_balance
 
-            # Auto-wrap any USDC.e into tradeable pUSD (needs POL for gas).
-            usdc_e = balances.get("usdc_e", 0.0)
-            if usdc_e >= 1.0 and balances.get("matic", 0.0) >= 0.01 and user.get("wallet_private_key_enc"):
+            # Auto-convert any deposited USDC (native or bridged) into tradeable pUSD:
+            # native USDC -> USDC.e (Uniswap) -> pUSD (onramp). Needs POL for gas.
+            convertible = balances.get("usdc", 0.0) + balances.get("usdc_e", 0.0)
+            if convertible >= 1.0 and balances.get("matic", 0.0) >= 0.02 and user.get("wallet_private_key_enc"):
                 try:
-                    from core.polygon import wrap_usdce_to_pusd
-                    if wrap_usdce_to_pusd(user["wallet_private_key_enc"], addr):
-                        _notify_wrapped(user["telegram_id"], usdc_e)
+                    from core.polygon import convert_to_pusd
+                    converted = convert_to_pusd(user["wallet_private_key_enc"], addr)
+                    if converted >= 1.0:
+                        _notify_wrapped(user["telegram_id"], converted)
                         notified += 1
                 except Exception:
-                    log.warning("auto_wrap_failed", user_id=user["id"])
+                    log.warning("auto_convert_failed", user_id=user["id"])
 
             # Update stored balance
             sb.table("users").update({"balance_usdc": new_balance}).eq("id", user["id"]).execute()
@@ -80,7 +82,7 @@ def _notify_wrapped(telegram_id: int, amount: float) -> None:
             chat_id=telegram_id,
             text=(
                 f"♻️ <b>Конвертация выполнена</b>\n\n"
-                f"<b>${amount:.2f} USDC.e → pUSD</b>\n\n"
+                f"<b>${amount:.2f} USDC → pUSD</b>\n\n"
                 f"Средства готовы к торговле. ▶️ PolyMind копирует сделки!"
             ),
             parse_mode="HTML",

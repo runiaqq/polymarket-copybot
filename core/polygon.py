@@ -3,6 +3,8 @@ Polygon network utilities: USDC balance, MATIC balance, USDC transfer.
 Uses Alchemy RPC via web3.py.
 """
 
+import time
+
 import structlog
 from web3 import Web3
 
@@ -12,11 +14,16 @@ from core.wallet import decrypt_key
 log = structlog.get_logger(__name__)
 
 # Polygon token contracts
-USDC_NATIVE = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"   # Circle native USDC
+USDC_NATIVE = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"   # Circle native USDC (exchanges send this)
 USDC_BRIDGED = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e (wrappable into pUSD)
 PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # Polymarket USD (V2 collateral)
 COLLATERAL_ONRAMP = "0x93070a847efEf7F70739046A929D47a521F5B8ee"   # wrap USDC.e -> pUSD
 COLLATERAL_OFFRAMP = "0x2957922Eb93258b93368531d39fAcCA3B4dC5854"  # unwrap pUSD -> USDC.e
+
+# Uniswap v3 — swap native USDC <-> USDC.e (deepest pool is the 0.01% fee tier).
+UNISWAP_V3_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+USDC_POOL_FEE = 100        # 0.01%
+SWAP_SLIPPAGE = 0.01       # 1% — generous for a $1/$1 stable pair
 USDC_DECIMALS = 6
 
 _ERC20_ABI = [
@@ -55,6 +62,25 @@ _ERC20_ABI = [
         "name": "allowance",
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
+        "type": "function",
+    },
+]
+
+_SWAP_ROUTER_ABI = [
+    {
+        "inputs": [{"components": [
+            {"name": "tokenIn", "type": "address"},
+            {"name": "tokenOut", "type": "address"},
+            {"name": "fee", "type": "uint24"},
+            {"name": "recipient", "type": "address"},
+            {"name": "deadline", "type": "uint256"},
+            {"name": "amountIn", "type": "uint256"},
+            {"name": "amountOutMinimum", "type": "uint256"},
+            {"name": "sqrtPriceLimitX96", "type": "uint160"},
+        ], "name": "params", "type": "tuple"}],
+        "name": "exactInputSingle",
+        "outputs": [{"name": "amountOut", "type": "uint256"}],
+        "stateMutability": "payable",
         "type": "function",
     },
 ]
@@ -263,6 +289,87 @@ def transfer_usdc(
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     log.info("usdc_transfer", from_addr=wallet_address[:10], to=to_address[:10], amount=amount_usdc)
     return tx_hash.hex()
+
+
+def _swap_exact_in(
+    private_key_enc: str, wallet_address: str, token_in: str, token_out: str,
+    amount_raw: int | None = None,
+) -> str | None:
+    """Swap token_in -> token_out via Uniswap v3 (0.01% pool). Stable 1:1 pair.
+    amount_raw None -> swap full token_in balance. Returns tx hash or None."""
+    w3 = _w3()
+    private_key = decrypt_key(private_key_enc)
+    addr = Web3.to_checksum_address(wallet_address)
+    tin = w3.eth.contract(address=Web3.to_checksum_address(token_in), abi=_ERC20_ABI)
+
+    bal = tin.functions.balanceOf(addr).call()
+    amt = bal if amount_raw is None else min(amount_raw, bal)
+    if amt <= 0:
+        return None
+
+    router = Web3.to_checksum_address(UNISWAP_V3_ROUTER)
+    nonce = w3.eth.get_transaction_count(addr)
+    gas_price = w3.eth.gas_price
+
+    if tin.functions.allowance(addr, router).call() < amt:
+        approve_tx = tin.functions.approve(router, MAX_UINT).build_transaction({
+            "from": addr, "nonce": nonce, "gasPrice": gas_price, "gas": 80_000, "chainId": 137,
+        })
+        signed = w3.eth.account.sign_transaction(approve_tx, private_key)
+        w3.eth.send_raw_transaction(signed.raw_transaction)
+        w3.eth.wait_for_transaction_receipt(signed.hash, timeout=120)
+        nonce += 1
+
+    min_out = int(amt * (1 - SWAP_SLIPPAGE))
+    params = (
+        Web3.to_checksum_address(token_in),
+        Web3.to_checksum_address(token_out),
+        USDC_POOL_FEE,
+        addr,
+        int(time.time()) + 600,
+        amt,
+        min_out,
+        0,
+    )
+    router_c = w3.eth.contract(address=router, abi=_SWAP_ROUTER_ABI)
+    swap_tx = router_c.functions.exactInputSingle(params).build_transaction({
+        "from": addr, "nonce": nonce, "gasPrice": gas_price, "gas": 300_000, "chainId": 137,
+    })
+    signed = w3.eth.account.sign_transaction(swap_tx, private_key)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    log.info("swap_done", token_in=token_in[:8], token_out=token_out[:8],
+             amount=amt / 10**USDC_DECIMALS)
+    return tx_hash.hex()
+
+
+def swap_usdc_to_usdce(private_key_enc: str, wallet_address: str,
+                       amount_usdc: float | None = None) -> str | None:
+    raw = int(amount_usdc * 10**USDC_DECIMALS) if amount_usdc is not None else None
+    return _swap_exact_in(private_key_enc, wallet_address, USDC_NATIVE, USDC_BRIDGED, raw)
+
+
+def swap_usdce_to_usdc(private_key_enc: str, wallet_address: str,
+                       amount_usdce: float) -> str | None:
+    raw = int(amount_usdce * 10**USDC_DECIMALS)
+    return _swap_exact_in(private_key_enc, wallet_address, USDC_BRIDGED, USDC_NATIVE, raw)
+
+
+def convert_to_pusd(private_key_enc: str, wallet_address: str) -> float:
+    """
+    Full deposit conversion: native USDC -> USDC.e -> pUSD.
+    Returns approximate amount (USDC) converted into pUSD. Requires POL for gas.
+    """
+    b = get_balances(wallet_address)
+    if b.get("usdc", 0) >= 0.5:
+        swap_usdc_to_usdce(private_key_enc, wallet_address)  # swap full native balance
+
+    b2 = get_balances(wallet_address)
+    converted = 0.0
+    if b2.get("usdc_e", 0) >= 0.5:
+        converted = b2["usdc_e"]
+        wrap_usdce_to_pusd(private_key_enc, wallet_address)
+    return converted
 
 
 def is_valid_address(address: str) -> bool:

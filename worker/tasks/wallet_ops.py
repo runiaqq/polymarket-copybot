@@ -31,7 +31,7 @@ def _notify(telegram_id: int, text: str) -> None:
 @celery_app.task(name="worker.tasks.wrap_collateral", queue="trades")
 def wrap_collateral(user_id: int) -> dict:
     from core.db import get_supabase
-    from core.polygon import get_balances, wrap_usdce_to_pusd
+    from core.polygon import convert_to_pusd, get_balances
 
     sb = get_supabase()
     res = sb.table("users").select("*").eq("id", user_id).maybe_single().execute()
@@ -41,22 +41,25 @@ def wrap_collateral(user_id: int) -> dict:
 
     addr = user["wallet_address"]
     balances = get_balances(addr)
-    if balances.get("usdc_e", 0) < 1.0:
-        _notify(user["telegram_id"], "ℹ️ Нет USDC.e для конвертации (или уже в pUSD).")
-        return {"skipped": True, "reason": "nothing_to_wrap"}
-    if balances.get("matic", 0) < 0.01:
+    convertible = balances.get("usdc", 0) + balances.get("usdc_e", 0)
+    if convertible < 1.0:
+        _notify(user["telegram_id"], "ℹ️ Нет USDC для конвертации (или уже в pUSD).")
+        return {"skipped": True, "reason": "nothing_to_convert"}
+    if balances.get("matic", 0) < 0.02:
         _notify(user["telegram_id"], "⛽️ Недостаточно POL на газ для конвертации. Пополни ~0.05 POL.")
         return {"skipped": True, "reason": "no_gas"}
 
     try:
-        amount = balances["usdc_e"]
-        wrap_usdce_to_pusd(user["wallet_private_key_enc"], addr)
+        converted = convert_to_pusd(user["wallet_private_key_enc"], addr)
+        if converted < 1.0:
+            _notify(user["telegram_id"], "ℹ️ Нечего конвертировать.")
+            return {"skipped": True, "reason": "nothing_converted"}
         _notify(
             user["telegram_id"],
-            f"♻️ <b>Готово!</b> Конвертировано <b>${amount:.2f}</b> USDC.e → pUSD.\n"
+            f"♻️ <b>Готово!</b> Конвертировано <b>${converted:.2f}</b> USDC → pUSD.\n"
             f"Средства готовы к торговле.",
         )
-        return {"wrapped": amount}
+        return {"converted": converted}
     except Exception as exc:
         log.exception("wrap_collateral_failed", user_id=user_id)
         _notify(user["telegram_id"], f"❌ Ошибка конвертации: <code>{str(exc)[:200]}</code>")
@@ -66,7 +69,12 @@ def wrap_collateral(user_id: int) -> dict:
 @celery_app.task(name="worker.tasks.withdraw_funds", queue="trades")
 def withdraw_funds(user_id: int, to_address: str, amount_usdc: float) -> dict:
     from core.db import get_supabase
-    from core.polygon import get_balances, transfer_usdc, unwrap_pusd_to_usdce
+    from core.polygon import (
+        get_balances,
+        swap_usdce_to_usdc,
+        transfer_usdc,
+        unwrap_pusd_to_usdce,
+    )
 
     sb = get_supabase()
     res = sb.table("users").select("*").eq("id", user_id).maybe_single().execute()
@@ -78,25 +86,28 @@ def withdraw_funds(user_id: int, to_address: str, amount_usdc: float) -> dict:
     key = user["wallet_private_key_enc"]
 
     try:
-        balances = get_balances(addr)
-        usdc_e = balances.get("usdc_e", 0.0)
-        # Unwrap pUSD -> USDC.e if we don't have enough liquid USDC.e to send.
-        if usdc_e < amount_usdc:
-            need = amount_usdc - usdc_e
-            if balances.get("pusd", 0.0) >= need:
-                unwrap_pusd_to_usdce(key, addr, need)
-            # else: transfer_usdc will raise on insufficient funds below.
+        # User receives native USDC. Build it up: unwrap pUSD -> USDC.e, then swap -> native.
+        b = get_balances(addr)
+        if b.get("usdc", 0.0) < amount_usdc:
+            need_usdce = amount_usdc - b.get("usdc", 0.0)
+            if b.get("usdc_e", 0.0) < need_usdce and b.get("pusd", 0.0) > 0:
+                unwrap_pusd_to_usdce(key, addr, need_usdce - b.get("usdc_e", 0.0))
+            b2 = get_balances(addr)
+            swap_amt = min(b2.get("usdc_e", 0.0), need_usdce)
+            if swap_amt > 0:
+                swap_usdce_to_usdc(key, addr, swap_amt)
 
         tx_hash = transfer_usdc(
             private_key_enc=key,
             wallet_address=addr,
             to_address=to_address,
             amount_usdc=amount_usdc,
+            use_bridged=False,   # send native USDC to the user
         )
         _notify(
             user["telegram_id"],
             f"✅ <b>Вывод выполнен!</b>\n\n"
-            f"💵 <b>${amount_usdc:.2f} USDC.e</b>\n"
+            f"💵 <b>${amount_usdc:.2f} USDC</b>\n"
             f"📬 На: <code>{to_address}</code>\n\n"
             f"🔗 <a href=\"https://polygonscan.com/tx/{tx_hash}\">Транзакция</a>",
         )
