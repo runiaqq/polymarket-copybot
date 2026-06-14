@@ -159,92 +159,84 @@ def get_balances(wallet_address: str) -> dict:
     }
 
 
+def _exec_tx(w3, private_key, addr, fn, gas: int, label: str) -> str:
+    """Build, sign, send and CONFIRM a contract call. Raises if it reverts.
+    Uses the 'pending' nonce so sequential txs don't collide on RPC lag."""
+    tx = fn.build_transaction({
+        "from": addr,
+        "nonce": w3.eth.get_transaction_count(addr, "pending"),
+        "gasPrice": w3.eth.gas_price,
+        "gas": gas,
+        "chainId": 137,
+    })
+    signed = w3.eth.account.sign_transaction(tx, private_key)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    if receipt.get("status") != 1:
+        raise RuntimeError(f"{label}_reverted tx={tx_hash.hex()}")
+    return tx_hash.hex()
+
+
+def _ensure_allowance(w3, token, owner, spender, amount: int, private_key) -> None:
+    """Approve `spender` for at least `amount`, then verify the allowance actually took."""
+    if token.functions.allowance(owner, spender).call() >= amount:
+        return
+    _exec_tx(w3, private_key, owner, token.functions.approve(spender, MAX_UINT), 90_000, "approve")
+    if token.functions.allowance(owner, spender).call() < amount:
+        raise RuntimeError(f"allowance_not_set spender={spender}")
+
+
 def wrap_usdce_to_pusd(
     private_key_enc: str, wallet_address: str, amount_usdce: float | None = None
 ) -> str | None:
-    """
-    Wrap USDC.e into pUSD via the CollateralOnramp (1:1).
-    If amount is None, wraps the full USDC.e balance. Returns tx hash, or None if nothing to wrap.
-    Requires POL for gas.
-    """
+    """Wrap USDC.e into pUSD via the CollateralOnramp (1:1). Returns tx hash or None."""
     w3 = _w3()
-    private_key = decrypt_key(private_key_enc)
+    pk = decrypt_key(private_key_enc)
     addr = Web3.to_checksum_address(wallet_address)
     usdce = w3.eth.contract(address=Web3.to_checksum_address(USDC_BRIDGED), abi=_ERC20_ABI)
 
-    bal_raw = usdce.functions.balanceOf(addr).call()
-    want_raw = int(amount_usdce * 10**USDC_DECIMALS) if amount_usdce is not None else bal_raw
-    want_raw = min(want_raw, bal_raw)
-    if want_raw <= 0:
+    bal = usdce.functions.balanceOf(addr).call()
+    want = int(amount_usdce * 10**USDC_DECIMALS) if amount_usdce is not None else bal
+    want = min(want, bal)
+    if want <= 0:
         return None
 
     onramp = Web3.to_checksum_address(COLLATERAL_ONRAMP)
-    nonce = w3.eth.get_transaction_count(addr)
-    gas_price = w3.eth.gas_price
-
-    # Approve the Onramp to pull USDC.e if needed.
-    allowance = usdce.functions.allowance(addr, onramp).call()
-    if allowance < want_raw:
-        approve_tx = usdce.functions.approve(onramp, MAX_UINT).build_transaction({
-            "from": addr, "nonce": nonce, "gasPrice": gas_price, "gas": 80_000, "chainId": 137,
-        })
-        signed = w3.eth.account.sign_transaction(approve_tx, private_key)
-        w3.eth.send_raw_transaction(signed.raw_transaction)
-        w3.eth.wait_for_transaction_receipt(signed.hash, timeout=120)
-        nonce += 1
-
+    _ensure_allowance(w3, usdce, addr, onramp, want, pk)
     ramp = w3.eth.contract(address=onramp, abi=_RAMP_ABI)
-    wrap_tx = ramp.functions.wrap(
-        Web3.to_checksum_address(USDC_BRIDGED), addr, want_raw
-    ).build_transaction({
-        "from": addr, "nonce": nonce, "gasPrice": gas_price, "gas": 250_000, "chainId": 137,
-    })
-    signed = w3.eth.account.sign_transaction(wrap_tx, private_key)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-    log.info("wrapped_usdce_to_pusd", wallet=wallet_address[:10], amount=want_raw / 10**USDC_DECIMALS)
-    return tx_hash.hex()
+    tx_hash = _exec_tx(
+        w3, pk, addr,
+        ramp.functions.wrap(Web3.to_checksum_address(USDC_BRIDGED), addr, want),
+        300_000, "wrap",
+    )
+    log.info("wrapped_usdce_to_pusd", wallet=wallet_address[:10], amount=want / 10**USDC_DECIMALS)
+    return tx_hash
 
 
 def unwrap_pusd_to_usdce(
     private_key_enc: str, wallet_address: str, amount_pusd: float
 ) -> str | None:
-    """Unwrap pUSD back into USDC.e via the CollateralOfframp. Returns tx hash."""
+    """Unwrap pUSD back into USDC.e via the CollateralOfframp. Returns tx hash or None."""
     w3 = _w3()
-    private_key = decrypt_key(private_key_enc)
+    pk = decrypt_key(private_key_enc)
     addr = Web3.to_checksum_address(wallet_address)
     pusd = w3.eth.contract(address=Web3.to_checksum_address(PUSD_ADDRESS), abi=_ERC20_ABI)
 
-    bal_raw = pusd.functions.balanceOf(addr).call()
-    want_raw = min(int(amount_pusd * 10**USDC_DECIMALS), bal_raw)
-    if want_raw <= 0:
+    bal = pusd.functions.balanceOf(addr).call()
+    want = min(int(amount_pusd * 10**USDC_DECIMALS), bal)
+    if want <= 0:
         return None
 
     offramp = Web3.to_checksum_address(COLLATERAL_OFFRAMP)
-    nonce = w3.eth.get_transaction_count(addr)
-    gas_price = w3.eth.gas_price
-
-    allowance = pusd.functions.allowance(addr, offramp).call()
-    if allowance < want_raw:
-        approve_tx = pusd.functions.approve(offramp, MAX_UINT).build_transaction({
-            "from": addr, "nonce": nonce, "gasPrice": gas_price, "gas": 80_000, "chainId": 137,
-        })
-        signed = w3.eth.account.sign_transaction(approve_tx, private_key)
-        w3.eth.send_raw_transaction(signed.raw_transaction)
-        w3.eth.wait_for_transaction_receipt(signed.hash, timeout=120)
-        nonce += 1
-
+    _ensure_allowance(w3, pusd, addr, offramp, want, pk)
     ramp = w3.eth.contract(address=offramp, abi=_RAMP_ABI)
-    unwrap_tx = ramp.functions.unwrap(
-        Web3.to_checksum_address(USDC_BRIDGED), addr, want_raw
-    ).build_transaction({
-        "from": addr, "nonce": nonce, "gasPrice": gas_price, "gas": 250_000, "chainId": 137,
-    })
-    signed = w3.eth.account.sign_transaction(unwrap_tx, private_key)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-    log.info("unwrapped_pusd_to_usdce", wallet=wallet_address[:10], amount=want_raw / 10**USDC_DECIMALS)
-    return tx_hash.hex()
+    tx_hash = _exec_tx(
+        w3, pk, addr,
+        ramp.functions.unwrap(Web3.to_checksum_address(USDC_BRIDGED), addr, want),
+        300_000, "unwrap",
+    )
+    log.info("unwrapped_pusd_to_usdce", wallet=wallet_address[:10], amount=want / 10**USDC_DECIMALS)
+    return tx_hash
 
 
 def transfer_usdc(
@@ -298,7 +290,7 @@ def _swap_exact_in(
     """Swap token_in -> token_out via Uniswap v3 (0.01% pool). Stable 1:1 pair.
     amount_raw None -> swap full token_in balance. Returns tx hash or None."""
     w3 = _w3()
-    private_key = decrypt_key(private_key_enc)
+    pk = decrypt_key(private_key_enc)
     addr = Web3.to_checksum_address(wallet_address)
     tin = w3.eth.contract(address=Web3.to_checksum_address(token_in), abi=_ERC20_ABI)
 
@@ -308,17 +300,7 @@ def _swap_exact_in(
         return None
 
     router = Web3.to_checksum_address(UNISWAP_V3_ROUTER)
-    nonce = w3.eth.get_transaction_count(addr)
-    gas_price = w3.eth.gas_price
-
-    if tin.functions.allowance(addr, router).call() < amt:
-        approve_tx = tin.functions.approve(router, MAX_UINT).build_transaction({
-            "from": addr, "nonce": nonce, "gasPrice": gas_price, "gas": 80_000, "chainId": 137,
-        })
-        signed = w3.eth.account.sign_transaction(approve_tx, private_key)
-        w3.eth.send_raw_transaction(signed.raw_transaction)
-        w3.eth.wait_for_transaction_receipt(signed.hash, timeout=120)
-        nonce += 1
+    _ensure_allowance(w3, tin, addr, router, amt, pk)
 
     min_out = int(amt * (1 - SWAP_SLIPPAGE))
     params = (
@@ -332,15 +314,10 @@ def _swap_exact_in(
         0,
     )
     router_c = w3.eth.contract(address=router, abi=_SWAP_ROUTER_ABI)
-    swap_tx = router_c.functions.exactInputSingle(params).build_transaction({
-        "from": addr, "nonce": nonce, "gasPrice": gas_price, "gas": 300_000, "chainId": 137,
-    })
-    signed = w3.eth.account.sign_transaction(swap_tx, private_key)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    tx_hash = _exec_tx(w3, pk, addr, router_c.functions.exactInputSingle(params), 300_000, "swap")
     log.info("swap_done", token_in=token_in[:8], token_out=token_out[:8],
              amount=amt / 10**USDC_DECIMALS)
-    return tx_hash.hex()
+    return tx_hash
 
 
 def swap_usdc_to_usdce(private_key_enc: str, wallet_address: str,
