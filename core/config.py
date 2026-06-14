@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     alchemy_api_key: str
     polygon_rpc_url: str
 
+    # Polymarket V2 relayer / deposit wallets (auto-copy). Builder creds (3-part HMAC)
+    # are required by the Python relayer SDK; the 2-part relayer api key is stored too.
+    relayer_url: str = "https://relayer-v2.polymarket.com/"
+    builder_api_key: str = ""
+    builder_secret: str = ""
+    builder_passphrase: str = ""
+    relayer_api_key: str = ""
+    relayer_api_key_address: str = ""
+
     # App
     app_env: str = "development"
     webhook_base_url: str
