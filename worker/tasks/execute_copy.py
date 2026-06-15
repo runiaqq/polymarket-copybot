@@ -355,6 +355,10 @@ def _notify(
         price = float(signal.get("price") or 0)
         outcome = signal.get("outcome") or "—"
         prob = f"{price * 100:.0f}%"
+        whale_usdc = float(signal.get("size_usdc") or 0)
+        hours = signal.get("hours_to_resolve")
+        whale_line = f"🐳 Кит вошёл на: <b>${whale_usdc:,.0f}</b>" if whale_usdc else ""
+        hours_line = f" · ⏳ ~{hours:.0f} ч" if hours else ""
         link_line = f"\n🔗 <a href=\"{url}\">Смотреть позицию</a>" if url else ""
 
         if fill_status == "none":
@@ -388,8 +392,10 @@ def _notify(
             msg = (
                 f"{head}\n\n"
                 f"📌 {title_html}\n"
-                f"🎯 Исход: <b>{outcome}</b> @ {price:.3f} (~{prob})\n"
-                f"💵 Вложено: <b>${invested:.2f}{partial_note}</b>\n"
+                f"🎯 Исход: <b>{outcome}</b> @ {price:.3f} (~{prob}){hours_line}\n"
+                + (f"{whale_line}\n" if whale_line else "")
+                + "━━━━━━━━━━━━━━━━━\n"
+                f"💵 Бот вложил: <b>${invested:.2f}{partial_note}</b>\n"
                 f"💼 Остаток: <b>${remaining:.2f} pUSD</b>"
                 f"{ai_block}"
                 f"{link_line}"
