@@ -146,6 +146,7 @@ def evaluate_trade(
         "market_id":        market.get("condition_id", ""),
         "token_id":         market.get("token_id") or trade.get("token_id"),
         "title":            market.get("title", ""),
+        "outcome":          market.get("outcome", ""),   # e.g. "Yes", "No", "Over", "Under"
         "side":             "BUY",
         "price":            best_ask,
         "size_usdc":        usdc,                 # whale size (informational)

@@ -64,15 +64,27 @@ def _hours_until(end_iso: str | None) -> float | None:
     return (end - datetime.now(timezone.utc)).total_seconds() / 3600
 
 
-def _parse_tokens(m: dict) -> list[str]:
-    raw = m.get("clobTokenIds")
-    if not raw:
+def _parse_tokens(m: dict) -> list[dict]:
+    """Return list of {token_id, outcome} for a market."""
+    raw_ids = m.get("clobTokenIds")
+    if not raw_ids:
         return []
     try:
-        toks = json.loads(raw) if isinstance(raw, str) else raw
-        return [str(t) for t in toks if t]
+        ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+        ids = [str(t) for t in ids if t]
     except Exception:
         return []
+
+    raw_out = m.get("outcomes")
+    try:
+        outcomes = json.loads(raw_out) if isinstance(raw_out, str) else (raw_out or [])
+    except Exception:
+        outcomes = []
+
+    return [
+        {"token_id": tid, "outcome": str(outcomes[i]) if i < len(outcomes) else ""}
+        for i, tid in enumerate(ids)
+    ]
 
 
 def _build_market_meta(m: dict) -> dict | None:
@@ -100,8 +112,8 @@ def _build_market_meta(m: dict) -> dict | None:
     if settings.market_min_liquidity_usdc > 0 and liquidity < settings.market_min_liquidity_usdc:
         return None
 
-    tokens = _parse_tokens(m)
-    if not tokens:
+    token_list = _parse_tokens(m)
+    if not token_list:
         return None
 
     events = m.get("events") or []
@@ -116,7 +128,8 @@ def _build_market_meta(m: dict) -> dict | None:
         "min_size": float(m.get("orderMinSize") or 5),
         "neg_risk": bool(m.get("negRisk", False)),
         "liquidity": liquidity,
-        "tokens": tokens,
+        "tokens": [t["token_id"] for t in token_list],   # back-compat list of IDs
+        "token_outcomes": {t["token_id"]: t["outcome"] for t in token_list},
         "event_slug": event_slug,
     }
 
@@ -186,8 +199,13 @@ def get_watch_markets() -> dict[str, dict]:
 
     token_map: dict[str, dict] = {}
     for meta in markets:
+        outcomes_by_id = meta.get("token_outcomes", {})
         for token_id in meta.get("tokens", []):
-            token_map[token_id] = {**meta, "token_id": token_id}
+            token_map[token_id] = {
+                **meta,
+                "token_id": token_id,
+                "outcome": outcomes_by_id.get(token_id, ""),
+            }
     return token_map
 
 
