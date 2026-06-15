@@ -653,12 +653,21 @@ def _build_pnl(db_user: dict, period: str = "day") -> str:
     losses = sum(1 for c in period_closed if c["realized_pnl"] < 0)
 
     invested = sum(p["current_value"] for p in open_pos)
-    unrealized = sum(p["cash_pnl"] for p in open_pos)
+    # Compute unrealized P&L robustly from shares × (cur − avg). The API's cashPnl
+    # is unreliable on freshly-opened positions (avg_price momentarily 0 → it reports
+    # the whole position value as "profit"). Skip positions without a valid avg price.
+    unrealized = 0.0
+    for p in open_pos:
+        avg = float(p.get("avg_price") or 0)
+        cur = float(p.get("cur_price") or 0)
+        shares = float(p.get("shares") or 0)
+        if avg > 0.001:
+            unrealized += shares * (cur - avg)
 
     r_icon = "📈" if realized >= 0 else "📉"
     u_icon = "📈" if unrealized >= 0 else "📉"
     settled_n = len(period_closed)
-    winrate = f" · винрейт {wins}/{settled_n}" if settled_n else ""
+    winrate = f" · винрейт <b>{wins / settled_n * 100:.0f}%</b>" if settled_n else ""
 
     return (
         f"💰 <b>Статистика P&L · {_PNL_LABELS[period]}</b>\n\n"

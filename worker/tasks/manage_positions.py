@@ -258,7 +258,16 @@ def close_position(self, user_id: int, token_id: str, reason: str = "manual") ->
         # if this exit fills near 0/1.
         if condition_id:
             _claim_settled(user_id, condition_id)
-        _notify_closed(user["telegram_id"], position, reason)
+        # Read the new trading balance so the user sees the funds returned.
+        try:
+            import time as _t
+            _t.sleep(4)  # let the sale settle to pUSD
+            from core.polymarket import get_positions as _gp  # noqa: F401
+            from core.polygon import get_balances
+            remaining = get_balances(deposit_wallet).get("pusd", 0.0)
+        except Exception:
+            remaining = None
+        _notify_closed(user["telegram_id"], position, reason, remaining)
         log.info("position_closed", user_id=user_id, token=token_id[:18], reason=reason)
         return {"closed": True, "reason": reason}
     except Exception as exc:
@@ -304,7 +313,8 @@ def _event_link(event_slug: str | None) -> str:
     return f"\n🔗 <a href=\"{url}\">Открыть на Polymarket</a>" if url else ""
 
 
-def _notify_closed(telegram_id: int, position: dict, reason: str) -> None:
+def _notify_closed(telegram_id: int, position: dict, reason: str,
+                   remaining: float | None = None) -> None:
     labels = {
         "take_profit": "🎯 Тейк-профит",
         "stop_loss":   "🛑 Стоп-лосс",
@@ -316,12 +326,14 @@ def _notify_closed(telegram_id: int, position: dict, reason: str) -> None:
     icon = "📈" if pnl >= 0 else "📉"
     outcome = position.get("outcome") or "—"
     title = (position.get("title") or "—")[:50]
+    bal_line = f"\n💼 Торговый баланс: <b>${remaining:.2f} pUSD</b>" if remaining is not None else ""
     _notify(
         telegram_id,
         f"✅ <b>Позиция закрыта</b> ({labels.get(reason, reason)})\n\n"
         f"📌 {title}\n"
         f"🎯 Исход: <b>{outcome}</b>\n"
         f"{icon} P&L: <b>{pnl:+.2f}$</b> ({pct:+.0%})"
+        f"{bal_line}"
         f"{_event_link(position.get('event_slug'))}",
     )
 

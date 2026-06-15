@@ -12,8 +12,7 @@ from worker.celery_app import celery_app
 
 log = structlog.get_logger(__name__)
 
-DEPOSIT_MIN = 0.50    # notify if balance increased by at least $0.50
-WITHDRAW_MIN = 0.50   # notify if balance decreased by at least $0.50
+DEPOSIT_MIN = 0.50    # notify if fresh EOA stablecoin increased by at least $0.50
 
 
 @celery_app.task(name="worker.tasks.monitor_deposits", queue="periodic")
@@ -39,20 +38,21 @@ def monitor_deposits() -> dict:
         try:
             balances = get_balances(addr)
             dw = user.get("deposit_wallet_address")
-            dw_pusd = get_balances(dw).get("pusd", 0.0) if dw else 0.0
-            # Use TOTAL across EOA + deposit wallet so internal sweeps don't
-            # look like withdrawals (EOA drops but DW rises → net = 0).
-            eoa_total = balances.get("total_usdc", 0.0)
-            new_balance = round(eoa_total + dw_pusd, 4)
-            old_balance = float(user.get("balance_usdc") or 0.0)
-            diff = new_balance - old_balance
+            has_pol = balances.get("matic", 0.0) >= 0.02
+            has_key = bool(user.get("wallet_private_key_enc"))
 
-            # Auto-fund the deposit wallet: convert any deposited USDC (native or
-            # bridged) on the EOA into pUSD, then sweep it into the deposit wallet
-            # (the trading collateral). Needs POL on the EOA for gas.
-            dw = user.get("deposit_wallet_address")
-            on_eoa = balances.get("usdc", 0.0) + balances.get("usdc_e", 0.0) + balances.get("pusd", 0.0)
-            if dw and on_eoa >= 1.0 and balances.get("matic", 0.0) >= 0.02 and user.get("wallet_private_key_enc"):
+            # A DEPOSIT = fresh stablecoin arriving on the EOA (USDC / USDC.e).
+            # This is the ONLY unambiguous deposit signal: opening/closing positions
+            # and resolutions move funds inside the deposit wallet, never onto the EOA,
+            # so they can't be mistaken for deposits. (We don't track "withdrawals" here
+            # at all — the bot's own withdraw flow notifies separately.)
+            eoa_stable = round(balances.get("usdc", 0.0) + balances.get("usdc_e", 0.0), 4)
+            last_eoa_stable = float(user.get("balance_usdc") or 0.0)
+            is_new_deposit = eoa_stable >= DEPOSIT_MIN and eoa_stable > last_eoa_stable + DEPOSIT_MIN
+
+            # Auto-fund: convert EOA USDC -> pUSD and sweep into the deposit wallet.
+            moved = 0.0
+            if dw and eoa_stable >= 1.0 and has_pol and has_key:
                 try:
                     from core.polygon import fund_deposit_wallet
                     moved = fund_deposit_wallet(user["wallet_private_key_enc"], addr, dw)
@@ -62,17 +62,17 @@ def monitor_deposits() -> dict:
                 except Exception:
                     log.warning("auto_fund_failed", user_id=user["id"])
 
-            # Update stored balance
-            sb.table("users").update({"balance_usdc": new_balance}).eq("id", user["id"]).execute()
+            # If we couldn't auto-fund a fresh deposit (no POL / no wallet yet),
+            # tell the user what to do — but only once per new deposit.
+            if is_new_deposit and moved < 1.0:
+                _notify_deposit(user["telegram_id"], eoa_stable, eoa_stable, has_pol, bool(dw))
+                notified += 1
 
-            if diff >= DEPOSIT_MIN:
-                has_pol = balances.get("matic", 0.0) >= 0.02
-                has_dw = bool(user.get("deposit_wallet_address"))
-                _notify_deposit(user["telegram_id"], new_balance, diff, has_pol, has_dw)
-                notified += 1
-            elif diff <= -WITHDRAW_MIN:
-                _notify_withdrawal(user["telegram_id"], new_balance, abs(diff))
-                notified += 1
+            # Store the post-action EOA stablecoin balance as the new baseline.
+            # After a successful auto-fund the EOA is ~0, so the next real deposit
+            # is detected cleanly.
+            new_baseline = 0.0 if moved >= 1.0 else eoa_stable
+            sb.table("users").update({"balance_usdc": new_baseline}).eq("id", user["id"]).execute()
 
         except Exception:
             log.exception("balance_check_failed", user_id=user["id"])
@@ -150,25 +150,3 @@ def _notify_deposit(telegram_id: int, new_balance: float, amount: float,
         asyncio.get_event_loop().run_until_complete(_send())
     except Exception:
         log.exception("deposit_notify_failed", telegram_id=telegram_id)
-
-
-def _notify_withdrawal(telegram_id: int, new_balance: float, amount: float) -> None:
-    from telegram import Bot
-    from core.config import settings
-
-    async def _send() -> None:
-        bot = Bot(token=settings.telegram_bot_token)
-        await bot.send_message(
-            chat_id=telegram_id,
-            text=(
-                f"🔴 <b>Вывод выполнен</b>\n\n"
-                f"➖ <b>-${amount:.2f} USDC</b>\n"
-                f"💼 Остаток: <b>${new_balance:.2f} USDC</b>"
-            ),
-            parse_mode="HTML",
-        )
-
-    try:
-        asyncio.get_event_loop().run_until_complete(_send())
-    except Exception:
-        log.exception("withdraw_notify_failed", telegram_id=telegram_id)
