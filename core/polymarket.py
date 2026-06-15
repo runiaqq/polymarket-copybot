@@ -338,7 +338,10 @@ def get_positions(wallet_address: str) -> list[dict]:
                 "cur_price":    float(p.get("curPrice") or 0),
                 "current_value": float(p.get("currentValue") or 0),
                 "cash_pnl":     float(p.get("cashPnl") or 0),
-                "percent_pnl":  float(p.get("percentPnl") or 0),
+                # Polymarket API returns percentPnl as a percentage value (e.g. -3.96
+                # meaning -3.96%), NOT as a fraction (0.0396). Divide by 100 so the
+                # rest of the codebase works with standard fraction form (1.0 = 100%).
+                "percent_pnl":  float(p.get("percentPnl") or 0) / 100.0,
                 "realized_pnl": float(p.get("realizedPnl") or 0),
                 "redeemable":   bool(p.get("redeemable", False)),
                 "neg_risk":     bool(p.get("negativeRisk", False)),
