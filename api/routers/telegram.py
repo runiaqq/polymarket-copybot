@@ -125,16 +125,13 @@ def _checklist(db_user: dict) -> str:
     sub = get_subscription_status(db_user.get("telegram_id")) if db_user.get("telegram_id") else {"active": False}
     registered = bool(db_user.get("wallet_registered"))
     copy_active = bool(db_user.get("copy_active"))
-    funded = (dw_pusd + on_eoa) >= MIN_USDC_READY
+    funded_enough = (dw_pusd + on_eoa) >= MIN_USDC_READY
 
-    steps_done = (
-        registered
-        and dw_pusd >= MIN_USDC_READY
-        and pol >= MIN_POL_READY
-        and sub.get("active")
-        and copy_active
-    )
-    if steps_done:
+    # Hide checklist once all SETUP steps are done.
+    # Balance level is NOT a setup condition — money may be deployed in open positions,
+    # and the bot will alert separately when funds are insufficient for a new trade.
+    setup_done = registered and sub.get("active") and copy_active
+    if setup_done:
         return ""
 
     def mark(ok: bool) -> str:
@@ -142,7 +139,7 @@ def _checklist(db_user: dict) -> str:
 
     lines = ["📋 <b>Чек-лист запуска</b>\n"]
     lines.append(f"{mark(registered)} 1. Настроить торговый кошелёк (/register, без газа)")
-    lines.append(f"{mark(funded)} 2. Пополнить <b>USDC</b> (сеть Polygon)")
+    lines.append(f"{mark(funded_enough)} 2. Пополнить <b>USDC</b> (сеть Polygon)")
     lines.append(f"{mark(pol >= MIN_POL_READY)} 3. Пополнить <b>POL</b> для газа (~0.1)")
     lines.append(f"{mark(dw_pusd >= MIN_USDC_READY)} 4. Средства на торговом кошельке (авто / /wrap)")
     if on_eoa >= 1.0 and dw_pusd < MIN_USDC_READY:
