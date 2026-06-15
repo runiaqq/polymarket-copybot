@@ -259,12 +259,15 @@ def _notify_closed(telegram_id: int, position: dict, reason: str) -> None:
         "manual":      "✋ Вручную",
     }
     pnl = position.get("cash_pnl", 0)
-    pct = position.get("percent_pnl", 0)
+    pct = max(-1.0, min(10.0, position.get("percent_pnl", 0)))
     icon = "📈" if pnl >= 0 else "📉"
+    outcome = position.get("outcome") or "—"
+    title = (position.get("title") or "—")[:50]
     _notify(
         telegram_id,
         f"✅ <b>Позиция закрыта</b> ({labels.get(reason, reason)})\n\n"
-        f"📌 {(position.get('title') or '—')[:50]} · {position.get('outcome', '')}\n"
+        f"📌 {title}\n"
+        f"🎯 Исход: <b>{outcome}</b>\n"
         f"{icon} P&L: <b>{pnl:+.2f}$</b> ({pct:+.0%})"
         f"{_event_link(position.get('event_slug'))}",
     )
@@ -282,7 +285,8 @@ def _emit_win(telegram_id: int, title: str | None, outcome: str | None,
     _notify(
         telegram_id,
         f"🏆 <b>Событие выиграно!</b>\n\n"
-        f"📌 {(title or '—')[:50]} · {outcome or ''}\n"
+        f"📌 {(title or '—')[:50]}\n"
+        f"🎯 Исход: <b>{outcome or '—'}</b>\n"
         f"📈 Результат: <b>{pnl:+.2f}$</b>"
         f"{_event_link(event_slug)}{note}",
     )
@@ -293,7 +297,8 @@ def _emit_loss(telegram_id: int, title: str | None, outcome: str | None,
     _notify(
         telegram_id,
         f"💔 <b>Событие проиграно</b>\n\n"
-        f"📌 {(title or '—')[:50]} · {outcome or ''}\n"
+        f"📌 {(title or '—')[:50]}\n"
+        f"🎯 Исход: <b>{outcome or '—'}</b>\n"
         f"📉 Результат: <b>{pnl:+.2f}$</b>"
         f"{_event_link(event_slug)}",
     )

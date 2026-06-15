@@ -302,10 +302,14 @@ def _notify(
         price = signal.get("price", 0)
         link_line = f"\n🔗 <a href=\"{url}\">Открыть на Polymarket</a>" if url else ""
 
+        outcome = signal.get("outcome") or "—"
+        prob = f"{price * 100:.0f}%"
+
         if fill_status == "none":
             msg = (
                 f"⚠️ <b>Не удалось наполнить ордер</b>\n\n"
-                f"📌 {title_html}\n\n"
+                f"📌 {title_html}\n"
+                f"🎯 Исход: <b>{outcome}</b>\n\n"
                 f"Стакан слишком тонкий — позиция не открыта. "
                 f"Сделка пропущена.{link_line}"
             )
@@ -319,8 +323,8 @@ def _notify(
             )
             msg = (
                 f"{head}\n\n"
-                f"📌 {title_html}\n\n"
-                f"🟢 BUY @ <code>{price:.4f}</code>\n"
+                f"📌 {title_html}\n"
+                f"🎯 Исход: <b>{outcome}</b> @ <code>{price:.3f}</code> (~{prob})\n"
                 f"{fill_line}{link_line}"
             )
         await bot.send_message(
