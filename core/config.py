@@ -118,7 +118,7 @@ class Settings(BaseSettings):
     # Wider slippage when exiting (books thin out near resolution).
     exit_slippage_pct: float = 0.03
     # Portfolio cap: max simultaneous open positions per user.
-    max_open_positions: int = 10
+    max_open_positions: int = 15
     # How often (seconds) to sync positions, evaluate TP/SL and detect resolution.
     positions_sync_sec: int = 60
     # Only emit win/loss notices for settlements newer than this lookback (anti-spam

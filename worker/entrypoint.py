@@ -15,6 +15,6 @@ if __name__ == "__main__":
         "--beat",                       # embed beat scheduler
         "--loglevel=info",
         "--queues=trades,ai,periodic",
-        "--concurrency=4",
+        "--concurrency=8",
     ]
     celery_main()
