@@ -1,0 +1,49 @@
+version: "3.9"
+
+# Full self-hosted stack: API (polling) + Worker + local Redis.
+# Drop-in replacement for Railway (API) + Fly (worker) + Upstash (Redis).
+#
+# Usage on a VPS in a non-geoblocked region (e.g. AWS eu-west-1 Ireland):
+#   docker compose up -d --build
+#   docker compose logs -f
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      USE_POLLING: "true"
+      AUTO_COPY_ENABLED: "true"
+      REDIS_URL: "redis://redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"   # optional: health check endpoint
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      AUTO_COPY_ENABLED: "true"
+      REDIS_URL: "redis://redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy

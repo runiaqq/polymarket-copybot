@@ -53,7 +53,7 @@ class Settings(BaseSettings):
 
     # App
     app_env: str = "development"
-    webhook_base_url: str
+    webhook_base_url: str = ""
 
     # ── Strategy: whale-tracking on fast markets ────────────────────────────────
     # Market universe: only watch markets resolving within this window.
@@ -133,6 +133,11 @@ class Settings(BaseSettings):
     scan_trades_limit: int = 100
     min_trade_size_usdc: float = 5.0
     min_market_hours_to_close: float = 0.0
+
+    # ── Telegram delivery mode ─────────────────────────────────────────────────
+    # True  = polling (no domain/HTTPS needed; good for VPS without a domain)
+    # False = webhook (default; needs WEBHOOK_BASE_URL + HTTPS)
+    use_polling: bool = False
 
     # ── Product mode ───────────────────────────────────────────────────────────
     # False = signals only (detect + AI + link, user trades on Polymarket themselves).

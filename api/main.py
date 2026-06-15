@@ -1,4 +1,6 @@
+import asyncio
 import hmac
+import threading
 from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
 
@@ -19,17 +21,49 @@ tg_app = build_application()
 admin_app = build_admin_application()
 
 
+def _run_polling(app, name: str) -> None:
+    """Run a telegram Application in polling mode in its own event loop thread."""
+    async def _start() -> None:
+        await app.initialize()
+        await app.updater.start_polling(drop_pending_updates=True)
+        await app.start()
+        log.info(f"{name}_polling_started")
+        # Keep alive until the process exits.
+        stop_event = asyncio.Event()
+        await stop_event.wait()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_start())
+    except Exception:
+        log.exception(f"{name}_polling_crashed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    await tg_app.initialize()
-    log.info("telegram_app_initialized")
-    if admin_app:
-        await admin_app.initialize()
-        log.info("admin_app_initialized")
+    if settings.use_polling:
+        # Polling mode: each bot runs in its own background thread with its own loop.
+        t_main = threading.Thread(target=_run_polling, args=(tg_app, "main_bot"),
+                                  daemon=True, name="tg-poll-main")
+        t_main.start()
+        if admin_app:
+            t_admin = threading.Thread(target=_run_polling, args=(admin_app, "admin_bot"),
+                                       daemon=True, name="tg-poll-admin")
+            t_admin.start()
+        log.info("polling_mode_active")
+    else:
+        # Webhook mode: standard initialization, updates come via POST /webhook/*.
+        await tg_app.initialize()
+        log.info("telegram_app_initialized")
+        if admin_app:
+            await admin_app.initialize()
+            log.info("admin_app_initialized")
     yield
-    await tg_app.shutdown()
-    if admin_app:
-        await admin_app.shutdown()
+    if not settings.use_polling:
+        await tg_app.shutdown()
+        if admin_app:
+            await admin_app.shutdown()
 
 
 app = FastAPI(title="Polymarket CopyBot API", lifespan=lifespan)
