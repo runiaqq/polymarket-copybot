@@ -235,11 +235,19 @@ def close_position(self, user_id: int, token_id: str, reason: str = "manual") ->
             raise self.retry(exc=exc)
 
     try:
+        import math
+        # Truncate shares DOWN to 2 decimal places to avoid "not enough balance"
+        # errors caused by the positions API rounding up vs actual on-chain token balance.
+        shares_to_sell = math.floor(position["shares"] * 100) / 100
+        if shares_to_sell <= 0:
+            _closing.discard((user_id, token_id))
+            return {"skipped": True, "reason": "zero_shares_after_truncation"}
+
         sell_position(
             private_key_enc=user["wallet_private_key_enc"],
             api_creds=api_creds,
             token_id=token_id,
-            shares=position["shares"],
+            shares=shares_to_sell,
             price=float(best_bid),
             tick_size=str(book.get("tick_size", "0.01")),
             neg_risk=bool(book.get("neg_risk", position.get("neg_risk", False))),
