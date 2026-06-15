@@ -66,7 +66,9 @@ def monitor_deposits() -> dict:
             sb.table("users").update({"balance_usdc": new_balance}).eq("id", user["id"]).execute()
 
             if diff >= DEPOSIT_MIN:
-                _notify_deposit(user["telegram_id"], new_balance, diff)
+                has_pol = balances.get("matic", 0.0) >= 0.02
+                has_dw = bool(user.get("deposit_wallet_address"))
+                _notify_deposit(user["telegram_id"], new_balance, diff, has_pol, has_dw)
                 notified += 1
             elif diff <= -WITHDRAW_MIN:
                 _notify_withdrawal(user["telegram_id"], new_balance, abs(diff))
@@ -101,22 +103,48 @@ def _notify_wrapped(telegram_id: int, amount: float) -> None:
         log.exception("wrapped_notify_failed", telegram_id=telegram_id)
 
 
-def _notify_deposit(telegram_id: int, new_balance: float, amount: float) -> None:
+def _notify_deposit(telegram_id: int, new_balance: float, amount: float,
+                    has_pol: bool = True, has_dw: bool = True) -> None:
     from telegram import Bot
     from core.config import settings
 
     async def _send() -> None:
         bot = Bot(token=settings.telegram_bot_token)
-        await bot.send_message(
-            chat_id=telegram_id,
-            text=(
-                f"💚 <b>Пополнение получено!</b>\n\n"
-                f"➕ <b>+${amount:.2f} USDC</b>\n"
-                f"💼 Текущий баланс: <b>${new_balance:.2f} USDC</b>\n\n"
-                f"▶️ PolyMind готов копировать сделки!"
-            ),
-            parse_mode="HTML",
+
+        if not has_dw:
+            # Wallet not registered yet — guide to /register first
+            next_step = (
+                "⚙️ <b>Что дальше:</b>\n"
+                "1. Сначала выполни /register — настройка торгового кошелька (без газа)\n"
+                "2. Затем /wrap — перевод средств в торговый баланс\n"
+                "3. /resume — включи копирование\n\n"
+                "Бот начнёт копировать сделки автоматически."
+            )
+        elif not has_pol:
+            # Has DW but no POL — swap can't run automatically
+            next_step = (
+                "⚙️ <b>Что дальше:</b>\n"
+                "Для перевода средств в торговый баланс нужен <b>POL</b> на газ.\n\n"
+                "1. Пополни <b>POL (~0.1)</b> на тот же адрес\n"
+                "2. После этого выполни /wrap — средства переведутся автоматически\n\n"
+                "⚠️ Пока не сделаешь /wrap, бот <b>не торгует</b> — USDC ещё не в торговом балансе."
+            )
+        else:
+            # Has DW + POL — auto-fund will run in the next monitor cycle
+            next_step = (
+                "⚙️ <b>Что дальше:</b>\n"
+                "Бот автоматически переведёт USDC в торговый баланс (pUSD) в течение пары минут.\n\n"
+                "Если хочешь сделать это прямо сейчас — выполни /wrap.\n"
+                "После этого бот сразу начнёт копировать сделки."
+            )
+
+        text = (
+            f"💚 <b>Пополнение получено!</b>\n\n"
+            f"➕ <b>+${amount:.2f} USDC</b>\n"
+            f"💼 Общий баланс: <b>${new_balance:.2f} USDC</b>\n\n"
+            f"{next_step}"
         )
+        await bot.send_message(chat_id=telegram_id, text=text, parse_mode="HTML")
 
     try:
         asyncio.get_event_loop().run_until_complete(_send())
