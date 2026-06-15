@@ -97,12 +97,14 @@ def dispatch_signal(signal: dict) -> dict:
             log.warning("wallet_filter_error", market=signal.get("market_id"))
 
     user_ids = [u["id"] for u in subscribers]
-    # Auto-copy is gated: without it (signals mode) we only send the AI analysis,
-    # and the user trades on Polymarket themselves via the link.
     if settings.auto_copy_enabled:
+        # Auto-copy: AI analysis is embedded inside each execute_copy_trade task
+        # so the user gets ONE combined message (trade + analysis). No separate AI task.
         for uid in user_ids:
             execute_copy_trade.delay(uid, signal)
-    run_ai_analysis.delay(signal, user_ids)
+    else:
+        # Signals mode: no trade executed, send standalone AI analysis.
+        run_ai_analysis.delay(signal, user_ids)
 
     log.info("signal_dispatched", market=signal.get("market_id", "")[:18],
              whale_usdc=signal.get("size_usdc"), subs=len(user_ids), auto_copy=settings.auto_copy_enabled)

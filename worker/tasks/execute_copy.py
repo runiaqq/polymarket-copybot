@@ -188,6 +188,26 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         })
         signal_id = sig_row["id"]
 
+    # ── Guard against Celery retry re-executing an already-placed order ──────
+    # If a copy_trade row for this (user, signal) already exists with a non-failed
+    # terminal status, this is a Celery retry after a transient error — skip.
+    try:
+        existing = (
+            sb.table("copy_trades")
+            .select("id,status")
+            .eq("user_id", user["id"])
+            .eq("signal_id", signal_id)
+            .neq("status", "failed")
+            .neq("status", "executing")
+            .maybe_single()
+            .execute()
+        )
+        if existing and existing.data:
+            log.info("skip_already_executed", user_id=user_id, signal_id=signal_id)
+            return {"skipped": True, "reason": "already_executed"}
+    except Exception:
+        pass
+
     trade_row = insert_copy_trade({
         "user_id":   user["id"],
         "signal_id": signal_id,
@@ -211,28 +231,57 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
 
         order_id = result.get("orderID") or result.get("order_id") or ""
 
-        # FAK orders can partial-fill (or fill nothing) on thin books.
-        # Confirm the actual fill from on-chain positions (held by the deposit wallet).
+        # Mark as placed immediately so retries won't double-execute.
+        try:
+            sb.table("copy_trades").update({
+                "status":   "placed",
+                "order_id": order_id,
+            }).eq("id", trade_row["id"]).execute()
+        except Exception:
+            pass
+
+        # Confirm actual fill from on-chain positions (deposit wallet).
         filled, fill_status = _confirm_fill(deposit_wallet, token_id, size_usdc)
 
-        status = "confirmed" if fill_status != "none" else "unfilled"
-        sb.table("copy_trades").update({
-            "status":   status,
-            "order_id": order_id,
-            "size_usdc": round(filled, 2) if fill_status in ("full", "partial") else size_usdc,
-        }).eq("id", trade_row["id"]).execute()
+        # Remaining balance after the trade.
+        try:
+            from core.polygon import get_balances
+            remaining = get_balances(deposit_wallet).get("pusd", 0.0)
+        except Exception:
+            remaining = 0.0
+
+        # Get AI analysis to include in the single combined notification.
+        score, verdict, reason = None, None, None
+        try:
+            from worker.tasks.ai_filter import _call_gpt
+            score, verdict, reason = _call_gpt(signal)
+        except Exception:
+            log.warning("ai_inline_failed", user_id=user_id)
+
+        final_status = "confirmed" if fill_status != "none" else "unfilled"
+        try:
+            sb.table("copy_trades").update({
+                "status":   final_status,
+                "size_usdc": round(filled, 2) if fill_status in ("full", "partial") else size_usdc,
+            }).eq("id", trade_row["id"]).execute()
+        except Exception:
+            pass
 
         log.info("copy_trade_ok", user_id=user_id, order_id=order_id,
                  fill=fill_status, filled=round(filled, 2))
-        _notify(user["telegram_id"], signal, order_id, size_usdc, filled, fill_status)
+        _notify(user["telegram_id"], signal, order_id, size_usdc, filled,
+                fill_status, remaining, score, verdict, reason)
 
         return {"order_id": order_id, "user_id": user_id, "fill": fill_status, "filled": filled}
 
     except Exception as exc:
-        sb.table("copy_trades").update({
-            "status":    "failed",
-            "error_msg": str(exc)[:1000],
-        }).eq("id", trade_row["id"]).execute()
+        try:
+            sb.table("copy_trades").update({
+                "status":    "failed",
+                "error_msg": str(exc)[:1000],
+            }).eq("id", trade_row["id"]).execute()
+        except Exception:
+            pass
         log.exception("copy_trade_failed", user_id=user_id)
         raise self.retry(exc=exc)
 
@@ -288,44 +337,62 @@ def _notify_low_balance(telegram_id: int, balance: float, needed: float, signal:
 def _notify(
     telegram_id: int, signal: dict, order_id: str,
     intended_usdc: float, filled_usdc: float, fill_status: str,
+    remaining: float = 0.0,
+    ai_score: int | None = None,
+    ai_verdict: str | None = None,
+    ai_reason: str | None = None,
 ) -> None:
-    """Send the entry notification, reflecting full / partial / no fill, with event link."""
+    """One combined message: trade result + AI analysis + balance remaining."""
     from telegram import Bot
     from core.config import settings
     from core.polymarket import event_url
 
     async def _send() -> None:
         bot = Bot(token=settings.telegram_bot_token)
-        title = signal.get("title") or "—"
+        title = (signal.get("title") or "—")[:60]
         url = event_url(signal.get("event_slug"))
         title_html = f"<a href=\"{url}\">{title}</a>" if url else f"<b>{title}</b>"
-        price = signal.get("price", 0)
-        link_line = f"\n🔗 <a href=\"{url}\">Открыть на Polymarket</a>" if url else ""
-
+        price = float(signal.get("price") or 0)
         outcome = signal.get("outcome") or "—"
         prob = f"{price * 100:.0f}%"
+        link_line = f"\n🔗 <a href=\"{url}\">Смотреть позицию</a>" if url else ""
 
         if fill_status == "none":
             msg = (
-                f"⚠️ <b>Не удалось наполнить ордер</b>\n\n"
+                f"⚠️ <b>Сделка не прошла</b>\n\n"
                 f"📌 {title_html}\n"
                 f"🎯 Исход: <b>{outcome}</b>\n\n"
-                f"Стакан слишком тонкий — позиция не открыта. "
-                f"Сделка пропущена.{link_line}"
+                f"Стакан слишком тонкий — ордер не наполнился, позиция не открыта.{link_line}"
             )
         else:
-            head = "⚡️ <b>Сделка скопирована!</b>"
+            head = "✅ <b>Бот открыл позицию</b>"
             if fill_status == "partial":
-                head = "⚡️ <b>Сделка скопирована частично</b>"
-            fill_line = (
-                f"💵 Вложено: <b>${filled_usdc:.2f}</b>"
-                + (f" из <b>${intended_usdc:.2f}</b> (тонкий стакан)" if fill_status == "partial" else " USDC")
-            )
+                head = "✅ <b>Бот открыл позицию (частично)</b>"
+            elif fill_status == "unknown":
+                head = "✅ <b>Бот открыл позицию</b>"
+
+            invested = filled_usdc if fill_status in ("full", "partial") else intended_usdc
+            partial_note = f" из ${intended_usdc:.2f} (тонкий стакан)" if fill_status == "partial" else ""
+
+            # AI block
+            ai_block = ""
+            if ai_score is not None and ai_verdict and ai_reason:
+                risk_icon = "🟢" if ai_score <= 4 else ("🟡" if ai_score <= 6 else "🔴")
+                ai_block = (
+                    f"\n\n━━━━━━━━━━━━━━━━━\n"
+                    f"🧠 <b>ИИ-анализ</b>\n"
+                    f"{risk_icon} <b>{ai_verdict}</b> · риск {ai_score}/10\n"
+                    f"💬 {ai_reason}"
+                )
+
             msg = (
                 f"{head}\n\n"
                 f"📌 {title_html}\n"
-                f"🎯 Исход: <b>{outcome}</b> @ <code>{price:.3f}</code> (~{prob})\n"
-                f"{fill_line}{link_line}"
+                f"🎯 Исход: <b>{outcome}</b> @ {price:.3f} (~{prob})\n"
+                f"💵 Вложено: <b>${invested:.2f}{partial_note}</b>\n"
+                f"💼 Остаток: <b>${remaining:.2f} pUSD</b>"
+                f"{ai_block}"
+                f"{link_line}"
             )
         await bot.send_message(
             chat_id=telegram_id, text=msg, parse_mode="HTML", disable_web_page_preview=True
