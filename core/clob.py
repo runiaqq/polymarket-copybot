@@ -27,8 +27,14 @@ _ERC20_APPROVE_ABI = [{"inputs":[{"name":"spender","type":"address"},{"name":"am
 _ERC1155_APPROVAL_ABI = [{"inputs":[{"name":"operator","type":"address"},{"name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"}]
 
 
-def _make_client(private_key: str, api_creds: dict | None = None):
-    from py_clob_client_v2 import ApiCreds, ClobClient
+def _make_client(private_key: str, api_creds: dict | None = None, funder: str | None = None):
+    """Build a CLOB v2 client.
+
+    When `funder` (the user's deposit wallet) is given, the client signs orders as
+    POLY_1271 with the deposit wallet as collateral source — the only path V2 accepts
+    (plain EOA makers are rejected with "maker address not allowed").
+    """
+    from py_clob_client_v2 import ApiCreds, ClobClient, SignatureTypeV2
 
     creds = None
     if api_creds and api_creds.get("clob_api_key"):
@@ -38,79 +44,40 @@ def _make_client(private_key: str, api_creds: dict | None = None):
             api_passphrase=api_creds["clob_passphrase"],
         )
 
-    return ClobClient(
-        host=CLOB_HOST,
-        chain_id=CHAIN_ID,
-        key=private_key,
-        creds=creds,
-    )
+    kwargs = dict(host=CLOB_HOST, chain_id=CHAIN_ID, key=private_key, creds=creds)
+    if funder:
+        kwargs["signature_type"] = SignatureTypeV2.POLY_1271
+        kwargs["funder"] = funder
+    return ClobClient(**kwargs)
 
 
-def register_wallet(private_key_enc: str) -> dict:
+def register_deposit_wallet(private_key_enc: str) -> dict:
     """
-    One-time wallet registration for Polymarket CLOB V2 trading (EOA / signature type 0).
-    Approves pUSD (collateral) and the CTF outcome tokens for the V2 exchanges so orders
-    can be matched and settled on-chain, then wraps any existing USDC.e into pUSD.
-    Requires POL (MATIC) for gas (~0.05 recommended for the full approval set).
+    One-time per-user setup for Polymarket V2 trading via a deposit wallet.
+
+    Gasless (relayer-paid): derive the deterministic deposit wallet, deploy it,
+    set pUSD + CTF approvals on it, then derive CLOB API creds bound to that
+    deposit wallet (POLY_1271). No POL needed from the user for any of this.
+    Funding (moving pUSD into the deposit wallet) happens separately on deposit.
     """
-    from web3 import Web3
-    from core.config import settings
+    from core import relayer
 
-    private_key = decrypt_key(private_key_enc)
-    w3 = Web3(Web3.HTTPProvider(settings.polygon_rpc_url))
-    account = w3.eth.account.from_key(private_key)
-    address = account.address
+    deposit_wallet = relayer.derive_deposit_wallet(private_key_enc)
+    relayer.deploy_deposit_wallet(private_key_enc)
+    relayer.set_trading_approvals(private_key_enc)
+    creds = generate_api_creds(private_key_enc, funder=deposit_wallet)
 
-    matic_balance = w3.eth.get_balance(address)
-    if matic_balance < w3.to_wei(0.02, "ether"):
-        raise ValueError(
-            f"Недостаточно POL для регистрации. "
-            f"Нужно минимум ~0.05 POL, на балансе: "
-            f"{w3.from_wei(matic_balance, 'ether'):.6f} POL"
-        )
-
-    gas_price = w3.eth.gas_price
-    nonce = w3.eth.get_transaction_count(address)
-
-    def _send_tx(contract_address: str, abi: list, fn_name: str, *args) -> None:
-        nonlocal nonce
-        contract = w3.eth.contract(address=Web3.to_checksum_address(contract_address), abi=abi)
-        fn = getattr(contract.functions, fn_name)(*args)
-        tx = fn.build_transaction({
-            "from": address, "nonce": nonce, "gasPrice": gas_price, "gas": 120_000, "chainId": 137,
-        })
-        signed = w3.eth.account.sign_transaction(tx, private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-        nonce += 1
-        log.info("approval_tx", fn=fn_name, contract=contract_address[:10], tx=tx_hash.hex()[:16])
-
-    # Approve each V2 trading spender to move the wallet's pUSD and outcome tokens.
-    for spender in _TRADING_SPENDERS:
-        _send_tx(PUSD_ADDRESS, _ERC20_APPROVE_ABI, "approve",
-                 Web3.to_checksum_address(spender), MAX_UINT)
-        _send_tx(CONDITIONAL_TOKENS, _ERC1155_APPROVAL_ABI, "setApprovalForAll",
-                 Web3.to_checksum_address(spender), True)
-
-    # Wrap any existing USDC.e into pUSD so the wallet has tradeable collateral.
-    wrapped = None
-    try:
-        from core.polygon import wrap_usdce_to_pusd
-        wrapped = wrap_usdce_to_pusd(private_key_enc, address)
-    except Exception:
-        log.warning("register_wrap_failed", address=address[:10])
-
-    log.info("wallet_registered", address=address, wrapped=bool(wrapped))
-    return {"registered": True, "address": address, "wrapped_tx": wrapped}
+    log.info("deposit_wallet_registered", dw=deposit_wallet[:12])
+    return {"registered": True, "deposit_wallet": deposit_wallet, "creds": creds}
 
 
-def generate_api_creds(private_key_enc: str) -> dict:
+def generate_api_creds(private_key_enc: str, funder: str | None = None) -> dict:
     """
-    Generate Polymarket CLOB API credentials via L1 (EIP-712) auth.
-    Called once per user wallet. Runs wallet registration first if needed.
+    Generate/derive Polymarket CLOB API credentials via L1 (EIP-712) auth.
+    `funder` is the user's deposit wallet (POLY_1271) so the creds are bound to it.
     """
     private_key = decrypt_key(private_key_enc)
-    client = _make_client(private_key)
+    client = _make_client(private_key, funder=funder)
     raw = client.create_or_derive_api_key()
     return {
         "clob_api_key": raw.api_key,
@@ -178,20 +145,34 @@ def sell_position(
     tick_size: str = "0.01",
     neg_risk: bool = False,
     slippage_pct: float = 0.03,
+    deposit_wallet: str | None = None,
 ) -> dict:
     """
     Exit a position with a marketable SELL (FAK) of `shares` outcome tokens.
     `price` is the reference (best bid); we accept down to a slippage-protected floor.
+    `deposit_wallet` is the POLY_1271 funder that holds the position.
     """
     from py_clob_client_v2 import (
+        AssetType,
+        BalanceAllowanceParams,
         MarketOrderArgs,
         OrderType,
         PartialCreateOrderOptions,
         Side,
+        SignatureTypeV2,
     )
 
     private_key = decrypt_key(private_key_enc)
-    client = _make_client(private_key, api_creds)
+    client = _make_client(private_key, api_creds, funder=deposit_wallet)
+    if deposit_wallet:
+        try:
+            client.update_balance_allowance(BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+                signature_type=SignatureTypeV2.POLY_1271,
+            ))
+        except Exception:
+            log.warning("sell_allowance_update_failed", token=token_id[:18])
     worst_price = _worst_sell_price(price, tick_size, slippage_pct)
 
     order_args = MarketOrderArgs(
@@ -225,26 +206,39 @@ def place_order(
     tick_size: str = "0.01",
     neg_risk: bool = False,
     slippage_pct: float = 0.02,
+    deposit_wallet: str | None = None,
 ) -> dict:
     """
     Place a copy-trade BUY as a marketable order (FAK) with slippage protection.
 
     size_usdc: dollar amount to spend.
     The worst-price limit caps how much worse than the donor/whale price we'll pay.
+    `deposit_wallet` is the POLY_1271 funder (holds pUSD collateral).
     Returns the CLOB order response dict.
     """
     from py_clob_client_v2 import (
+        AssetType,
+        BalanceAllowanceParams,
         MarketOrderArgs,
         OrderType,
         PartialCreateOrderOptions,
         Side,
+        SignatureTypeV2,
     )
 
     if side.upper() not in ("BUY", "YES"):
         raise ValueError(f"only BUY copy is supported, got side={side}")
 
     private_key = decrypt_key(private_key_enc)
-    client = _make_client(private_key, api_creds)
+    client = _make_client(private_key, api_creds, funder=deposit_wallet)
+    if deposit_wallet:
+        try:
+            client.update_balance_allowance(BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=SignatureTypeV2.POLY_1271,
+            ))
+        except Exception:
+            log.warning("buy_allowance_update_failed", token=token_id[:18])
 
     worst_price = _worst_buy_price(price, tick_size, slippage_pct)
 

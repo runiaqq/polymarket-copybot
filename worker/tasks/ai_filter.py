@@ -24,9 +24,9 @@ MARKET_COOLDOWN_SEC = 900   # same market won't notify more than once / 15 min
 USER_HOURLY_LIMIT = 8       # max AI analyses per user per hour
 
 RISK_PROMPT = """\
-Ты — опытный аналитик рынков предсказаний Polymarket внутри копи-трейдинг-бота.
-Крупный игрок («кит») купил исход, и бот скопировал сделку. Дай пользователю
-краткий профессиональный разбор — это ключевая ценность сервиса.
+Ты — опытный аналитик рынков предсказаний Polymarket внутри сервиса сигналов.
+Крупный игрок («кит») только что купил исход — это потенциальный сигнал для входа.
+Дай пользователю краткий профессиональный разбор — это ключевая ценность сервиса.
 
 Данные сделки:
 - Рынок: {title}
@@ -126,14 +126,19 @@ def run_ai_analysis(signal: dict, user_ids: list[int]) -> dict:
     hours_line = f" · ⏳ ~{hours:.0f} ч" if hours else ""
     link_line = f"\n🔗 <a href=\"{url}\">Открыть на Polymarket</a>" if url else ""
 
+    # Signals mode: this is a signal to act on, not a copied trade.
+    header = "🐳 <b>Сигнал по киту</b>" if not settings.auto_copy_enabled else "🧠 <b>ИИ-анализ сделки</b>"
+    cta = "\n\n👉 Заходи на Polymarket и решай сам." if not settings.auto_copy_enabled else ""
+
     msg = (
-        f"🧠 <b>ИИ-анализ сделки</b>\n\n"
+        f"{header}\n\n"
         f"📌 {title_html}\n"
         f"🎯 Кит купил: <b>{outcome}</b> @ {price:.3f} (~{price*100:.0f}%)\n"
         f"🐳 Объём: <b>${size:.0f}</b>{hours_line}\n\n"
         f"{risk_icon} <b>{verdict}</b> · риск {score}/10\n"
         f"💬 {reason}"
         f"{link_line}"
+        f"{cta}"
     )
     asyncio.get_event_loop().run_until_complete(_broadcast(filtered_users, msg))
 

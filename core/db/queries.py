@@ -25,18 +25,25 @@ def get_donor_by_address(address: str) -> dict | None:
 
 
 def get_active_subscribers() -> list[dict]:
+    """Active paying subscribers.
+
+    In signals mode (auto_copy disabled) the only requirement is a valid paid
+    subscription. The copy_active / wallet_address filters are auto-copy
+    (custodial) concerns and are applied only when auto-copy is enabled.
+    """
+    from core.config import settings
+
     sb = get_supabase()
     now = datetime.now(timezone.utc).isoformat()
-    res = (
+    q = (
         sb.table("users")
         .select("*")
         .neq("sub_tier", "free")
         .gt("sub_expires_at", now)
-        .eq("copy_active", True)
-        .not_.is_("wallet_address", "null")
-        .execute()
     )
-    return res.data
+    if settings.auto_copy_enabled:
+        q = q.eq("copy_active", True).not_.is_("wallet_address", "null")
+    return q.execute().data
 
 
 def get_user_by_telegram_id(telegram_id: int) -> dict | None:

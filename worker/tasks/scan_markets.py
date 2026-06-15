@@ -68,14 +68,45 @@ def dispatch_signal(signal: dict) -> dict:
         log.exception("signal_insert_failed", market=signal.get("market_id"))
         return {"skipped": True, "reason": "insert_failed"}
 
+    from core.config import settings
+
+    # ── Wallet track-record filter (observe: log only; enforce: gate entries) ────
+    if settings.wallet_filter_mode != "off":
+        try:
+            from core import wallet_score
+            addr, score, passed = wallet_score.evaluate(signal["market_id"], tx)
+            if addr:
+                try:
+                    sb.table("trade_signals").update({
+                        "whale_wallet":        addr,
+                        "whale_realized_pnl":  (score or {}).get("realized_pnl"),
+                        "whale_resolved_count": (score or {}).get("resolved_count"),
+                        "whale_winrate":       (score or {}).get("winrate"),
+                        "whale_passed":        passed,
+                    }).eq("id", signal["signal_id"]).execute()
+                except Exception:
+                    log.warning("whale_score_persist_failed", signal=signal["signal_id"])
+                log.info("whale_scored", wallet=addr[:10], passed=passed,
+                         realized=(score or {}).get("realized_pnl"),
+                         resolved=(score or {}).get("resolved_count"))
+            if settings.wallet_filter_mode == "enforce" and not passed:
+                log.info("signal_blocked_by_wallet_filter", market=signal["market_id"][:18],
+                         wallet=(addr or "?")[:10])
+                return {"skipped": True, "reason": "wallet_filter", "whale_passed": False}
+        except Exception:
+            log.warning("wallet_filter_error", market=signal.get("market_id"))
+
     user_ids = [u["id"] for u in subscribers]
-    for uid in user_ids:
-        execute_copy_trade.delay(uid, signal)
+    # Auto-copy is gated: without it (signals mode) we only send the AI analysis,
+    # and the user trades on Polymarket themselves via the link.
+    if settings.auto_copy_enabled:
+        for uid in user_ids:
+            execute_copy_trade.delay(uid, signal)
     run_ai_analysis.delay(signal, user_ids)
 
     log.info("signal_dispatched", market=signal.get("market_id", "")[:18],
-             whale_usdc=signal.get("size_usdc"), subs=len(user_ids))
-    return {"dispatched": len(user_ids)}
+             whale_usdc=signal.get("size_usdc"), subs=len(user_ids), auto_copy=settings.auto_copy_enabled)
+    return {"dispatched": len(user_ids), "auto_copy": settings.auto_copy_enabled}
 
 
 @celery_app.task(name="worker.tasks.scan_whale_trades", queue="periodic")

@@ -30,8 +30,10 @@ def _notify(telegram_id: int, text: str) -> None:
 
 @celery_app.task(name="worker.tasks.wrap_collateral", queue="trades")
 def wrap_collateral(user_id: int) -> dict:
+    """Fund the deposit wallet: convert EOA USDC -> pUSD and sweep it into the
+    deposit wallet (the trading collateral)."""
     from core.db import get_supabase
-    from core.polygon import convert_to_pusd, get_balances
+    from core.polygon import fund_deposit_wallet, get_balances
 
     sb = get_supabase()
     res = sb.table("users").select("*").eq("id", user_id).maybe_single().execute()
@@ -40,29 +42,34 @@ def wrap_collateral(user_id: int) -> dict:
         return {"skipped": True, "reason": "no_wallet"}
 
     addr = user["wallet_address"]
+    deposit_wallet = user.get("deposit_wallet_address")
+    if not deposit_wallet:
+        _notify(user["telegram_id"], "⚙️ Сначала разверни торговый кошелёк: /register")
+        return {"skipped": True, "reason": "not_registered"}
+
     balances = get_balances(addr)
-    convertible = balances.get("usdc", 0) + balances.get("usdc_e", 0)
-    if convertible < 1.0:
-        _notify(user["telegram_id"], "ℹ️ Нет USDC для конвертации (или уже в pUSD).")
-        return {"skipped": True, "reason": "nothing_to_convert"}
+    on_eoa = balances.get("usdc", 0) + balances.get("usdc_e", 0) + balances.get("pusd", 0)
+    if on_eoa < 1.0:
+        _notify(user["telegram_id"], "ℹ️ На кошельке нет средств для перевода в торговый баланс.")
+        return {"skipped": True, "reason": "nothing_to_fund"}
     if balances.get("matic", 0) < 0.02:
-        _notify(user["telegram_id"], "⛽️ Недостаточно POL на газ для конвертации. Пополни ~0.05 POL.")
+        _notify(user["telegram_id"], "⛽️ Недостаточно POL на газ. Пополни ~0.05 POL.")
         return {"skipped": True, "reason": "no_gas"}
 
     try:
-        converted = convert_to_pusd(user["wallet_private_key_enc"], addr)
-        if converted < 1.0:
-            _notify(user["telegram_id"], "ℹ️ Нечего конвертировать.")
-            return {"skipped": True, "reason": "nothing_converted"}
+        moved = fund_deposit_wallet(user["wallet_private_key_enc"], addr, deposit_wallet)
+        if moved < 1.0:
+            _notify(user["telegram_id"], "ℹ️ Нечего переводить.")
+            return {"skipped": True, "reason": "nothing_moved"}
         _notify(
             user["telegram_id"],
-            f"♻️ <b>Готово!</b> Конвертировано <b>${converted:.2f}</b> USDC → pUSD.\n"
+            f"♻️ <b>Готово!</b> <b>${moved:.2f}</b> переведено на торговый кошелёк (pUSD).\n"
             f"Средства готовы к торговле.",
         )
-        return {"converted": converted}
+        return {"moved": moved}
     except Exception as exc:
         log.exception("wrap_collateral_failed", user_id=user_id)
-        _notify(user["telegram_id"], f"❌ Ошибка конвертации: <code>{str(exc)[:200]}</code>")
+        _notify(user["telegram_id"], f"❌ Ошибка: <code>{str(exc)[:200]}</code>")
         return {"error": str(exc)[:200]}
 
 
@@ -84,8 +91,21 @@ def withdraw_funds(user_id: int, to_address: str, amount_usdc: float) -> dict:
 
     addr = user["wallet_address"]
     key = user["wallet_private_key_enc"]
+    deposit_wallet = user.get("deposit_wallet_address")
 
     try:
+        # In V2 the collateral lives in the deposit wallet — pull it back to the EOA
+        # first (gasless via the relayer), then convert/transfer from the EOA.
+        if deposit_wallet:
+            try:
+                from core import relayer
+                dw_pusd = get_balances(deposit_wallet).get("pusd", 0.0)
+                pull = min(amount_usdc, dw_pusd)
+                if pull > 0:
+                    relayer.transfer_from_deposit_wallet(key, addr, int(round(pull * 1_000_000)))
+            except Exception:
+                log.warning("withdraw_dw_pull_failed", user_id=user_id)
+
         # User receives native USDC. Build it up: unwrap pUSD -> USDC.e, then swap -> native.
         b = get_balances(addr)
         if b.get("usdc", 0.0) < amount_usdc:

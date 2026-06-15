@@ -25,7 +25,7 @@ def monitor_deposits() -> dict:
 
     # Only users with wallets and active subscriptions
     res = sb.table("users").select(
-        "id, telegram_id, wallet_address, wallet_private_key_enc, balance_usdc"
+        "id, telegram_id, wallet_address, wallet_private_key_enc, balance_usdc, deposit_wallet_address"
     ).not_.is_("wallet_address", "null").execute()
 
     users = res.data or []
@@ -42,18 +42,20 @@ def monitor_deposits() -> dict:
             old_balance = float(user.get("balance_usdc") or 0.0)
             diff = new_balance - old_balance
 
-            # Auto-convert any deposited USDC (native or bridged) into tradeable pUSD:
-            # native USDC -> USDC.e (Uniswap) -> pUSD (onramp). Needs POL for gas.
-            convertible = balances.get("usdc", 0.0) + balances.get("usdc_e", 0.0)
-            if convertible >= 1.0 and balances.get("matic", 0.0) >= 0.02 and user.get("wallet_private_key_enc"):
+            # Auto-fund the deposit wallet: convert any deposited USDC (native or
+            # bridged) on the EOA into pUSD, then sweep it into the deposit wallet
+            # (the trading collateral). Needs POL on the EOA for gas.
+            dw = user.get("deposit_wallet_address")
+            on_eoa = balances.get("usdc", 0.0) + balances.get("usdc_e", 0.0) + balances.get("pusd", 0.0)
+            if dw and on_eoa >= 1.0 and balances.get("matic", 0.0) >= 0.02 and user.get("wallet_private_key_enc"):
                 try:
-                    from core.polygon import convert_to_pusd
-                    converted = convert_to_pusd(user["wallet_private_key_enc"], addr)
-                    if converted >= 1.0:
-                        _notify_wrapped(user["telegram_id"], converted)
+                    from core.polygon import fund_deposit_wallet
+                    moved = fund_deposit_wallet(user["wallet_private_key_enc"], addr, dw)
+                    if moved >= 1.0:
+                        _notify_wrapped(user["telegram_id"], moved)
                         notified += 1
                 except Exception:
-                    log.warning("auto_convert_failed", user_id=user["id"])
+                    log.warning("auto_fund_failed", user_id=user["id"])
 
             # Update stored balance
             sb.table("users").update({"balance_usdc": new_balance}).eq("id", user["id"]).execute()
@@ -81,9 +83,9 @@ def _notify_wrapped(telegram_id: int, amount: float) -> None:
         await bot.send_message(
             chat_id=telegram_id,
             text=(
-                f"♻️ <b>Конвертация выполнена</b>\n\n"
-                f"<b>${amount:.2f} USDC → pUSD</b>\n\n"
-                f"Средства готовы к торговле. ▶️ PolyMind копирует сделки!"
+                f"♻️ <b>Средства готовы к торговле</b>\n\n"
+                f"<b>${amount:.2f}</b> сконвертированы в pUSD и переведены на торговый кошелёк.\n\n"
+                f"▶️ PolyMind копирует сделки!"
             ),
             parse_mode="HTML",
         )

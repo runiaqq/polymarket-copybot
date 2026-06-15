@@ -57,21 +57,23 @@ class Settings(BaseSettings):
 
     # ── Strategy: whale-tracking on fast markets ────────────────────────────────
     # Market universe: only watch markets resolving within this window.
-    market_max_hours_to_resolve: float = 48.0
+    # 24h keeps the focus on the "1-2 day" idea and shrinks the universe (less spam).
+    market_max_hours_to_resolve: float = 24.0
     # Skip ultra-fast markets below this (e.g. 5-15 min crypto) — thin & HFT-dominated.
     market_min_hours_to_resolve: float = 0.5
     # Skip illiquid markets (Gamma liquidityNum, in USDC). 0 disables the filter.
-    market_min_liquidity_usdc: float = 1000.0
+    market_min_liquidity_usdc: float = 2000.0
     # Max number of markets (tokens) to subscribe to over WebSocket at once.
     watch_max_markets: int = 300
     # How often (seconds) to rebuild the watched-markets set from Gamma.
     fast_markets_refresh_sec: int = 120
     # Cooldown (seconds) before the same market can produce another signal.
-    market_signal_cooldown_sec: int = 600
+    market_signal_cooldown_sec: int = 1800
 
     # ── Dynamic "large buy" detection (liquidity/volume relative) ────────────────
     # Absolute floor: never treat a buy smaller than this (USDC) as a whale.
-    dyn_abs_floor_usdc: float = 100.0
+    # $1000 cuts the noise of routine trades; only real whales pass.
+    dyn_abs_floor_usdc: float = 1000.0
     # Trade must be >= this fraction of the ask liquidity within the slippage band.
     dyn_rel_depth: float = 0.5
     # Trade must be >= this multiple of the recent trade-size p90 for the market.
@@ -90,7 +92,8 @@ class Settings(BaseSettings):
     # Skip if the market taker fee exceeds this (basis points).
     fee_bps_max: float = 500.0
     # Require at least this much fillable ask depth (USDC) to copy into.
-    dyn_min_book_depth_usdc: float = 50.0
+    # $750 ensures we can both enter AND exit without being stuck in a thin book.
+    dyn_min_book_depth_usdc: float = 750.0
 
     # ── Copy sizing ──────────────────────────────────────────────────────────────
     # Scale applied to the whale size before other caps.
@@ -130,6 +133,26 @@ class Settings(BaseSettings):
     scan_trades_limit: int = 100
     min_trade_size_usdc: float = 5.0
     min_market_hours_to_close: float = 0.0
+
+    # ── Product mode ───────────────────────────────────────────────────────────
+    # False = signals only (detect + AI + link, user trades on Polymarket themselves).
+    # True  = custodial auto-copy (requires Builder Program + deposit-wallet rework).
+    auto_copy_enabled: bool = False
+
+    # ── Wallet track-record filter (validate the edge before enforcing) ──────────
+    # off     = ignore the buyer's history entirely
+    # observe = resolve the buyer, score their P&L, LOG it on the signal, never block
+    # enforce = only copy when the buyer's history passes the thresholds below
+    wallet_filter_mode: str = "observe"
+    # Minimum resolved markets before a wallet's P&L is trusted (avoid lucky-gambler noise).
+    wallet_min_resolved: int = 20
+    # Required realized P&L (USDC) of the buyer to copy (enforce mode).
+    wallet_min_realized_pnl: float = 0.0
+    # Cache a wallet's score for this long (seconds) to avoid refetching per signal.
+    wallet_score_ttl_sec: int = 3600
+    # Retries/delay to resolve the buyer via the Data API (handles indexing lag).
+    wallet_resolve_retries: int = 4
+    wallet_resolve_delay_sec: float = 1.0
 
     # ── AI ───────────────────────────────────────────────────────────────────────
     # Risk score (1-10) at or above which the user gets a HIGH-RISK warning.

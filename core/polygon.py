@@ -349,6 +349,45 @@ def convert_to_pusd(private_key_enc: str, wallet_address: str) -> float:
     return converted
 
 
+def sweep_pusd_to_deposit_wallet(
+    private_key_enc: str, eoa_address: str, deposit_wallet: str,
+    amount_pusd: float | None = None,
+) -> str | None:
+    """Move pUSD from the user's EOA into their deposit wallet (the trading collateral).
+    EOA pays gas (needs POL). Returns tx hash or None if nothing to move."""
+    w3 = _w3()
+    pk = decrypt_key(private_key_enc)
+    addr = Web3.to_checksum_address(eoa_address)
+    pusd = w3.eth.contract(address=Web3.to_checksum_address(PUSD_ADDRESS), abi=_ERC20_ABI)
+
+    bal = pusd.functions.balanceOf(addr).call()
+    want = int(amount_pusd * 10**USDC_DECIMALS) if amount_pusd is not None else bal
+    want = min(want, bal)
+    if want <= 0:
+        return None
+
+    tx_hash = _exec_tx(
+        w3, pk, addr,
+        pusd.functions.transfer(Web3.to_checksum_address(deposit_wallet), want),
+        100_000, "sweep_pusd",
+    )
+    log.info("swept_pusd_to_dw", eoa=eoa_address[:10], dw=deposit_wallet[:10],
+             amount=want / 10**USDC_DECIMALS)
+    return tx_hash
+
+
+def fund_deposit_wallet(private_key_enc: str, eoa_address: str, deposit_wallet: str) -> float:
+    """Convert any USDC/USDC.e on the EOA to pUSD, then sweep all pUSD into the
+    deposit wallet. Returns the amount (USDC) moved into the deposit wallet."""
+    convert_to_pusd(private_key_enc, eoa_address)
+    b = get_balances(eoa_address)
+    pusd = b.get("pusd", 0)
+    if pusd < 0.5:
+        return 0.0
+    sweep_pusd_to_deposit_wallet(private_key_enc, eoa_address, deposit_wallet)
+    return pusd
+
+
 def is_valid_address(address: str) -> bool:
     """Check if string is a valid Ethereum/Polygon address."""
     try:

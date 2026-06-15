@@ -6,20 +6,28 @@ from core.config import settings
 
 _redis_url = settings.redis_url
 
+# AUTO_COPY_ENABLED is the master switch. Keep it OFF until the worker is hosted in
+# a non-geoblocked region (Polymarket blocks order placement from US/DE/NL/etc.).
+# When ON: the WS whale listener + periodic position/deposit/subscription tasks run.
+_AUTO = settings.auto_copy_enabled
+
+_includes = [
+    "worker.tasks",
+    "worker.tasks.scan_markets",
+    "worker.tasks.manage_positions",
+    "worker.tasks.subscriptions",
+    "worker.tasks.wallet_ops",
+    "worker.tasks.poll_donors",
+    "worker.tasks.monitor_deposits",
+]
+if _AUTO:
+    _includes.append("worker.signals")  # worker_ready hook that starts the WS whale listener
+
 celery_app = Celery(
     "copybot",
     broker=_redis_url,
     backend=_redis_url,
-    include=[
-        "worker.tasks",
-        "worker.tasks.scan_markets",
-        "worker.tasks.manage_positions",
-        "worker.tasks.subscriptions",
-        "worker.tasks.wallet_ops",
-        "worker.tasks.poll_donors",
-        "worker.tasks.monitor_deposits",
-        # "worker.signals",  # PAUSED for V2 deposit-wallet rework — WS listener disabled
-    ],
+    include=_includes,
 )
 
 # Upstash Redis uses TLS — Celery needs explicit SSL config for rediss://
@@ -49,7 +57,19 @@ celery_app.conf.update(
         "worker.tasks.refresh_donor_stats": {"queue": "periodic"},
         "worker.tasks.deactivate_underperforming_donors": {"queue": "periodic"},
     },
-    # PAUSED for V2 deposit-wallet rework — no periodic tasks run.
-    # Restore monitor-deposits / sync-positions / check-subscription-expiry when re-enabling.
-    beat_schedule={},
+    # Periodic tasks only run in auto-copy mode (and thus only on a non-geoblocked host).
+    beat_schedule=({
+        "sync-positions": {
+            "task": "worker.tasks.sync_positions",
+            "schedule": 120.0,  # TP/SL + resolution checks every 2 min
+        },
+        "monitor-deposits": {
+            "task": "worker.tasks.monitor_deposits",
+            "schedule": 120.0,  # detect deposits, auto-fund the deposit wallet
+        },
+        "check-subscription-expiry": {
+            "task": "worker.tasks.check_subscription_expiry",
+            "schedule": 21600.0,  # every 6 hours
+        },
+    } if _AUTO else {}),
 )

@@ -59,7 +59,7 @@ def sync_positions() -> dict:
     now = time.time()
     actions = 0
     for user in subscribers:
-        wallet = user.get("wallet_address")
+        wallet = user.get("deposit_wallet_address")
         if not wallet:
             continue
         uid = user["id"]
@@ -144,9 +144,14 @@ def close_position(self, user_id: int, token_id: str, reason: str = "manual") ->
     if not user or not user.get("wallet_private_key_enc"):
         return {"skipped": True, "reason": "no_wallet"}
 
+    deposit_wallet = user.get("deposit_wallet_address")
+    if not deposit_wallet:
+        _closing.discard((user_id, token_id))
+        return {"skipped": True, "reason": "not_registered"}
+
     # Find the live position to know how many shares to sell.
     position = next(
-        (p for p in get_positions(user["wallet_address"])
+        (p for p in get_positions(deposit_wallet)
          if p["token_id"] == token_id and p["shares"] > 0),
         None,
     )
@@ -170,7 +175,7 @@ def close_position(self, user_id: int, token_id: str, reason: str = "manual") ->
     }
     if not api_creds["clob_api_key"]:
         try:
-            api_creds = generate_api_creds(user["wallet_private_key_enc"])
+            api_creds = generate_api_creds(user["wallet_private_key_enc"], funder=deposit_wallet)
             sb.table("users").update(api_creds).eq("id", user_id).execute()
         except Exception as exc:
             raise self.retry(exc=exc)
@@ -185,6 +190,7 @@ def close_position(self, user_id: int, token_id: str, reason: str = "manual") ->
             tick_size=str(book.get("tick_size", "0.01")),
             neg_risk=bool(book.get("neg_risk", position.get("neg_risk", False))),
             slippage_pct=settings.exit_slippage_pct,
+            deposit_wallet=deposit_wallet,
         )
         # Claim the settlement key so the resolution scanner won't double-notify
         # if this exit fills near 0/1.

@@ -67,6 +67,13 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         log.warning("skip_no_wallet", user_id=user_id)
         return {"skipped": True, "reason": "no_wallet"}
 
+    # V2: trading goes through the user's deposit wallet (POLY_1271 funder).
+    deposit_wallet = user.get("deposit_wallet_address")
+    if not deposit_wallet:
+        log.warning("skip_not_registered", user_id=user_id)
+        _notify_not_registered(user["telegram_id"])
+        return {"skipped": True, "reason": "not_registered"}
+
     # Only copy BUY signals — SELL requires owning the token first
     if signal.get("side", "").upper() in ("SELL", "NO"):
         log.debug("skip_sell_signal", user_id=user_id)
@@ -81,28 +88,32 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         log.debug("skip_below_min", user_id=user_id, size=size_usdc)
         return {"skipped": True, "reason": "below_min_size"}
 
-    # Check balance. In Polymarket V2 the tradeable collateral is pUSD (USDC.e must
-    # be wrapped first). Deposits are auto-wrapped, but guard here too.
+    # Check collateral: in V2 the tradeable pUSD lives in the DEPOSIT WALLET.
+    # The deposit monitor sweeps EOA funds into it; if it's short, try a sweep
+    # on demand before giving up.
     try:
-        from core.polygon import get_balances
-        balances = get_balances(user["wallet_address"])
-        tradeable = balances.get("pusd", 0)
-        usdc_e = balances.get("usdc_e", 0)
+        from core.polygon import get_balances, fund_deposit_wallet
+        tradeable = get_balances(deposit_wallet).get("pusd", 0)
         if tradeable < size_usdc:
-            if (tradeable + usdc_e) >= size_usdc:
-                _notify_needs_wrap(user["telegram_id"], balances)
-                log.warning("skip_needs_wrap", user_id=user_id, pusd=tradeable, usdc_e=usdc_e)
-                return {"skipped": True, "reason": "needs_wrap"}
-            _notify_low_balance(user["telegram_id"], balances.get("total_usdc", 0), size_usdc, signal)
-            log.warning("skip_low_balance", user_id=user_id, pusd=tradeable, needed=size_usdc)
-            return {"skipped": True, "reason": "low_balance"}
+            eoa = get_balances(user["wallet_address"])
+            on_eoa = eoa.get("pusd", 0) + eoa.get("usdc_e", 0) + eoa.get("usdc", 0)
+            if (tradeable + on_eoa) >= size_usdc and on_eoa >= 0.5:
+                try:
+                    fund_deposit_wallet(user["wallet_private_key_enc"], user["wallet_address"], deposit_wallet)
+                    tradeable = get_balances(deposit_wallet).get("pusd", 0)
+                except Exception:
+                    log.warning("ondemand_fund_failed", user_id=user_id)
+            if tradeable < size_usdc:
+                _notify_low_balance(user["telegram_id"], tradeable, size_usdc, signal)
+                log.warning("skip_low_balance", user_id=user_id, pusd=tradeable, needed=size_usdc)
+                return {"skipped": True, "reason": "low_balance"}
     except Exception:
         log.warning("balance_check_failed", user_id=user_id)
 
     # Portfolio cap: don't open more than max_open_positions simultaneously.
     try:
         from core.polymarket import get_positions
-        open_count = sum(1 for p in get_positions(user["wallet_address"]) if p["shares"] > 0)
+        open_count = sum(1 for p in get_positions(deposit_wallet) if p["shares"] > 0)
         if open_count >= settings.max_open_positions:
             log.info("skip_max_positions", user_id=user_id, open=open_count)
             return {"skipped": True, "reason": "max_positions"}
@@ -117,7 +128,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     }
     if not api_creds["clob_api_key"]:
         try:
-            api_creds = generate_api_creds(user["wallet_private_key_enc"])
+            api_creds = generate_api_creds(user["wallet_private_key_enc"], funder=deposit_wallet)
             sb.table("users").update(api_creds).eq("id", user_id).execute()
             log.info("clob_creds_generated", user_id=user_id)
         except Exception as exc:
@@ -188,13 +199,14 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             tick_size=str(signal.get("tick_size", "0.01")),
             neg_risk=bool(signal.get("neg_risk", False)),
             slippage_pct=settings.order_slippage_pct,
+            deposit_wallet=deposit_wallet,
         )
 
         order_id = result.get("orderID") or result.get("order_id") or ""
 
         # FAK orders can partial-fill (or fill nothing) on thin books.
-        # Confirm the actual fill from on-chain positions.
-        filled, fill_status = _confirm_fill(user["wallet_address"], token_id, size_usdc)
+        # Confirm the actual fill from on-chain positions (held by the deposit wallet).
+        filled, fill_status = _confirm_fill(deposit_wallet, token_id, size_usdc)
 
         status = "confirmed" if fill_status != "none" else "unfilled"
         sb.table("copy_trades").update({
@@ -218,25 +230,19 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         raise self.retry(exc=exc)
 
 
-def _notify_needs_wrap(telegram_id: int, balances: dict) -> None:
-    """User has USDC.e that isn't yet wrapped into the tradeable pUSD collateral."""
+def _notify_not_registered(telegram_id: int) -> None:
+    """User hasn't set up their deposit wallet yet — can't trade."""
     from telegram import Bot
     from core.config import settings
 
     async def _send() -> None:
         bot = Bot(token=settings.telegram_bot_token)
-        pusd = balances.get("pusd", 0)
-        usdc_e = balances.get("usdc_e", 0)
-        to_convert = usdc_e + balances.get("usdc", 0)
         await bot.send_message(
             chat_id=telegram_id,
             text=(
-                f"♻️ <b>Нужно конвертировать в pUSD</b>\n\n"
-                f"Polymarket V2 торгует в <b>pUSD</b>:\n"
-                f"• pUSD (готово к торговле): <b>${pusd:.2f}</b>\n"
-                f"• USDC (надо конвертировать): <b>${to_convert:.2f}</b>\n\n"
-                f"Нажми /wrap чтобы конвертировать USDC → pUSD "
-                f"(нужен POL на газ), и сделки снова будут исполняться."
+                "⚙️ <b>Нужна настройка кошелька</b>\n\n"
+                "Чтобы бот копировал сделки, разверни торговый кошелёк: /register "
+                "(без газа с твоей стороны). После этого пополни баланс и включи /resume."
             ),
             parse_mode="HTML",
         )
@@ -244,7 +250,7 @@ def _notify_needs_wrap(telegram_id: int, balances: dict) -> None:
     try:
         asyncio.get_event_loop().run_until_complete(_send())
     except Exception:
-        log.exception("notify_needs_wrap_failed", telegram_id=telegram_id)
+        log.exception("notify_not_registered_failed", telegram_id=telegram_id)
 
 
 def _notify_low_balance(telegram_id: int, balance: float, needed: float, signal: dict) -> None:

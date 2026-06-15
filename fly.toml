@@ -1,0 +1,15 @@
+# Fly.io config for the PolyMind WORKER (Celery + WS whale listener).
+# Deploy region MUST be non-geoblocked by Polymarket. Good clean EU options:
+# arn (Stockholm 🇸🇪), mad (Madrid 🇪🇸), otp (Bucharest 🇷🇴).
+# Avoid: ams/cdg/fra/lhr (NL/FR/DE/GB blocked), waw/sin (close-only), all US.
+app = "polymind-worker"
+primary_region = "arn"
+
+[build]
+  dockerfile = "worker/Dockerfile"
+
+# No [http_service]: this is a background worker, not a web app.
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"

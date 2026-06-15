@@ -57,18 +57,57 @@ def _load_signer() -> tuple[str, str]:
     return decrypt_key(row["wallet_private_key_enc"]), row["wallet_address"]
 
 
+_HTTP_RELAYER_CLS = None
+
+
+def _http_relayer_cls():
+    """Subclass of RelayClient that authenticates with the 2-part Relayer API Key
+    (RELAYER_API_KEY + RELAYER_API_KEY_ADDRESS headers) instead of 3-part builder HMAC.
+    Reuses all of the SDK's EIP-712 payload building; only swaps the auth headers."""
+    global _HTTP_RELAYER_CLS
+    if _HTTP_RELAYER_CLS is not None:
+        return _HTTP_RELAYER_CLS
+    from py_builder_relayer_client.client import RelayClient
+
+    class _RelayerHttpClient(RelayClient):
+        def __init__(self, url, chain_id, private_key, api_key, api_key_address, rpc_url=None):
+            super().__init__(url, chain_id, private_key, builder_config=None, rpc_url=rpc_url)
+            self._rk = api_key
+            self._rka = api_key_address
+
+        def assert_builder_creds_needed(self):  # auth is via relayer-key headers
+            return
+
+        def _generate_builder_headers(self, method, request_path, body=None):
+            return {"RELAYER_API_KEY": self._rk, "RELAYER_API_KEY_ADDRESS": self._rka}
+
+    _HTTP_RELAYER_CLS = _RelayerHttpClient
+    return _HTTP_RELAYER_CLS
+
+
 def _relayer(private_key: str, need_builder: bool = True):
     from py_builder_relayer_client.client import RelayClient
-    from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
 
-    cfg = None
-    if need_builder:
-        if not settings.builder_api_key:
-            raise SystemExit("BUILDER_API_KEY/SECRET/PASSPHRASE not set in .env (Builder Program).")
+    rpc = settings.polygon_rpc_url
+
+    # Preferred: 3-part Builder creds (SDK-native HMAC auth).
+    if settings.builder_api_key and settings.builder_secret and settings.builder_passphrase:
+        from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
         cfg = BuilderConfig(local_builder_creds=BuilderApiKeyCreds(
             key=settings.builder_api_key, secret=settings.builder_secret,
             passphrase=settings.builder_passphrase))
-    return RelayClient(settings.relayer_url, CHAIN_ID, private_key, cfg)
+        return RelayClient(settings.relayer_url, CHAIN_ID, private_key, cfg, rpc_url=rpc)
+
+    # Fallback: 2-part Relayer API Key via HTTP headers (what we have today).
+    if need_builder:
+        if not settings.relayer_api_key:
+            raise SystemExit("Neither BUILDER_* nor RELAYER_API_KEY set in .env.")
+        cls = _http_relayer_cls()
+        return cls(settings.relayer_url, CHAIN_ID, private_key,
+                   settings.relayer_api_key, settings.relayer_api_key_address, rpc_url=rpc)
+
+    # Read-only (derive): no auth needed.
+    return RelayClient(settings.relayer_url, CHAIN_ID, private_key, None, rpc_url=rpc)
 
 
 def _approve_data(spender: str) -> str:

@@ -44,6 +44,15 @@ def _main_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def _signals_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⭐️ Подписка", callback_data="subscription"),
+            InlineKeyboardButton("❓ Как работает", callback_data="help"),
+        ],
+    ])
+
+
 def _wallet_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -98,31 +107,33 @@ MIN_POL_READY = 0.05
 def _checklist(db_user: dict) -> str:
     """Onboarding checklist with live status of each prerequisite step."""
     addr = db_user.get("wallet_address")
-    balances = {}
-    if addr:
-        try:
-            from core.polygon import get_balances
-            balances = get_balances(addr)
-        except Exception:
-            balances = {}
+    dw = db_user.get("deposit_wallet_address")
+    eoa_bal, dw_bal = {}, {}
+    try:
+        from core.polygon import get_balances
+        if addr:
+            eoa_bal = get_balances(addr)
+        if dw:
+            dw_bal = get_balances(dw)
+    except Exception:
+        pass
 
-    pusd = balances.get("pusd", 0)
-    to_convert = balances.get("usdc_e", 0) + balances.get("usdc", 0)
-    pol = balances.get("matic", 0)
+    dw_pusd = dw_bal.get("pusd", 0)
+    on_eoa = eoa_bal.get("pusd", 0) + eoa_bal.get("usdc_e", 0) + eoa_bal.get("usdc", 0)
+    pol = eoa_bal.get("matic", 0)
 
     sub = get_subscription_status(db_user.get("telegram_id")) if db_user.get("telegram_id") else {"active": False}
     registered = bool(db_user.get("wallet_registered"))
     copy_active = bool(db_user.get("copy_active"))
-    funded = (pusd + to_convert) >= MIN_USDC_READY
+    funded = (dw_pusd + on_eoa) >= MIN_USDC_READY
 
     steps_done = (
-        pusd >= MIN_USDC_READY
+        registered
+        and dw_pusd >= MIN_USDC_READY
         and pol >= MIN_POL_READY
-        and registered
         and sub.get("active")
         and copy_active
     )
-    # Hide the checklist once everything is set up.
     if steps_done:
         return ""
 
@@ -130,12 +141,12 @@ def _checklist(db_user: dict) -> str:
         return "✅" if ok else "⬜️"
 
     lines = ["📋 <b>Чек-лист запуска</b>\n"]
-    lines.append(f"{mark(funded)} 1. Пополнить <b>USDC</b> (Polygon)")
-    lines.append(f"{mark(pol >= MIN_POL_READY)} 2. Пополнить <b>POL</b> для газа (~0.1)")
-    lines.append(f"{mark(registered)} 3. Зарегистрировать кошелёк (/register)")
-    lines.append(f"{mark(pusd >= MIN_USDC_READY)} 4. Конвертация в <b>pUSD</b> (авто / /wrap)")
-    if to_convert >= MIN_USDC_READY and pusd < MIN_USDC_READY:
-        lines.append("    ♻️ Есть USDC — нажми /wrap для конвертации в pUSD")
+    lines.append(f"{mark(registered)} 1. Настроить торговый кошелёк (/register, без газа)")
+    lines.append(f"{mark(funded)} 2. Пополнить <b>USDC</b> (сеть Polygon)")
+    lines.append(f"{mark(pol >= MIN_POL_READY)} 3. Пополнить <b>POL</b> для газа (~0.1)")
+    lines.append(f"{mark(dw_pusd >= MIN_USDC_READY)} 4. Средства на торговом кошельке (авто / /wrap)")
+    if on_eoa >= 1.0 and dw_pusd < MIN_USDC_READY:
+        lines.append("    ♻️ Есть USDC на кошельке — нажми /wrap, чтобы перевести в торговый баланс")
     lines.append(f"{mark(sub.get('active'))} 5. Активная подписка")
     lines.append(f"{mark(copy_active)} 6. Копирование включено")
     return "\n".join(lines)
@@ -185,6 +196,73 @@ def _new_user_text(addr: str) -> str:
         "⚠️ Только сеть <b>Polygon</b> — не Ethereum, не BSC!\n"
         "ℹ️ Торговля идёт в <b>pUSD</b> (V2) — конвертация из USDC автоматическая."
     )
+
+
+def _signals_dashboard_text(db_user: dict, first_name: str) -> str:
+    sub = get_subscription_status(db_user.get("telegram_id")) if db_user.get("telegram_id") else {"active": False}
+    if sub.get("active"):
+        exp = (sub.get("expires_at") or "")[:10]
+        status = f"🟢 <b>Активна</b> (до {exp})" if exp else "🟢 <b>Активна</b>"
+        tail = "Сигналы приходят автоматически. Жди уведомления о ките и заходи на Polymarket по ссылке."
+    else:
+        status = "⛔️ <b>Не активна</b>"
+        tail = "Чтобы получать сигналы — оформи подписку у администратора."
+    return (
+        f"👋 <b>Привет, {first_name}!</b>\n\n"
+        "🧠 <b>PolyMind AI</b> — сигналы по китам Polymarket\n\n"
+        "Бот в реальном времени ловит крупные покупки китов на быстрых "
+        "рынках (резолв 1–2 дня), а нейросеть оценивает риск и присылает "
+        "тебе готовый разбор со ссылкой на рынок.\n"
+        "Сделку ты открываешь сам на Polymarket — деньги остаются у тебя.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⭐️ Подписка: {status}\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{tail}"
+    )
+
+
+def _signals_welcome_text() -> str:
+    return (
+        "🧠 <b>Добро пожаловать в PolyMind AI!</b>\n\n"
+        "Это бот-сигналы по китам Polymarket.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡️ <b>Как это работает</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ Бот сканирует быстрые рынки (резолв 1–2 дня) в реальном времени\n"
+        "2️⃣ Ловит крупную покупку кита и считает ликвидность стакана\n"
+        "3️⃣ Нейросеть оценивает риск и присылает тебе разбор\n"
+        "4️⃣ Ты заходишь на Polymarket по ссылке и открываешь сделку сам\n\n"
+        "💼 Деньги и сделки полностью под твоим контролем — бот ничего не "
+        "хранит и не торгует за тебя.\n\n"
+        "⭐️ Для доступа к сигналам нужна активная подписка — оформи её у "
+        "администратора."
+    )
+
+
+HELP_TEXT_SIGNALS = (
+    "🧠 <b>PolyMind AI — Руководство</b>\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n"
+    "⚡️ <b>Что делает бот</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n"
+    "PolyMind в реальном времени отслеживает крупные покупки китов на "
+    "быстрых рынках Polymarket и присылает тебе сигнал + ИИ-анализ риска "
+    "со ссылкой на рынок.\n\n"
+    "Сделку открываешь <b>сам на Polymarket</b> — это не кастодиальный бот, "
+    "деньги остаются у тебя.\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n"
+    "📋 <b>Команды</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n"
+    "/start — 🏠 Главное меню\n"
+    "/subscription — ⭐️ Статус подписки\n"
+    "/help — ❓ Это руководство\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n"
+    "💡 <b>Как читать сигнал</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n"
+    "• Размер покупки кита и цена входа\n"
+    "• Оценка риска и вердикт от ИИ\n"
+    "• Ссылка на рынок — заходи и решай сам\n\n"
+    "💬 Вопросы по подписке — к администратору."
+)
 
 
 HELP_TEXT = (
@@ -240,6 +318,13 @@ HELP_TEXT = (
 # ─── App builder ──────────────────────────────────────────────────────────────
 
 async def _set_commands(app: Application) -> None:
+    if not settings.auto_copy_enabled:
+        await app.bot.set_my_commands([
+            BotCommand("start",        "🏠 Главное меню"),
+            BotCommand("subscription", "⭐️ Статус подписки"),
+            BotCommand("help",         "❓ Как работает"),
+        ])
+        return
     await app.bot.set_my_commands([
         BotCommand("start",    "🏠 Главное меню"),
         BotCommand("wallet",   "💼 Кошелёк и баланс"),
@@ -304,10 +389,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             result = redeem_access_code(code, tg_user.id)
             if result.get("ok"):
                 exp = (result.get("expires_at") or "")[:10]
+                tail = (
+                    "Теперь жди сигналы по китам — бот пришлёт разбор и ссылку на рынок."
+                    if not settings.auto_copy_enabled
+                    else "Теперь пройди шаги ниже, и бот начнёт копировать сделки."
+                )
                 await update.message.reply_text(  # type: ignore[union-attr]
                     f"✅ <b>Подписка активирована!</b>\n\n"
                     f"Действует до: <b>{exp}</b>\n\n"
-                    f"Теперь пройди шаги ниже, и бот начнёт копировать сделки.",
+                    f"{tail}",
                     parse_mode="HTML",
                 )
             elif result.get("reason") in ("used", "invalid"):
@@ -316,6 +406,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     "Обратись к администратору за новой ссылкой.",
                     parse_mode="HTML",
                 )
+
+    # Signals mode: no custodial wallet — user trades on Polymarket themselves.
+    if not settings.auto_copy_enabled:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            _signals_dashboard_text(db_user, tg_user.first_name),
+            parse_mode="HTML",
+            reply_markup=_signals_kb(),
+        )
+        return
 
     if not db_user.get("wallet_address"):
         await update.message.reply_text(  # type: ignore[union-attr]
@@ -351,7 +450,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(  # type: ignore[union-attr]
-        HELP_TEXT,
+        HELP_TEXT_SIGNALS if not settings.auto_copy_enabled else HELP_TEXT,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
@@ -359,26 +458,26 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def _wallet_text(addr: str, balances: dict | None = None) -> str:
+def _wallet_text(addr: str, balances: dict | None = None, dw_pusd: float | None = None) -> str:
     text = (
         f"💼 <b>Кошелёк PolyMind</b>\n\n"
-        f"<code>{addr}</code>\n\n"
+        f"📬 Адрес для пополнения (USDC, Polygon):\n<code>{addr}</code>\n\n"
     )
     if balances is not None:
-        pusd = balances.get("pusd", 0)
-        to_convert = balances.get("usdc_e", 0) + balances.get("usdc", 0)
+        on_eoa = balances.get("usdc_e", 0) + balances.get("usdc", 0) + balances.get("pusd", 0)
         pol = balances.get("matic", 0)
-        status = "✅ Готов к торговле" if pusd >= 5 else "⚠️ Пополни/сконвертируй баланс"
-        text += f"💵 pUSD (торговый): <b>${pusd:.2f}</b>\n"
-        if to_convert >= 0.01:
-            text += f"♻️ USDC (к конвертации): <b>${to_convert:.2f}</b>\n"
+        trading = dw_pusd if dw_pusd is not None else 0.0
+        status = "✅ Готов к торговле" if trading >= 5 else "⚠️ Пополни баланс"
+        text += f"💵 Торговый баланс (pUSD): <b>${trading:.2f}</b>\n"
+        if on_eoa >= 0.01:
+            text += f"♻️ На кошельке (к переводу): <b>${on_eoa:.2f}</b>\n"
         text += (
             f"⛽️ POL (газ): <b>{pol:.4f}</b>\n"
             f"📊 Статус: {status}\n\n"
         )
     text += (
         f"🔗 <a href=\"https://polygonscan.com/address/{addr}\">Посмотреть на Polygonscan</a>\n\n"
-        "📌 Пополняй <b>USDC</b> в сети <b>Polygon</b> — бот сам сконвертирует в pUSD\n"
+        "📌 Пополняй <b>USDC</b> в сети <b>Polygon</b> — бот сам переведёт на торговый кошелёк\n"
         "⚠️ Только сеть <b>Polygon</b> — не Ethereum, не BSC!"
     )
     return text
@@ -395,8 +494,10 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     addr = db_user["wallet_address"]
     from core.polygon import get_balances
     balances = get_balances(addr)
+    dw = db_user.get("deposit_wallet_address")
+    dw_pusd = get_balances(dw).get("pusd", 0.0) if dw else 0.0
     await update.message.reply_text(  # type: ignore[union-attr]
-        _wallet_text(addr, balances),
+        _wallet_text(addr, balances, dw_pusd),
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=_wallet_kb(),
@@ -415,13 +516,14 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     msg = await update.message.reply_text("⏳ Проверяю баланс…", parse_mode="HTML")  # type: ignore[union-attr]
     from core.polygon import get_balances
     balances = get_balances(addr)
-    pusd = balances.get("pusd", 0)
-    to_convert = balances.get("usdc_e", 0) + balances.get("usdc", 0)
+    dw = db_user.get("deposit_wallet_address")
+    trading = get_balances(dw).get("pusd", 0.0) if dw else 0.0
+    on_eoa = balances.get("usdc_e", 0) + balances.get("usdc", 0) + balances.get("pusd", 0)
     pol = balances.get("matic", 0)
-    extra = f"♻️ USDC (к конвертации): <b>${to_convert:.2f}</b>\n" if to_convert >= 0.01 else ""
+    extra = f"♻️ На кошельке (к переводу): <b>${on_eoa:.2f}</b>\n" if on_eoa >= 0.01 else ""
     await msg.edit_text(  # type: ignore[union-attr]
-        f"💵 <b>Баланс кошелька</b>\n\n"
-        f"pUSD (торговый): <b>${pusd:.2f}</b>\n"
+        f"💵 <b>Баланс</b>\n\n"
+        f"Торговый баланс (pUSD): <b>${trading:.2f}</b>\n"
         f"{extra}"
         f"POL (газ): <b>{pol:.4f}</b>\n\n"
         f"<code>{addr}</code>",
@@ -454,9 +556,15 @@ async def cmd_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+def _trading_wallet(db_user: dict) -> str | None:
+    """Address that actually holds positions/collateral — the deposit wallet in V2,
+    falling back to the EOA for legacy users."""
+    return db_user.get("deposit_wallet_address") or db_user.get("wallet_address")
+
+
 def _build_positions(db_user: dict, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, InlineKeyboardMarkup]:
     """Render live positions (real P&L from data-api) with per-position close buttons."""
-    wallet = db_user.get("wallet_address")
+    wallet = _trading_wallet(db_user)
     positions = []
     if wallet:
         try:
@@ -532,7 +640,7 @@ def _build_pnl(db_user: dict, period: str = "day") -> str:
     """Real P&L: realized over the chosen period + current unrealized snapshot."""
     import time as _t
 
-    wallet = db_user.get("wallet_address")
+    wallet = _trading_wallet(db_user)
     open_pos, closed = [], []
     if wallet:
         try:
@@ -645,6 +753,24 @@ async def cmd_wrap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ Не удалось запустить конвертацию.", parse_mode="HTML")  # type: ignore[union-attr]
 
 
+def _register_deposit_wallet(telegram_id: int, db_user: dict) -> dict:
+    """Gasless per-user deposit-wallet setup (deploy + approvals + CLOB creds).
+    Persists the deposit wallet + creds. Returns the clob.register_deposit_wallet result."""
+    from core.clob import register_deposit_wallet
+
+    result = register_deposit_wallet(db_user["wallet_private_key_enc"])
+    creds = result.get("creds") or {}
+    update_user(telegram_id, {
+        "deposit_wallet_address":  result["deposit_wallet"],
+        "deposit_wallet_deployed": True,
+        "wallet_registered":       True,
+        "clob_api_key":            creds.get("clob_api_key"),
+        "clob_secret":             creds.get("clob_secret"),
+        "clob_passphrase":         creds.get("clob_passphrase"),
+    })
+    return result
+
+
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tg_user = update.effective_user
     if not tg_user:
@@ -654,34 +780,25 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Сначала отправь /start", parse_mode="HTML")  # type: ignore[union-attr]
         return
     msg = await update.message.reply_text(  # type: ignore[union-attr]
-        "⏳ <b>Регистрирую кошелёк в Polymarket...</b>\n\nЭто займёт 30-60 секунд.",
+        "⏳ <b>Настраиваю торговый кошелёк Polymarket…</b>\n\n"
+        "Разворачиваю deposit-wallet и проставляю разрешения (без газа с твоей стороны). "
+        "Это займёт 30–60 секунд.",
         parse_mode="HTML",
     )
     try:
-        from core.clob import register_wallet
-        register_wallet(db_user["wallet_private_key_enc"])
-        try:
-            update_user(tg_user.id, {"wallet_registered": True})
-        except Exception:
-            log.warning("set_registered_flag_failed", user=tg_user.id)
+        result = _register_deposit_wallet(tg_user.id, db_user)
+        dw = result.get("deposit_wallet", "")
         await msg.edit_text(  # type: ignore[union-attr]
-            "✅ <b>Кошелёк зарегистрирован!</b>\n\n"
-            "Теперь бот может копировать сделки на Polymarket.\n"
-            "Убедись что копирование включено: /resume",
-            parse_mode="HTML",
-        )
-    except ValueError as exc:
-        await msg.edit_text(  # type: ignore[union-attr]
-            f"⛽️ <b>Нужен POL для газа</b>\n\n"
-            f"{exc}\n\n"
-            f"Отправь хотя бы <b>0.1 POL</b> на кошелёк и повтори /register\n\n"
-            f"<code>{db_user.get('wallet_address', '')}</code>",
+            "✅ <b>Кошелёк готов к торговле!</b>\n\n"
+            f"Торговый адрес (deposit wallet):\n<code>{dw}</code>\n\n"
+            "Бот может копировать сделки. Убедись, что копирование включено: /resume",
             parse_mode="HTML",
         )
     except Exception as exc:
         log.exception("register_failed", user=tg_user.id)
         await msg.edit_text(  # type: ignore[union-attr]
-            f"❌ <b>Ошибка регистрации:</b>\n<code>{str(exc)[:300]}</code>",
+            f"❌ <b>Ошибка регистрации:</b>\n<code>{str(exc)[:300]}</code>\n\n"
+            "Попробуй ещё раз через минуту или напиши в поддержку.",
             parse_mode="HTML",
         )
 
@@ -995,16 +1112,49 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data == "menu":
         db_user = get_user_by_telegram_id(tg_user.id)
         if db_user:
-            await query.edit_message_text(
-                _dashboard_text(db_user, tg_user.first_name),
-                parse_mode="HTML",
-                reply_markup=_main_kb(),
+            if not settings.auto_copy_enabled:
+                await query.edit_message_text(
+                    _signals_dashboard_text(db_user, tg_user.first_name),
+                    parse_mode="HTML",
+                    reply_markup=_signals_kb(),
+                )
+            else:
+                await query.edit_message_text(
+                    _dashboard_text(db_user, tg_user.first_name),
+                    parse_mode="HTML",
+                    reply_markup=_main_kb(),
+                )
+        return
+
+    if data == "subscription":
+        db_user = get_user_by_telegram_id(tg_user.id)
+        sub = get_subscription_status(tg_user.id) if db_user else {"active": False}
+        if sub.get("active"):
+            exp = (sub.get("expires_at") or "")[:10]
+            txt = (
+                "⭐️ <b>Подписка активна</b>\n\n"
+                f"Действует до: <b>{exp or '—'}</b>\n\n"
+                "Сигналы приходят автоматически — жди уведомление о ките."
             )
+        else:
+            txt = (
+                "⛔️ <b>Подписка не активна</b>\n\n"
+                "Чтобы получать сигналы по китам с ИИ-анализом — оформи "
+                "подписку у администратора. После оплаты он пришлёт тебе "
+                "ссылку для активации."
+            )
+        await query.edit_message_text(
+            txt,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
+            ]]),
+        )
         return
 
     if data == "help":
         await query.edit_message_text(
-            HELP_TEXT,
+            HELP_TEXT_SIGNALS if not settings.auto_copy_enabled else HELP_TEXT,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
@@ -1021,8 +1171,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer("⏳ Загружаю баланс…")
         from core.polygon import get_balances
         balances = get_balances(addr)
+        dw = db_user.get("deposit_wallet_address")
+        dw_pusd = get_balances(dw).get("pusd", 0.0) if dw else 0.0
         await query.edit_message_text(
-            _wallet_text(addr, balances),
+            _wallet_text(addr, balances, dw_pusd),
             parse_mode="HTML",
             disable_web_page_preview=True,
             reply_markup=_wallet_kb(),
@@ -1035,34 +1187,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Сначала отправь /start", show_alert=True)
             return
         await query.edit_message_text(
-            "⏳ <b>Регистрирую кошелёк в Polymarket...</b>\n\nЭто займёт 30–60 секунд.",
+            "⏳ <b>Настраиваю торговый кошелёк Polymarket…</b>\n\n"
+            "Разворачиваю deposit-wallet и проставляю разрешения (без газа с твоей стороны). "
+            "Это займёт 30–60 секунд.",
             parse_mode="HTML",
         )
         try:
-            from core.clob import register_wallet
-            register_wallet(db_user["wallet_private_key_enc"])
-            try:
-                update_user(tg_user.id, {"wallet_registered": True})
-            except Exception:
-                log.warning("set_registered_flag_failed", user=tg_user.id)
+            result = _register_deposit_wallet(tg_user.id, db_user)
+            dw = result.get("deposit_wallet", "")
             await query.edit_message_text(
-                "✅ <b>Кошелёк зарегистрирован!</b>\n\n"
-                "Теперь бот может копировать сделки.\n"
-                "Включи копирование: /resume",
+                "✅ <b>Кошелёк готов к торговле!</b>\n\n"
+                f"Торговый адрес (deposit wallet):\n<code>{dw}</code>\n\n"
+                "Бот может копировать сделки. Включи копирование: /resume",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
-                ]]),
-            )
-        except ValueError as exc:
-            await query.edit_message_text(
-                f"⛽️ <b>Нужен POL для газа</b>\n\n{exc}\n\n"
-                f"Отправь хотя бы <b>0.1 POL</b> на кошелёк и повтори.\n\n"
-                f"<code>{db_user.get('wallet_address', '')}</code>",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔁 Повторить", callback_data="register"),
-                    InlineKeyboardButton("🏠 Меню", callback_data="menu"),
                 ]]),
             )
         except Exception as exc:
@@ -1071,7 +1210,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"❌ <b>Ошибка регистрации:</b>\n<code>{str(exc)[:300]}</code>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
+                    InlineKeyboardButton("🔁 Повторить", callback_data="register"),
+                    InlineKeyboardButton("🏠 Главное меню", callback_data="menu"),
                 ]]),
             )
         return
