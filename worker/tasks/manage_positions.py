@@ -178,15 +178,47 @@ def close_position(self, user_id: int, token_id: str, reason: str = "manual") ->
         None,
     )
     if position is None:
+        if reason == "manual":
+            _notify(
+                user["telegram_id"],
+                "ℹ️ <b>Позиция не найдена</b>\n\n"
+                "Возможно, она уже закрылась или разрезолвилась.\n"
+                "Проверь баланс через /balance.",
+            )
         _closing.discard((user_id, token_id))
         return {"skipped": True, "reason": "no_position"}
 
     condition_id = position.get("condition_id", "")
+    title = (position.get("title") or "—")[:50]
+    outcome = position.get("outcome") or "—"
+    cur_price = float(position.get("cur_price") or 0)
 
     book = get_order_book(token_id)
     best_bid = book.get("best_bid") if book else None
-    if not best_bid:
-        _notify(user["telegram_id"], "⚠️ Не удалось закрыть позицию: нет ликвидности на продажу.")
+
+    # At very high prices (>0.93) the order book is usually empty —
+    # buyers won't offer 0.93+ for a 0.07 return. Tell the user to wait for resolution.
+    if not best_bid or float(best_bid) < 0.01:
+        if cur_price >= 0.90:
+            _notify(
+                user["telegram_id"],
+                f"📊 <b>Стакан пустой — это нормально</b>\n\n"
+                f"📌 {title} · <b>{outcome}</b>\n"
+                f"💹 Текущая цена: <b>{cur_price:.3f} (~{cur_price*100:.0f}%)</b>\n\n"
+                f"При цене {cur_price*100:.0f}% никто не хочет покупать — "
+                f"слишком маленькая потенциальная прибыль для покупателя.\n\n"
+                f"✅ <b>Ничего делать не нужно</b> — при резолве бот автоматически "
+                f"зачислит выигрыш. Просто жди результата события.",
+            )
+        else:
+            url = _event_link(position.get("event_slug"))
+            _notify(
+                user["telegram_id"],
+                f"⚠️ <b>Нет покупателей для продажи</b>\n\n"
+                f"📌 {title} · <b>{outcome}</b>\n\n"
+                f"Стакан пустой — ордер не пройдёт. "
+                f"Попробуй позже или дождись резолва события.{url}",
+            )
         _closing.discard((user_id, token_id))
         return {"skipped": True, "reason": "no_bid"}
 
@@ -223,6 +255,19 @@ def close_position(self, user_id: int, token_id: str, reason: str = "manual") ->
         return {"closed": True, "reason": reason}
     except Exception as exc:
         log.exception("close_position_failed", user_id=user_id, token=token_id[:18])
+        err_str = str(exc).lower()
+        # After max retries, notify the user so they know what happened.
+        if self.request.retries >= self.max_retries:
+            if "geoblock" in err_str or "trading restricted" in err_str:
+                msg = "⚠️ <b>Не удалось закрыть позицию</b>\n\nГео-блок на сервере. Обратись к администратору."
+            elif "no_bid" in err_str or "liquidity" in err_str:
+                msg = (
+                    f"⚠️ <b>Не удалось закрыть позицию</b>\n\n"
+                    f"Стакан пустой. Попробуй позже или дождись резолва события."
+                )
+            else:
+                msg = f"⚠️ <b>Не удалось закрыть позицию</b>\n\n<code>{str(exc)[:200]}</code>"
+            _notify(user["telegram_id"], msg)
         raise self.retry(exc=exc)
     finally:
         _closing.discard((user_id, token_id))
