@@ -109,15 +109,25 @@ class Settings(BaseSettings):
     ws_refresh_markets_sec: int = 120
 
     # ── Exits / position management (Phase 3) ────────────────────────────────────
-    # Hybrid exit: hold to resolution when close to resolve, TP/SL otherwise.
-    # TP/SL only applies when the market still has at least this many hours left.
-    tp_sl_min_hours: float = 6.0
-    # Take-profit / stop-loss as fractional P&L on the position (0.25 = +25%).
-    take_profit_pct: float = 0.25
-    stop_loss_pct: float = 0.40
-    # Minimum time (seconds) a position must be held before TP/SL can fire.
-    # Prevents premature exits caused by Polymarket API returning garbage P&L
-    # on freshly-opened positions (data takes 5-15 min to stabilize).
+    # ── Exit strategy: HOLD TO RESOLUTION ───────────────────────────────────────
+    # Binary prediction markets pay $1/share on win or $0 on loss.
+    # Selling early almost always hurts EV: you cap upside AND crystallise losses
+    # on positions that might still resolve in your favour.
+    #
+    # Primary strategy: hold all positions to resolution.
+    # Single exception: "hard stop" — exit if the MARKET itself prices the
+    # outcome at near-zero (< hard_stop_abs_price), meaning it has effectively
+    # been ruled out. Recycles capital instead of waiting for a $0 resolution.
+    #
+    # Percentage TP/SL are disabled (set to unreachable values).
+    take_profit_pct: float = 99.0   # disabled — hold to resolution
+    stop_loss_pct: float = 99.0     # disabled — use hard_stop_abs_price instead
+    # Exit if best_bid drops below this absolute price (market says <7% chance).
+    hard_stop_abs_price: float = 0.07
+    # tp_sl_min_hours kept for the "hold when close to resolution" guard —
+    # when < this many hours remain we NEVER hard-stop (let it resolve naturally).
+    tp_sl_min_hours: float = 4.0
+    # Minimum hold time before any automated exit is evaluated.
     position_min_hold_sec: int = 1800
     # Wider slippage when exiting (books thin out near resolution).
     exit_slippage_pct: float = 0.03

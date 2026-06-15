@@ -88,40 +88,40 @@ def sync_positions() -> dict:
                     actions += 1
                 continue
 
-            hours = _hours_left(p.get("end_date"))
-            if hours is None or hours < settings.tp_sl_min_hours:
-                continue  # hold to resolution when close to settle
+            # ── Hold-to-resolution strategy ───────────────────────────────
+            # Binary markets pay $1 (win) or $0 (loss) at resolution.
+            # Selling early almost always hurts EV, so we hold.
+            # Exception: "hard stop" when the MARKET itself prices this
+            # outcome at near-zero — it's effectively dead, exit now.
 
-            # Track when we first saw this position to enforce minimum hold time.
+            hours = _hours_left(p.get("end_date"))
+
+            # When very close to resolution — let it settle, never hard-stop.
+            if hours is not None and hours < settings.tp_sl_min_hours:
+                continue
+
+            # Enforce minimum hold time (API P&L data unreliable on fresh positions).
             fkey = f"{uid}:{token_id}"
             seen_at = _first_seen.setdefault(fkey, now)
             age_sec = now - seen_at
             if age_sec < settings.position_min_hold_sec:
-                # Too fresh — Polymarket API P&L data unreliable for new positions.
-                log.debug("tp_sl_skipped_too_new",
+                log.debug("exit_skipped_too_new",
                           user_id=uid, token=token_id[:14],
-                          age_sec=round(age_sec), min_sec=settings.position_min_hold_sec)
+                          age_min=round(age_sec / 60, 1))
                 continue
-
-            # Clamp P&L to physically-possible range for binary prediction markets.
-            # The API occasionally returns nonsensical values (e.g. -463%) on
-            # recently settled or partially-matched positions.
-            raw_pct = p["percent_pnl"]
-            pct = max(-1.0, min(10.0, raw_pct))
-            if raw_pct != pct:
-                log.warning("pnl_clamped", user_id=uid, token=token_id[:14],
-                            raw=raw_pct, clamped=pct)
 
             ckey = (uid, token_id)
             if ckey in _closing:
                 continue
-            if pct >= settings.take_profit_pct:
+
+            # Hard stop: market has priced this outcome as essentially dead.
+            best_bid = p.get("cur_price", p.get("best_bid"))
+            if best_bid is not None and float(best_bid) < settings.hard_stop_abs_price:
+                log.info("hard_stop_triggered",
+                         user_id=uid, token=token_id[:14],
+                         cur_price=best_bid, threshold=settings.hard_stop_abs_price)
                 _closing.add(ckey)
-                close_position.delay(uid, token_id, "take_profit")
-                actions += 1
-            elif pct <= -settings.stop_loss_pct:
-                _closing.add(ckey)
-                close_position.delay(uid, token_id, "stop_loss")
+                close_position.delay(uid, token_id, "hard_stop")
                 actions += 1
 
         # ── Closed positions: resolution win/loss notices ───────────────────────
@@ -252,7 +252,12 @@ def _event_link(event_slug: str | None) -> str:
 
 
 def _notify_closed(telegram_id: int, position: dict, reason: str) -> None:
-    labels = {"take_profit": "🎯 Тейк-профит", "stop_loss": "🛑 Стоп-лосс", "manual": "✋ Вручную"}
+    labels = {
+        "take_profit": "🎯 Тейк-профит",
+        "stop_loss":   "🛑 Стоп-лосс",
+        "hard_stop":   "🚨 Жёсткий стоп (цена ~0)",
+        "manual":      "✋ Вручную",
+    }
     pnl = position.get("cash_pnl", 0)
     pct = position.get("percent_pnl", 0)
     icon = "📈" if pnl >= 0 else "📉"
