@@ -217,13 +217,12 @@ async def cmd_subs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for s in subs[:50]:
         nick = f"@{s['username']}" if s.get("username") else "—"
         dl = _days_left(s.get("sub_expires_at"))
-        bal = float(s.get("balance_usdc") or 0)
         mp = float(s.get("max_position_usdc") or 0)
         copy = "🟢" if s.get("copy_active") else "⏸"
-        reg = "✓" if s.get("wallet_registered") else "✗"
+        reg = "✅ кошелёк" if s.get("wallet_registered") else "❌ не зарег."
         lines.append(
             f"{copy} {nick} · <code>{s['telegram_id']}</code>\n"
-            f"   ⏳ {dl} дн · 💵 ${bal:.0f} · поз. ${mp:.0f} · рег.{reg}"
+            f"   ⏳ {dl} дн · макс. ${mp:.0f} · {reg}"
         )
     if len(subs) > 50:
         lines.append(f"\n…и ещё {len(subs) - 50}")
