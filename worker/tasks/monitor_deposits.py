@@ -38,7 +38,12 @@ def monitor_deposits() -> dict:
 
         try:
             balances = get_balances(addr)
-            new_balance = balances.get("total_usdc", 0.0)
+            dw = user.get("deposit_wallet_address")
+            dw_pusd = get_balances(dw).get("pusd", 0.0) if dw else 0.0
+            # Use TOTAL across EOA + deposit wallet so internal sweeps don't
+            # look like withdrawals (EOA drops but DW rises → net = 0).
+            eoa_total = balances.get("total_usdc", 0.0)
+            new_balance = round(eoa_total + dw_pusd, 4)
             old_balance = float(user.get("balance_usdc") or 0.0)
             diff = new_balance - old_balance
 
