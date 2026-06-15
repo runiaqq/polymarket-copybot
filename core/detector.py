@@ -12,8 +12,30 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from core.config import settings
+
+
+def _hours_fresh(market: dict) -> float | None:
+    """Compute hours to resolution fresh from the stored ISO end date.
+
+    Falls back to the cached `hours_to_resolve` value if the date can't be parsed.
+    This avoids showing stale values from when the market cache was last built.
+    """
+    end_iso = market.get("end_date_iso")
+    if end_iso:
+        try:
+            from dateutil.parser import parse as _dp
+            dt = _dp(end_iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            diff = (dt - datetime.now(timezone.utc)).total_seconds() / 3600
+            if diff > 0:
+                return round(diff, 1)
+        except Exception:
+            pass
+    return market.get("hours_to_resolve")
 
 
 class OrderBook:
@@ -142,6 +164,11 @@ def evaluate_trade(
     # ── Copy sizing hint (capped by book depth) ─────────────────────────────────
     max_copy_usdc = max(0.0, fillable_usdc * settings.book_safe_frac)
 
+    # Recompute hours_to_resolve fresh from the stored ISO end date so the signal
+    # always reflects the current distance to resolution, not a cached value that
+    # may have been computed minutes (or hours) ago.
+    hours_to_resolve = _hours_fresh(market)
+
     return {
         "market_id":        market.get("condition_id", ""),
         "token_id":         market.get("token_id") or trade.get("token_id"),
@@ -155,7 +182,7 @@ def evaluate_trade(
         "tick_size":        market.get("tick_size", "0.01"),
         "neg_risk":         bool(market.get("neg_risk", False)),
         "min_size":         market.get("min_size", 5),
-        "hours_to_resolve": market.get("hours_to_resolve"),
+        "hours_to_resolve": hours_to_resolve,
         "event_slug":       market.get("event_slug"),
         "fee_bps":          fee_bps,
         "best_bid":         best_bid,
