@@ -115,6 +115,10 @@ class Settings(BaseSettings):
     # Take-profit / stop-loss as fractional P&L on the position (0.25 = +25%).
     take_profit_pct: float = 0.25
     stop_loss_pct: float = 0.40
+    # Minimum time (seconds) a position must be held before TP/SL can fire.
+    # Prevents premature exits caused by Polymarket API returning garbage P&L
+    # on freshly-opened positions (data takes 5-15 min to stabilize).
+    position_min_hold_sec: int = 1800
     # Wider slippage when exiting (books thin out near resolution).
     exit_slippage_pct: float = 0.03
     # Portfolio cap: max simultaneous open positions per user.

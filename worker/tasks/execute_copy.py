@@ -17,27 +17,34 @@ log = structlog.get_logger(__name__)
 def _confirm_fill(wallet_address: str, token_id: str, intended_usdc: float) -> tuple[float, str]:
     """
     After a market FAK order, confirm how much actually filled by reading the
-    on-chain position. Returns (filled_usdc, status) where status is
-    'full' | 'partial' | 'none' | 'unknown'.
+    on-chain position. Retries up to 5 times with 4-second intervals to absorb
+    Polymarket Data API indexing lag (positions typically appear within 5-15s).
+    Returns (filled_usdc, status) where status is 'full' | 'partial' | 'none' | 'unknown'.
     """
-    try:
-        from core.polymarket import get_positions
-        time.sleep(3)  # give the data API a moment to reflect the fill
-        pos = next(
-            (p for p in get_positions(wallet_address) if p["token_id"] == token_id),
-            None,
-        )
-        if not pos or pos["shares"] <= 0:
-            return 0.0, "none"
-        filled = pos.get("current_value") or (pos["shares"] * pos["avg_price"])
-        if filled < 0.05 * intended_usdc:
-            return filled, "none"
-        if filled < 0.9 * intended_usdc:
-            return filled, "partial"
-        return filled, "full"
-    except Exception:
-        log.warning("confirm_fill_failed", token=token_id[:18])
-        return intended_usdc, "unknown"
+    from core.polymarket import get_positions
+
+    for attempt in range(5):
+        try:
+            time.sleep(4)
+            positions = get_positions(wallet_address)
+            pos = next(
+                (p for p in positions if p["token_id"] == token_id),
+                None,
+            )
+            if pos and pos["shares"] > 0:
+                filled = pos.get("current_value") or (pos["shares"] * pos["avg_price"])
+                if filled < 0.05 * intended_usdc:
+                    return filled, "none"
+                if filled < 0.9 * intended_usdc:
+                    return filled, "partial"
+                return filled, "full"
+            # Position not visible yet — retry unless this is the last attempt.
+            log.debug("confirm_fill_retry", token=token_id[:18], attempt=attempt + 1)
+        except Exception:
+            log.warning("confirm_fill_failed", token=token_id[:18], attempt=attempt + 1)
+
+    # After all retries still nothing — could be the order truly didn't fill.
+    return 0.0, "none"
 
 
 class ExecuteCopyTask(Task):

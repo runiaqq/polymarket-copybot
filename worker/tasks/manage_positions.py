@@ -23,6 +23,9 @@ log = structlog.get_logger(__name__)
 
 # Best-effort in-process guard for in-flight closes (per worker child).
 _closing: set[tuple] = set()
+# When a position was first observed (resets on restart — that's fine: old
+# positions are assumed mature and immediately eligible for TP/SL evaluation).
+_first_seen: dict[str, float] = {}
 
 
 def _notify_once(key: str) -> bool:
@@ -89,7 +92,26 @@ def sync_positions() -> dict:
             if hours is None or hours < settings.tp_sl_min_hours:
                 continue  # hold to resolution when close to settle
 
-            pct = p["percent_pnl"]
+            # Track when we first saw this position to enforce minimum hold time.
+            fkey = f"{uid}:{token_id}"
+            seen_at = _first_seen.setdefault(fkey, now)
+            age_sec = now - seen_at
+            if age_sec < settings.position_min_hold_sec:
+                # Too fresh — Polymarket API P&L data unreliable for new positions.
+                log.debug("tp_sl_skipped_too_new",
+                          user_id=uid, token=token_id[:14],
+                          age_sec=round(age_sec), min_sec=settings.position_min_hold_sec)
+                continue
+
+            # Clamp P&L to physically-possible range for binary prediction markets.
+            # The API occasionally returns nonsensical values (e.g. -463%) on
+            # recently settled or partially-matched positions.
+            raw_pct = p["percent_pnl"]
+            pct = max(-1.0, min(10.0, raw_pct))
+            if raw_pct != pct:
+                log.warning("pnl_clamped", user_id=uid, token=token_id[:14],
+                            raw=raw_pct, clamped=pct)
+
             ckey = (uid, token_id)
             if ckey in _closing:
                 continue
