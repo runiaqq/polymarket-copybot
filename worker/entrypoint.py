@@ -15,6 +15,9 @@ if __name__ == "__main__":
         "--beat",                       # embed beat scheduler
         "--loglevel=info",
         "--queues=trades,ai,periodic",
-        "--concurrency=8",
+        # gevent pool: order placement is network I/O, so hundreds of greenlets
+        # let ALL subscribers' orders fire near-simultaneously (no 8-slot queue).
+        "--pool=gevent",
+        "--concurrency=100",
     ]
     celery_main()

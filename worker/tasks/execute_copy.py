@@ -117,10 +117,22 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     except Exception:
         log.warning("balance_check_failed", user_id=user_id)
 
-    # Portfolio cap: don't open more than max_open_positions simultaneously.
+    # Portfolio guards: already-in-this-market (consensus) + max open positions.
     try:
         from core.polymarket import get_positions
-        open_count = sum(1 for p in get_positions(deposit_wallet) if p["shares"] > 0)
+        positions = get_positions(deposit_wallet)
+        cond = signal.get("market_id")
+        consensus = int(signal.get("consensus") or 1)
+
+        # Already holding a position in this event? Don't double-enter — instead,
+        # if another tracked pro just backed it (consensus≥2), send a confidence boost.
+        if any(p for p in positions if p.get("condition_id") == cond and p["shares"] > 0):
+            if consensus >= 2:
+                _notify_consensus(user["telegram_id"], signal, consensus)
+            log.info("skip_already_in_market", user_id=user_id, market=(cond or "")[:14], consensus=consensus)
+            return {"skipped": True, "reason": "already_in_market"}
+
+        open_count = sum(1 for p in positions if p["shares"] > 0)
         if open_count >= settings.max_open_positions:
             log.info("skip_max_positions", user_id=user_id, open=open_count)
             return {"skipped": True, "reason": "max_positions"}
@@ -286,6 +298,43 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         raise self.retry(exc=exc)
 
 
+def _notify_consensus(telegram_id: int, signal: dict, consensus: int) -> None:
+    """A second+ tracked pro entered an event the user already holds → confidence boost."""
+    from telegram import Bot
+    from core.config import settings
+    from core.cache import notify_once
+    from core.polymarket import event_url
+
+    cond = signal.get("market_id", "")
+    # Dedup per (user, market, consensus level) so we don't repeat the same boost.
+    if not notify_once(f"consensus:{telegram_id}:{cond}:{consensus}"):
+        return
+
+    async def _send() -> None:
+        bot = Bot(token=settings.telegram_bot_token)
+        title = (signal.get("title") or "—")[:60]
+        outcome = signal.get("outcome") or "—"
+        url = event_url(signal.get("event_slug"))
+        link = f"\n🔗 <a href=\"{url}\">Смотреть позицию</a>" if url else ""
+        await bot.send_message(
+            chat_id=telegram_id,
+            text=(
+                f"🔥 <b>Ещё один профи зашёл!</b>\n\n"
+                f"📌 {title}\n"
+                f"🎯 Исход: <b>{outcome}</b>\n\n"
+                f"Уже <b>{consensus} проверенных кита</b> в этом исходе — "
+                f"уверенность в победе растёт. Твоя позиция уже открыта, "
+                f"повторно не входим.{link}"
+            ),
+            parse_mode="HTML", disable_web_page_preview=True,
+        )
+
+    try:
+        asyncio.get_event_loop().run_until_complete(_send())
+    except Exception:
+        log.exception("notify_consensus_failed", telegram_id=telegram_id)
+
+
 def _notify_not_registered(telegram_id: int) -> None:
     """User hasn't set up their deposit wallet yet — can't trade."""
     from telegram import Bot
@@ -357,7 +406,10 @@ def _notify(
         prob = f"{price * 100:.0f}%"
         whale_usdc = float(signal.get("size_usdc") or 0)
         hours = signal.get("hours_to_resolve")
-        whale_line = f"🐳 Кит вошёл на: <b>${whale_usdc:,.0f}</b>" if whale_usdc else ""
+        consensus = int(signal.get("consensus") or 1)
+        whale_line = f"🐳 Профи вошёл на: <b>${whale_usdc:,.0f}</b>" if whale_usdc else "🐳 Сигнал от профи-кошелька"
+        if consensus >= 2:
+            whale_line += f"\n🔥 <b>Консенсус: {consensus} профи</b> в этом исходе"
         hours_line = f" · ⏳ ~{hours:.0f} ч" if hours else ""
         link_line = f"\n🔗 <a href=\"{url}\">Смотреть позицию</a>" if url else ""
 

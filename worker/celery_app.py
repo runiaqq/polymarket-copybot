@@ -18,10 +18,11 @@ _includes = [
     "worker.tasks.subscriptions",
     "worker.tasks.wallet_ops",
     "worker.tasks.poll_donors",
+    "worker.tasks.poll_tracked_wallets",
     "worker.tasks.monitor_deposits",
 ]
-if _AUTO:
-    _includes.append("worker.signals")  # worker_ready hook that starts the WS whale listener
+# Model B copies a curated whitelist via polling (poll_tracked_wallets), so the
+# anonymous WS large-buy listener is no longer the entry source and stays off.
 
 celery_app = Celery(
     "copybot",
@@ -59,6 +60,10 @@ celery_app.conf.update(
     },
     # Periodic tasks only run in auto-copy mode (and thus only on a non-geoblocked host).
     beat_schedule=({
+        "poll-tracked-wallets": {
+            "task": "worker.tasks.poll_tracked_wallets",
+            "schedule": settings.tracked_poll_sec,  # copy the whitelist (Model B)
+        },
         "sync-positions": {
             "task": "worker.tasks.sync_positions",
             "schedule": 120.0,  # TP/SL + resolution checks every 2 min

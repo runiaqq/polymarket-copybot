@@ -24,6 +24,33 @@ def get_donor_by_address(address: str) -> dict | None:
     return res.data if res else None
 
 
+def list_tracked_wallets(active_only: bool = True) -> list[dict]:
+    """Curated whitelist of profitable wallets to copy (Model B)."""
+    sb = get_supabase()
+    q = sb.table("tracked_wallets").select("*")
+    if active_only:
+        q = q.eq("active", True)
+    return q.execute().data or []
+
+
+def add_tracked_wallet(address: str, label: str | None = None) -> dict:
+    sb = get_supabase()
+    addr = address.strip().lower()
+    existing = sb.table("tracked_wallets").select("id").eq("address", addr).maybe_single().execute()
+    if existing and existing.data:
+        sb.table("tracked_wallets").update({"active": True, "label": label}).eq("address", addr).execute()
+        return {"address": addr, "updated": True}
+    sb.table("tracked_wallets").insert({"address": addr, "label": label, "active": True}).execute()
+    return {"address": addr, "added": True}
+
+
+def remove_tracked_wallet(address: str) -> bool:
+    sb = get_supabase()
+    addr = address.strip().lower()
+    sb.table("tracked_wallets").update({"active": False}).eq("address", addr).execute()
+    return True
+
+
 def get_active_subscribers() -> list[dict]:
     """Active paying subscribers.
 

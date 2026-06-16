@@ -158,6 +158,14 @@ class Settings(BaseSettings):
     # True  = custodial auto-copy (requires Builder Program + deposit-wallet rework).
     auto_copy_enabled: bool = False
 
+    # ── Model B: copy a curated whitelist of profitable wallets ─────────────────
+    # How often to poll each tracked wallet's recent trades (seconds).
+    tracked_poll_sec: float = 15.0
+    # Ignore a tracked wallet's trade older than this (avoid copying stale entries).
+    tracked_max_trade_age_sec: int = 300
+    # Window (hours) over which we count distinct tracked wallets for consensus.
+    consensus_window_hours: int = 24
+
     # ── Wallet track-record filter (validate the edge before enforcing) ──────────
     # off     = ignore the buyer's history entirely
     # observe = resolve the buyer, score their P&L, LOG it on the signal, never block

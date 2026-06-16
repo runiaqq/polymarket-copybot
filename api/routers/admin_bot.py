@@ -18,6 +18,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from core.config import settings
 from core.db import (
     add_admin,
+    add_tracked_wallet,
     create_access_code,
     create_admin_code,
     get_user_by_telegram_id,
@@ -25,6 +26,8 @@ from core.db import (
     is_admin,
     is_super_admin,
     list_active_subscribers_detail,
+    list_tracked_wallets,
+    remove_tracked_wallet,
     list_admins,
     redeem_admin_code,
     remove_admin,
@@ -80,6 +83,10 @@ HELP_ADMIN = (
     "/newcode <code>[дней]</code> — создать код-ссылку для клиента\n"
     "/subs — список активных подписчиков\n"
     "/user <code>&lt;@ник|id&gt;</code> — детали пользователя\n"
+    "\n<b>Белый список китов (копирование)</b>\n"
+    "/wallets — список отслеживаемых кошельков\n"
+    "/addwallet <code>&lt;адрес&gt; [метка]</code> — добавить кошелёк\n"
+    "/delwallet <code>&lt;адрес&gt;</code> — убрать кошелёк\n"
 )
 HELP_SUPER = (
     "\n<b>Управление админами</b> (только главный админ)\n"
@@ -99,6 +106,9 @@ def build_admin_application() -> Application | None:
     app.add_handler(CommandHandler("newcode", cmd_newcode))
     app.add_handler(CommandHandler("subs", cmd_subs))
     app.add_handler(CommandHandler("user", cmd_user))
+    app.add_handler(CommandHandler("wallets", cmd_wallets))
+    app.add_handler(CommandHandler("addwallet", cmd_addwallet))
+    app.add_handler(CommandHandler("delwallet", cmd_delwallet))
     app.add_handler(CommandHandler("addadmin", cmd_addadmin))
     app.add_handler(CommandHandler("admins", cmd_admins))
     app.add_handler(CommandHandler("deladmin", cmd_deladmin))
@@ -268,6 +278,59 @@ async def cmd_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"<code>{addr or '—'}</code>",
         parse_mode="HTML", disable_web_page_preview=True,
     )
+
+
+async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg = update.effective_user
+    if not tg or not is_admin(tg.id):
+        await _deny(update)
+        return
+    wallets = list_tracked_wallets()
+    if not wallets:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Белый список пуст.\nДобавь: <code>/addwallet &lt;адрес&gt; [метка]</code>",
+            parse_mode="HTML",
+        )
+        return
+    lines = [f"🐳 <b>Отслеживаемые кошельки: {len(wallets)}</b>\n"]
+    for w in wallets[:60]:
+        label = f" · {w['label']}" if w.get("label") else ""
+        lines.append(f"<code>{w['address']}</code>{label}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)  # type: ignore[union-attr]
+
+
+async def cmd_addwallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg = update.effective_user
+    if not tg or not is_admin(tg.id):
+        await _deny(update)
+        return
+    if not context.args:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Использование: <code>/addwallet &lt;0x-адрес&gt; [метка]</code>", parse_mode="HTML")
+        return
+    addr = context.args[0].strip()
+    if not (addr.startswith("0x") and len(addr) == 42):
+        await update.message.reply_text("❌ Неверный адрес (нужен 0x… длиной 42 символа).")  # type: ignore[union-attr]
+        return
+    label = " ".join(context.args[1:]) or None
+    add_tracked_wallet(addr, label)
+    await update.message.reply_text(  # type: ignore[union-attr]
+        f"✅ Кошелёк добавлен в белый список:\n<code>{addr.lower()}</code>", parse_mode="HTML")
+
+
+async def cmd_delwallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg = update.effective_user
+    if not tg or not is_admin(tg.id):
+        await _deny(update)
+        return
+    if not context.args:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Использование: <code>/delwallet &lt;0x-адрес&gt;</code>", parse_mode="HTML")
+        return
+    addr = context.args[0].strip()
+    remove_tracked_wallet(addr)
+    await update.message.reply_text(  # type: ignore[union-attr]
+        f"🗑 Кошелёк убран из белого списка:\n<code>{addr.lower()}</code>", parse_mode="HTML")
 
 
 async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

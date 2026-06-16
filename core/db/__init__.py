@@ -16,6 +16,9 @@ from core.db.queries import (
     is_super_admin,
     list_active_subscribers_detail,
     list_admins,
+    list_tracked_wallets,
+    add_tracked_wallet,
+    remove_tracked_wallet,
     redeem_access_code,
     redeem_admin_code,
     remove_admin,
@@ -52,4 +55,7 @@ __all__ = [
     "create_admin_code",
     "redeem_admin_code",
     "list_active_subscribers_detail",
+    "list_tracked_wallets",
+    "add_tracked_wallet",
+    "remove_tracked_wallet",
 ]

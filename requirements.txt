@@ -5,6 +5,7 @@ pydantic-settings>=2.2.0
 python-telegram-bot>=21.3
 supabase>=2.5.0
 celery[redis]>=5.4.0
+gevent>=24.2.1
 redis>=5.0.0
 web3>=6.19.0
 eth-account>=0.11.0
