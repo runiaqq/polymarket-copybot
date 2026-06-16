@@ -65,6 +65,10 @@ def _activity_profile(addr: str) -> dict:
     Liquidity providers / market makers receive MAKER_REBATE and REWARD payouts
     (liquidity rewards) — directional takers never do. That's the cleanest way
     to tell a copy-worthy bettor from an MM that just farms the spread.
+
+    Also computes trade density (trades/day) and average trade size from the
+    `usdcSize` field: MMs place 30-200 tiny orders/day, real whales place a
+    handful of large conviction bets.
     """
     import httpx
     try:
@@ -74,23 +78,46 @@ def _activity_profile(addr: str) -> dict:
         if not isinstance(rows, list):
             rows = rows.get("data", [])
     except Exception:
-        return {"last_days": 999.0, "is_mm": False, "trades": 0}
+        return {"last_days": 999.0, "is_mm": False, "trades": 0,
+                "trades_per_day": 0.0, "avg_size": 0.0}
+
     now = time.time()
-    last = 0
+    first_ts = last_ts = 0
     maker_rebate = rewards = trades = 0
+    total_size = 0.0
+
     for a in rows:
         t = a.get("type")
         if t == "TRADE":
             trades += 1
-            last = max(last, int(a.get("timestamp") or 0))
+            ts = int(a.get("timestamp") or 0)
+            if ts > 0:
+                if first_ts == 0 or ts < first_ts:
+                    first_ts = ts
+                if ts > last_ts:
+                    last_ts = ts
+            total_size += float(a.get("usdcSize") or 0)
         elif t == "MAKER_REBATE":
             maker_rebate += 1
         elif t == "REWARD":
             rewards += 1
+
+    # Trade density: how many trades per day over the observed window.
+    if first_ts and last_ts and last_ts > first_ts:
+        days_span = max((last_ts - first_ts) / 86400, 0.5)
+        trades_per_day = trades / days_span
+    else:
+        # All events in the same day — assume one-day window.
+        trades_per_day = float(trades)
+
+    avg_size = (total_size / trades) if trades > 0 else 0.0
+
     return {
-        "last_days": round((now - last) / 86400, 1) if last else 999.0,
+        "last_days": round((now - last_ts) / 86400, 1) if last_ts else 999.0,
         "is_mm": maker_rebate > 0 or rewards > MAX_REWARDS,
         "trades": trades,
+        "trades_per_day": round(trades_per_day, 1),
+        "avg_size": round(avg_size, 1),
     }
 
 
@@ -147,6 +174,19 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
         prof = _activity_profile(addr)
         time.sleep(0.05)
         if prof["is_mm"] or prof["last_days"] > MAX_LAST_DAYS:
+            continue
+        # Trade density filter: >20 trades/day → automated MM.
+        max_tpd = settings.discovery_max_trades_per_day
+        if prof["trades"] >= 10 and prof["trades_per_day"] > max_tpd:
+            log.debug("discovery_skip_density",
+                      addr=addr[:10], tpd=prof["trades_per_day"])
+            continue
+        # Average trade size filter: MMs scalp with tiny orders;
+        # directional whales bet hundreds+ per order.
+        min_sz = settings.discovery_min_avg_trade_size
+        if prof["trades"] >= 10 and prof["avg_size"] < min_sz:
+            log.debug("discovery_skip_size",
+                      addr=addr[:10], avg_size=prof["avg_size"])
             continue
         qualified.append({
             "wallet": meta["wallet"], "name": meta["name"],

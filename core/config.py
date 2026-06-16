@@ -195,7 +195,13 @@ class Settings(BaseSettings):
     # trader. Market makers/churners earn big absolute profit on huge volume (ratio
     # ~1-4%); directional bettors clear 10%+. Validated: catches skk1ch/swisstony
     # (MMs, ~4%) while keeping mintblade/fishalive/weatherman12 (14-68%).
-    discovery_min_profit_volume_ratio: float = 0.08
+    discovery_min_profit_volume_ratio: float = 0.15
+    # Max average trades per day (computed over the activity window).
+    # MMs place 30-200 orders/day; real whales rarely exceed 20.
+    discovery_max_trades_per_day: float = 20.0
+    # Min average trade size (USDC). MMs scalp with $50-500 orders;
+    # copy-worthy directional whales bet $300+ per order on average.
+    discovery_min_avg_trade_size: float = 300.0
 
     # ── AI ───────────────────────────────────────────────────────────────────────
     # Risk score (1-10) at or above which the user gets a HIGH-RISK warning.
