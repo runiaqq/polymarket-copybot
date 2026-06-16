@@ -32,14 +32,19 @@ log = structlog.get_logger(__name__)
 _ACT_URL = "https://data-api.polymarket.com/activity"
 _H = {"User-Agent": "Mozilla/5.0 (PolyMind seeder)"}
 
-# Quality thresholds (anti-arbitrage / anti-hedge / anti-market-maker).
-MIN_REALIZED = 20_000      # meaningful realized P&L ($)
-MIN_RESOLVED = 25          # real track record
-MAX_RESOLVED = 2_000       # above this = industrial arbitrage
-MIN_AVG_PER_MARKET = 120   # directional conviction, not cent-scalping ($)
-WINRATE_LO = 0.45
-WINRATE_HI = 0.90          # exclude near-riskless arb/hedge
-MAX_LAST_DAYS = 5          # must be trading recently
+# Quality thresholds.
+#
+# The leaderboard ranks by TOTAL P&L (largely unrealized — open positions), so
+# the closed-positions track record is the WRONG gate: the best directional
+# whales (mintblade +$9.2M, fishalive +$9.1M) hold their edge in open positions
+# and show realized≈0 / few resolved markets. Gating on realized P&L or a 0.90
+# winrate cap wiped them out (only 1/79 survived). The reliable signals are:
+#   * leaderboard profit (proven edge),
+#   * profit/volume ratio (separates directional bettors from MMs/arb/churn),
+#   * 30d consistency + recent activity.
+MIN_LB_PNL = 50_000        # minimum leaderboard profit to bother copying ($)
+MIN_RESOLVED_LIGHT = 3     # light anti-luck floor for wallets we can't ratio-check
+MAX_LAST_DAYS = 7          # must be trading recently
 MAX_REWARDS = 2            # liquidity rewards in feed => MM/LP (secondary signal)
 
 
@@ -124,29 +129,28 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
     for addr, meta in by_addr.items():
         if addr not in addrs30:
             continue
-        # Primary MM filter: high profit on huge volume = churner, not a bettor.
-        ratio = _profit_volume_ratio(pnl_map.get(addr, 0.0), vmap.get(addr))
+        pnl = pnl_map.get(addr, 0.0)
+        if pnl < MIN_LB_PNL:
+            continue
+        # Primary MM/arb filter: big profit on huge volume = churner, not a bettor.
+        ratio = _profit_volume_ratio(pnl, vmap.get(addr))
         if ratio is not None and ratio < min_ratio:
             continue
-        s = score_wallet(addr)
-        time.sleep(0.05)
-        realized = s["realized_pnl"]
-        resolved = s["resolved_count"]
-        winrate = s["winrate"]
-        avg = realized / resolved if resolved else 0
-
-        if not (realized >= MIN_REALIZED
-                and MIN_RESOLVED <= resolved <= MAX_RESOLVED
-                and avg >= MIN_AVG_PER_MARKET
-                and WINRATE_LO <= winrate <= WINRATE_HI):
-            continue
+        if ratio is None:
+            # Not on the volume board (modest volume) — can't compute the ratio,
+            # so require a light resolved track record to rule out one-shot luck.
+            s = score_wallet(addr)
+            time.sleep(0.05)
+            if s["resolved_count"] < MIN_RESOLVED_LIGHT:
+                continue
+        # Must be actively trading; drop obvious MM/LP (liquidity-reward earners).
         prof = _activity_profile(addr)
         time.sleep(0.05)
         if prof["is_mm"] or prof["last_days"] > MAX_LAST_DAYS:
             continue
         qualified.append({
             "wallet": meta["wallet"], "name": meta["name"],
-            "realized": realized, "winrate": winrate,
+            "realized": pnl, "winrate": 0.0,
             "ratio": ratio,
             "existing": addr in existing,
         })

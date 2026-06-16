@@ -476,9 +476,11 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lines.append("\n<b>Новые кошельки:</b>")
         for p in r["added"][:25]:
             name = f" · {p['name']}" if p.get("name") else ""
+            ratio = p.get("ratio")
+            ratio_txt = f" · edge {ratio * 100:.0f}%" if ratio else ""
             lines.append(
                 f"🐳 <code>{_short_addr(p['wallet'])}</code>{name}\n"
-                f"   ${p['realized']:,.0f} · win {p['winrate']:.0%}"
+                f"   +${p['realized']:,.0f}{ratio_txt}"
             )
     else:
         lines.append("\nНовых кошельков не нашлось — список уже актуален.")
