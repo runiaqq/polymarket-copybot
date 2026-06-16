@@ -68,6 +68,12 @@ def poll_tracked_wallets() -> dict:
     reentry_sec = settings.tracked_reentry_hours * 3600
     min_copy = settings.tracked_min_copy_usdc
 
+    skipped_age_total = 0
+    skipped_small_total = 0
+    skipped_no_market_total = 0
+    skipped_dedup_total = 0
+    wallets_with_activity = 0
+
     for w in wallets:
         addr = (w.get("address") or "").lower()
         if not addr:
@@ -81,6 +87,7 @@ def poll_tracked_wallets() -> dict:
         # Aggregate sliced fills: a whale that builds a position with dozens of
         # tiny buys in one market+outcome is ONE entry, not dozens of signals.
         groups: dict[tuple[str, str], dict] = {}
+        skipped_old = 0
         for t in trades:
             if (t.get("side") or "").upper() != "BUY":
                 continue
@@ -91,6 +98,7 @@ def poll_tracked_wallets() -> dict:
                 continue
             ts = int(t.get("timestamp") or 0)
             if ts and (now - ts) > max_age:
+                skipped_old += 1
                 continue  # only fresh fills count toward the burst
             size = float(t.get("size_usdc") or 0)
             price = float(t.get("price") or 0)
@@ -106,19 +114,27 @@ def poll_tracked_wallets() -> dict:
                 g["last_ts"] = ts
                 g["last_tx"] = tx
 
+        skipped_age_total += skipped_old
+        if groups:
+            wallets_with_activity += 1
+
         for (cond, token), g in groups.items():
             agg_size = g["size"]
             if agg_size < min_copy:
+                skipped_small_total += 1
                 continue  # below conviction floor — dust/noise
 
             key = f"{addr}:{cond}:{token}"
             last = _seen.get(key)
             if last and (now - last) < reentry_sec:
+                skipped_dedup_total += 1
                 continue  # already copied this entry burst
 
             meta = fast.get(cond)
             if meta is None:
-                _seen[key] = now
+                skipped_no_market_total += 1
+                # Don't poison _seen here — we want to retry once this market
+                # enters our resolution window (or config changes).
                 continue  # not a fast/liquid market in range — skip
 
             # Cross-restart dedup: did we already signal this wallet→market+outcome?
@@ -187,4 +203,17 @@ def poll_tracked_wallets() -> dict:
         cutoff = now - reentry_sec
         for k in [k for k, v in _seen.items() if v < cutoff]:
             del _seen[k]
+
+    # Log a summary every cycle so we can diagnose why dispatched stays 0.
+    if dispatched == 0 and (wallets_with_activity or skipped_age_total):
+        log.info(
+            "poll_no_dispatch",
+            wallets=len(wallets),
+            active=wallets_with_activity,
+            skipped_age=skipped_age_total,
+            skipped_small=skipped_small_total,
+            skipped_no_market=skipped_no_market_total,
+            skipped_dedup=skipped_dedup_total,
+            fast_markets=len(fast),
+        )
     return {"dispatched": dispatched}

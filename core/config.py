@@ -57,8 +57,8 @@ class Settings(BaseSettings):
 
     # ── Strategy: whale-tracking on fast markets ────────────────────────────────
     # Market universe: only watch markets resolving within this window.
-    # 24h keeps the focus on the "1-2 day" idea and shrinks the universe (less spam).
-    market_max_hours_to_resolve: float = 24.0
+    # 72h covers 1-3 day markets where most directional whales operate.
+    market_max_hours_to_resolve: float = 72.0
     # Skip ultra-fast markets below this (e.g. 5-15 min crypto) — thin & HFT-dominated.
     market_min_hours_to_resolve: float = 0.5
     # Skip illiquid markets (Gamma liquidityNum, in USDC). 0 disables the filter.
@@ -162,7 +162,9 @@ class Settings(BaseSettings):
     # How often to poll each tracked wallet's recent trades (seconds).
     tracked_poll_sec: float = 15.0
     # Ignore a tracked wallet's trade older than this (avoid copying stale entries).
-    tracked_max_trade_age_sec: int = 300
+    # 2 hours gives us enough history to catch sliced entries and survive restarts.
+    # The in-memory + DB dedup prevents double-copying within reentry_hours window.
+    tracked_max_trade_age_sec: int = 7200
     # Window (hours) over which we count distinct tracked wallets for consensus.
     consensus_window_hours: int = 24
     # How many recent fills to pull per wallet (a sliced entry can be dozens of fills).
