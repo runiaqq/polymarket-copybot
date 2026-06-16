@@ -17,8 +17,9 @@ from worker.celery_app import celery_app
 
 log = structlog.get_logger(__name__)
 
-# In-memory dedup of (wallet:tx) already processed within a worker run.
-_seen: set[str] = set()
+# In-memory dedup: (wallet:market:token) -> last emit epoch. A sliced entry is
+# one logical signal even though it lands as dozens of fills across poll cycles.
+_seen: dict[str, float] = {}
 _SEEN_MAX = 8000
 
 
@@ -63,57 +64,92 @@ def poll_tracked_wallets() -> dict:
     user_ids = [u["id"] for u in subscribers]
     dispatched = 0
 
+    max_age = settings.tracked_max_trade_age_sec
+    reentry_sec = settings.tracked_reentry_hours * 3600
+    min_copy = settings.tracked_min_copy_usdc
+
     for w in wallets:
         addr = (w.get("address") or "").lower()
         if not addr:
             continue
         try:
-            trades = fetch_donor_recent_trades(addr, limit=15)
+            trades = fetch_donor_recent_trades(addr, limit=settings.tracked_fetch_limit)
         except Exception:
             log.warning("tracked_fetch_failed", wallet=addr[:10])
             continue
 
+        # Aggregate sliced fills: a whale that builds a position with dozens of
+        # tiny buys in one market+outcome is ONE entry, not dozens of signals.
+        groups: dict[tuple[str, str], dict] = {}
         for t in trades:
             if (t.get("side") or "").upper() != "BUY":
                 continue
-            tx = t.get("tx_hash") or t.get("trade_id") or t.get("id")
             cond = t.get("condition_id")
             token = t.get("token_id")
+            tx = t.get("tx_hash") or t.get("trade_id") or t.get("id")
             if not (tx and cond and token):
                 continue
             ts = int(t.get("timestamp") or 0)
-            if ts and (now - ts) > settings.tracked_max_trade_age_sec:
-                continue
-            key = f"{addr}:{tx}"
-            if key in _seen:
-                continue
+            if ts and (now - ts) > max_age:
+                continue  # only fresh fills count toward the burst
+            size = float(t.get("size_usdc") or 0)
+            price = float(t.get("price") or 0)
+            g = groups.get((cond, token))
+            if g is None:
+                g = {"size": 0.0, "notional": 0.0, "fills": 0,
+                     "last_ts": 0, "last_tx": tx, "title": t.get("title", "")}
+                groups[(cond, token)] = g
+            g["size"] += size
+            g["notional"] += price * size
+            g["fills"] += 1
+            if ts >= g["last_ts"]:
+                g["last_ts"] = ts
+                g["last_tx"] = tx
+
+        for (cond, token), g in groups.items():
+            agg_size = g["size"]
+            if agg_size < min_copy:
+                continue  # below conviction floor — dust/noise
+
+            key = f"{addr}:{cond}:{token}"
+            last = _seen.get(key)
+            if last and (now - last) < reentry_sec:
+                continue  # already copied this entry burst
 
             meta = fast.get(cond)
             if meta is None:
-                _seen.add(key)
+                _seen[key] = now
                 continue  # not a fast/liquid market in range — skip
 
-            # Cross-restart dedup via the persisted signal row.
+            # Cross-restart dedup: did we already signal this wallet→market+outcome?
             try:
-                ex = sb.table("trade_signals").select("id").eq("source_tx_hash", tx).limit(1).execute()
+                since = (datetime.now(timezone.utc)
+                         - timedelta(hours=settings.tracked_reentry_hours)).isoformat()
+                ex = (sb.table("trade_signals").select("id")
+                      .eq("source_wallet", addr).eq("market_id", cond)
+                      .eq("token_id", token).gte("created_at", since)
+                      .limit(1).execute())
                 if ex.data:
-                    _seen.add(key)
+                    _seen[key] = now
                     continue
             except Exception:
                 pass
-            _seen.add(key)
+            _seen[key] = now
 
+            vwap = (g["notional"] / agg_size) if agg_size else 0
+            tx = g["last_tx"]
             outcome = (meta.get("token_outcomes") or {}).get(token, "")
             consensus = _consensus_count(sb, cond, token, addr)
 
             signal = {
                 "market_id":        cond,
                 "token_id":         token,
-                "title":            meta.get("title") or t.get("title", ""),
+                "title":            meta.get("title") or g["title"],
                 "outcome":          outcome,
                 "side":             "BUY",
-                "price":            t.get("price", 0),
-                "size_usdc":        t.get("size_usdc", 0),
+                "price":            round(vwap, 4),
+                "size_usdc":        round(agg_size, 2),
+                "fills":            g["fills"],
                 "tick_size":        meta.get("tick_size", "0.01"),
                 "neg_risk":         bool(meta.get("neg_risk", False)),
                 "hours_to_resolve": meta.get("hours_to_resolve"),
@@ -144,8 +180,11 @@ def poll_tracked_wallets() -> dict:
                 execute_copy_trade.delay(uid, signal)
             dispatched += 1
             log.info("tracked_signal", wallet=addr[:10], market=cond[:14],
-                     outcome=outcome, consensus=consensus, subs=len(user_ids))
+                     outcome=outcome, size=round(agg_size, 2), fills=g["fills"],
+                     consensus=consensus, subs=len(user_ids))
 
     if len(_seen) > _SEEN_MAX:
-        _seen.clear()
+        cutoff = now - reentry_sec
+        for k in [k for k, v in _seen.items() if v < cutoff]:
+            del _seen[k]
     return {"dispatched": dispatched}

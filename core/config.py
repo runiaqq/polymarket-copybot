@@ -165,6 +165,15 @@ class Settings(BaseSettings):
     tracked_max_trade_age_sec: int = 300
     # Window (hours) over which we count distinct tracked wallets for consensus.
     consensus_window_hours: int = 24
+    # How many recent fills to pull per wallet (a sliced entry can be dozens of fills).
+    tracked_fetch_limit: int = 50
+    # Aggregate USDC a wallet must buy in ONE market+outcome (summed across sliced
+    # fills within the freshness window) before we copy. Filters dust, captures
+    # order-slicing whales that build a big position with many tiny buys.
+    tracked_min_copy_usdc: float = 50.0
+    # Don't re-copy the same wallet→market+outcome again within this window
+    # (one entry per burst, not one per fill / per poll cycle).
+    tracked_reentry_hours: int = 12
 
     # ── Wallet track-record filter (validate the edge before enforcing) ──────────
     # off     = ignore the buyer's history entirely

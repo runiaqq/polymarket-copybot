@@ -13,6 +13,9 @@ Heuristics that separate directional traders from arbitrage/hedge bots:
     real directional edge lives around 0.5-0.9.
   * resolved_count — absurdly high counts signal industrial arbitrage.
   * recency — must be actively trading (last trade within a few days).
+  * liquidity rewards — wallets earning MAKER_REBATE / REWARD payouts are
+    market makers / LPs (farming the spread), never copy-worthy takers.
+  * 30d consistency — must appear on the 30d profit board, not just a 7d spike.
 """
 
 import time
@@ -24,7 +27,7 @@ log = structlog.get_logger(__name__)
 _ACT_URL = "https://data-api.polymarket.com/activity"
 _H = {"User-Agent": "Mozilla/5.0 (PolyMind seeder)"}
 
-# Quality thresholds (anti-arbitrage / anti-hedge).
+# Quality thresholds (anti-arbitrage / anti-hedge / anti-market-maker).
 MIN_REALIZED = 20_000      # meaningful realized P&L ($)
 MIN_RESOLVED = 25          # real track record
 MAX_RESOLVED = 2_000       # above this = industrial arbitrage
@@ -32,24 +35,42 @@ MIN_AVG_PER_MARKET = 120   # directional conviction, not cent-scalping ($)
 WINRATE_LO = 0.45
 WINRATE_HI = 0.90          # exclude near-riskless arb/hedge
 MAX_LAST_DAYS = 5          # must be trading recently
+MAX_REWARDS = 2            # >this liquidity rewards => market maker / LP
 
 
-def _last_trade_days(addr: str) -> float:
+def _activity_profile(addr: str) -> dict:
+    """Recency + market-maker fingerprint from a wallet's activity feed.
+
+    Liquidity providers / market makers receive MAKER_REBATE and REWARD payouts
+    (liquidity rewards) — directional takers never do. That's the cleanest way
+    to tell a copy-worthy bettor from an MM that just farms the spread.
+    """
     import httpx
     try:
-        r = httpx.get(_ACT_URL, params={"user": addr, "limit": 50}, headers=_H, timeout=15)
+        r = httpx.get(_ACT_URL, params={"user": addr, "limit": 200}, headers=_H, timeout=15)
         r.raise_for_status()
         rows = r.json()
         if not isinstance(rows, list):
             rows = rows.get("data", [])
     except Exception:
-        return 999.0
+        return {"last_days": 999.0, "is_mm": False, "trades": 0}
     now = time.time()
     last = 0
+    maker_rebate = rewards = trades = 0
     for a in rows:
-        if a.get("type") == "TRADE":
+        t = a.get("type")
+        if t == "TRADE":
+            trades += 1
             last = max(last, int(a.get("timestamp") or 0))
-    return round((now - last) / 86400, 1) if last else 999.0
+        elif t == "MAKER_REBATE":
+            maker_rebate += 1
+        elif t == "REWARD":
+            rewards += 1
+    return {
+        "last_days": round((now - last) / 86400, 1) if last else 999.0,
+        "is_mm": maker_rebate > 0 or rewards > MAX_REWARDS,
+        "trades": trades,
+    }
 
 
 def discover_quality(target: int = 20, add: bool = True) -> dict:
@@ -58,12 +79,19 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
 
     Blocking (network + DB) — call via asyncio.to_thread from async code.
     """
-    from core.db import add_tracked_wallet, list_tracked_wallets
+    from core.db import (
+        add_tracked_wallet,
+        list_tracked_wallets,
+        remove_tracked_wallet,
+    )
     from core.leaderboard import top_profit_wallets
     from core.wallet_score import score_wallet
 
     c30 = top_profit_wallets("30d", 150)
     c7 = top_profit_wallets("7d", 100)
+    # Require consistent 30d profitability — a wallet that spikes in 7d but is
+    # absent from the 30d board is usually an MM/arb, not a durable edge.
+    addrs30 = {w["wallet"].lower() for w in c30}
     by_addr: dict[str, dict] = {}
     for w in c30 + c7:
         by_addr.setdefault(w["wallet"].lower(), {"wallet": w["wallet"], "name": w["name"]})
@@ -72,6 +100,8 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
     qualified: list[dict] = []
 
     for addr, meta in by_addr.items():
+        if addr not in addrs30:
+            continue
         s = score_wallet(addr)
         time.sleep(0.05)
         realized = s["realized_pnl"]
@@ -84,9 +114,10 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
                 and avg >= MIN_AVG_PER_MARKET
                 and WINRATE_LO <= winrate <= WINRATE_HI):
             continue
-        if _last_trade_days(addr) > MAX_LAST_DAYS:
-            continue
+        prof = _activity_profile(addr)
         time.sleep(0.05)
+        if prof["is_mm"] or prof["last_days"] > MAX_LAST_DAYS:
+            continue
         qualified.append({
             "wallet": meta["wallet"], "name": meta["name"],
             "realized": realized, "winrate": winrate,
@@ -109,11 +140,30 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
                 continue
         added.append(p)
 
+    # Hygiene: drop already-tracked wallets that turn out to be market makers /
+    # LPs (they collect MAKER_REBATE / liquidity rewards — never copy-worthy).
+    qualified_addrs = {p["wallet"].lower() for p in qualified}
+    removed: list[dict] = []
+    if add:
+        for w in list_tracked_wallets():
+            a = w["address"].lower()
+            if a in qualified_addrs:
+                continue
+            prof = _activity_profile(a)
+            time.sleep(0.05)
+            if prof["is_mm"]:
+                try:
+                    remove_tracked_wallet(w["address"])
+                    removed.append({"wallet": w["address"], "name": w.get("name") or ""})
+                except Exception:
+                    log.warning("prune_remove_failed", wallet=w["address"])
+
     total = len(list_tracked_wallets()) if add else len(existing)
     return {
         "scanned": len(by_addr),
         "qualified": len(qualified),
         "added": added,
         "kept": kept,
+        "removed": removed,
         "total": total,
     }

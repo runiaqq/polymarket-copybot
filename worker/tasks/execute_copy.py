@@ -405,9 +405,12 @@ def _notify(
         outcome = signal.get("outcome") or "—"
         prob = f"{price * 100:.0f}%"
         whale_usdc = float(signal.get("size_usdc") or 0)
+        fills = int(signal.get("fills") or 0)
         hours = signal.get("hours_to_resolve")
         consensus = int(signal.get("consensus") or 1)
         whale_line = f"🐳 Профи вошёл на: <b>${whale_usdc:,.0f}</b>" if whale_usdc else "🐳 Сигнал от профи-кошелька"
+        if fills > 1:
+            whale_line += f" ({fills} сделок)"
         if consensus >= 2:
             whale_line += f"\n🔥 <b>Консенсус: {consensus} профи</b> в этом исходе"
         hours_line = f" · ⏳ ~{hours:.0f} ч" if hours else ""

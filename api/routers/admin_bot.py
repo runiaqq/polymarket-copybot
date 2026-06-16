@@ -464,8 +464,14 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🎯 Прошли фильтр качества: <b>{r['qualified']}</b>",
         f"➕ Добавлено новых: <b>{len(r['added'])}</b>",
         f"✓ Уже были в списке: <b>{len(r['kept'])}</b>",
+        f"🧹 Убрано маркет-мейкеров: <b>{len(r.get('removed', []))}</b>",
         f"📋 Всего в списке: <b>{r['total']}</b>",
     ]
+    if r.get("removed"):
+        lines.append("\n<b>Убраны (маркет-мейкеры / LP):</b>")
+        for p in r["removed"][:25]:
+            name = f" · {p['name']}" if p.get("name") else ""
+            lines.append(f"🧹 <code>{_short_addr(p['wallet'])}</code>{name}")
     if r["added"]:
         lines.append("\n<b>Новые кошельки:</b>")
         for p in r["added"][:25]:
