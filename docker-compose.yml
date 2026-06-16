@@ -1,6 +1,4 @@
-version: "3.9"
-
-# Full self-hosted stack: API (polling) + Worker + local Redis.
+# Full self-hosted stack: API (polling) + Worker + Beat + local Redis.
 # Drop-in replacement for Railway (API) + Fly (worker) + Upstash (Redis).
 #
 # Usage on a VPS in a non-geoblocked region (e.g. AWS eu-west-1 Ireland):
@@ -44,6 +42,22 @@ services:
     environment:
       AUTO_COPY_ENABLED: "true"
       REDIS_URL: "redis://redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Periodic scheduler — separate process (gevent pool can't embed --beat).
+  # Keep exactly ONE replica so periodic tasks aren't double-fired.
+  beat:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      AUTO_COPY_ENABLED: "true"
+      REDIS_URL: "redis://redis:6379"
+    command: ["python", "-m", "worker.beat"]
     depends_on:
       redis:
         condition: service_healthy
