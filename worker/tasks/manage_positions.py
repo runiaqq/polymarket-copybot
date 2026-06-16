@@ -83,8 +83,17 @@ def sync_positions() -> dict:
 
             if p.get("redeemable"):
                 if _notify_once(f"settle:{uid}:{condition_id}"):
-                    _emit_win(tg, p.get("title"), p.get("outcome"), p.get("cash_pnl", 0),
-                              claimable=True, event_slug=p.get("event_slug"))
+                    # "redeemable" only means the market resolved — it does NOT mean
+                    # we won. The losing outcome token is also redeemable (for $0).
+                    # Decide win/loss by the resolved price (≈1 = won, ≈0 = lost).
+                    cur = float(p.get("cur_price") or 0)
+                    pnl = p.get("cash_pnl", 0)
+                    if cur >= 0.5:
+                        _emit_win(tg, p.get("title"), p.get("outcome"), pnl,
+                                  claimable=True, event_slug=p.get("event_slug"))
+                    else:
+                        _emit_loss(tg, p.get("title"), p.get("outcome"), pnl,
+                                   event_slug=p.get("event_slug"))
                     actions += 1
                 continue
 
