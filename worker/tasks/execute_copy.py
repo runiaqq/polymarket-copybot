@@ -378,7 +378,7 @@ def _notify_low_balance(telegram_id: int, balance: float, needed: float, signal:
         )
 
     try:
-        asyncio.get_event_loop().run_until_complete(_send())
+        asyncio.run(_send())
     except Exception:
         log.exception("notify_low_balance_failed", telegram_id=telegram_id)
 
@@ -460,6 +460,6 @@ def _notify(
         )
 
     try:
-        asyncio.get_event_loop().run_until_complete(_send())
+        asyncio.run(_send())
     except Exception:
         log.exception("notify_failed", telegram_id=telegram_id)
