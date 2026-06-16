@@ -6,7 +6,7 @@ from collections.abc import AsyncGenerator
 
 import structlog
 from fastapi import FastAPI, HTTPException, Request, Response
-from telegram import Update
+from telegram import BotCommand, Update
 
 from api.routers.admin import router as admin_router
 from api.routers.admin_bot import build_admin_application
@@ -20,13 +20,64 @@ tg_app = build_application()
 # Optional admin bot (only if a token is configured).
 admin_app = build_admin_application()
 
+# Commands shown in the Telegram "/" menu (next to the input field).
+MAIN_COMMANDS = [
+    BotCommand("start", "Запуск / активация"),
+    BotCommand("wallet", "Кошелёк и баланс"),
+    BotCommand("balance", "Балансы (pUSD/USDC/POL)"),
+    BotCommand("positions", "Открытые позиции"),
+    BotCommand("pnl", "Доход за период"),
+    BotCommand("register", "Регистрация кошелька"),
+    BotCommand("wrap", "Конвертировать в pUSD"),
+    BotCommand("withdraw", "Вывод средств"),
+    BotCommand("subscription", "Статус подписки"),
+    BotCommand("settings", "Настройки"),
+    BotCommand("stop", "Пауза копирования"),
+    BotCommand("resume", "Возобновить копирование"),
+    BotCommand("help", "Помощь"),
+]
+ADMIN_COMMANDS = [
+    BotCommand("top", "🔥 Топ китов (неделя)"),
+    BotCommand("wallets", "📋 Мои кошельки"),
+    BotCommand("addwallet", "Добавить кошелёк"),
+    BotCommand("delwallet", "Убрать кошелёк"),
+    BotCommand("grant", "Выдать/продлить подписку"),
+    BotCommand("newcode", "Код-ссылка для клиента"),
+    BotCommand("subs", "Активные подписчики"),
+    BotCommand("user", "Инфо о пользователе"),
+    BotCommand("addadmin", "Пригласить админа"),
+    BotCommand("admins", "Список админов"),
+    BotCommand("deladmin", "Убрать админа"),
+    BotCommand("help", "Все команды"),
+]
+
+
+async def _set_commands() -> None:
+    """Publish the slash-command menus so they appear next to the input field."""
+    try:
+        await tg_app.bot.set_my_commands(MAIN_COMMANDS)
+        if admin_app:
+            await admin_app.bot.set_my_commands(ADMIN_COMMANDS)
+        log.info("bot_commands_published")
+    except Exception:
+        log.exception("set_commands_failed")
+
 
 def _run_polling(app, name: str) -> None:
     """Run a telegram Application in polling mode in its own event loop thread."""
     async def _start() -> None:
         await app.initialize()
-        await app.updater.start_polling(drop_pending_updates=True)
+        await app.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=["message", "callback_query"],
+        )
         await app.start()
+        # Publish this bot's command menu.
+        cmds = ADMIN_COMMANDS if name == "admin_bot" else MAIN_COMMANDS
+        try:
+            await app.bot.set_my_commands(cmds)
+        except Exception:
+            log.exception(f"{name}_set_commands_failed")
         log.info(f"{name}_polling_started")
         # Keep alive until the process exits.
         stop_event = asyncio.Event()
@@ -59,6 +110,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         if admin_app:
             await admin_app.initialize()
             log.info("admin_app_initialized")
+        await _set_commands()
     yield
     if not settings.use_polling:
         await tg_app.shutdown()
@@ -125,7 +177,7 @@ async def register_webhook() -> dict:
         await admin_app.bot.set_webhook(
             url=admin_url,
             secret_token=settings.telegram_admin_webhook_secret,
-            allowed_updates=["message"],
+            allowed_updates=["message", "callback_query"],
         )
         result["admin_webhook_url"] = admin_url
         log.info("admin_webhook_registered", url=admin_url)
