@@ -41,6 +41,7 @@ from core.db import (
 )
 from core.leaderboard import (
     fmt_money,
+    polyloly_stats,
     profile_url,
     top_profit_wallets,
     wallet_profit,
@@ -371,6 +372,7 @@ def _mine_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
 def _detail_view(addr: str, origin: str) -> tuple[str, InlineKeyboardMarkup]:
     addr = addr.lower()
     tracked = addr in _tracked_set()
+
     def _pnl_str(v: float | None) -> str:
         if v is None:
             return "— <i>(вне топ-50)</i>"
@@ -379,11 +381,32 @@ def _detail_view(addr: str, origin: str) -> tuple[str, InlineKeyboardMarkup]:
 
     p7s = _pnl_str(wallet_profit(addr, "7d"))
     p30s = _pnl_str(wallet_profit(addr, "30d"))
+
+    # Polyloly: free public API, no auth needed.
+    pl = polyloly_stats(addr)
+    if pl:
+        wr = pl.get("winRate")
+        closed = pl.get("closedPositions")
+        insider = pl.get("knownInsider")
+        category = pl.get("topCategory") or ""
+        wr_str = f"{wr * 100:.0f}%" if wr is not None else "—"
+        insider_str = "🔴 INSIDER" if insider else ("✅ чистый" if wr is not None else "—")
+        closed_str = str(closed) if closed is not None else "—"
+        cat_str = f" · {category}" if category else ""
+        polyloly_block = (
+            f"\n\n📈 <b>Polyloly Analytics</b>\n"
+            f"🎯 Insider: <b>{insider_str}</b>\n"
+            f"📊 Win rate: <b>{wr_str}</b> ({closed_str} закрытых){cat_str}"
+        )
+    else:
+        polyloly_block = "\n\n📈 <i>Polyloly: нет данных</i>"
+
     text = (
         f"🐳 <b>Кит</b>\n<code>{addr}</code>\n\n"
         f"💰 Прибыль 7д: <b>{p7s}</b>\n"
         f"💰 Прибыль 30д: <b>{p30s}</b>\n"
         f"📥 В белом списке: {'✅ да' if tracked else '❌ нет'}"
+        f"{polyloly_block}"
     )
     rows = []
     if tracked:
@@ -392,8 +415,9 @@ def _detail_view(addr: str, origin: str) -> tuple[str, InlineKeyboardMarkup]:
         rows.append([InlineKeyboardButton("➕ Добавить в список", callback_data=f"aw:{origin}:{addr}")])
     rows.append([
         InlineKeyboardButton("📊 Последние сделки", callback_data=f"wt:{origin}:{addr}"),
-        InlineKeyboardButton("🔗 Профиль", url=profile_url(addr)),
+        InlineKeyboardButton("🔗 Polymarket", url=profile_url(addr)),
     ])
+    rows.append([InlineKeyboardButton("📈 Polyloly", url=f"https://polyloly.com")])
     back = "tp:0" if origin == "t" else "mp:0"
     rows.append([InlineKeyboardButton("🔙 Назад", callback_data=back)])
     return text, InlineKeyboardMarkup(rows)
