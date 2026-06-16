@@ -12,8 +12,13 @@ Disabled gracefully when TELEGRAM_ADMIN_BOT_TOKEN is not set.
 from datetime import datetime, timezone
 
 import structlog
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
 from core.config import settings
 from core.db import (
@@ -32,6 +37,13 @@ from core.db import (
     redeem_admin_code,
     remove_admin,
     set_subscription,
+)
+from core.leaderboard import (
+    fmt_money,
+    profile_url,
+    top_profit_wallets,
+    wallet_profit,
+    wallet_recent_trades,
 )
 
 log = structlog.get_logger(__name__)
@@ -84,9 +96,10 @@ HELP_ADMIN = (
     "/subs — список активных подписчиков\n"
     "/user <code>&lt;@ник|id&gt;</code> — детали пользователя\n"
     "\n<b>Белый список китов (копирование)</b>\n"
-    "/wallets — список отслеживаемых кошельков\n"
-    "/addwallet <code>&lt;адрес&gt; [метка]</code> — добавить кошелёк\n"
-    "/delwallet <code>&lt;адрес&gt;</code> — убрать кошелёк\n"
+    "/top — 🔥 топ прибыльных китов за неделю (меню)\n"
+    "/wallets — отслеживаемые кошельки (меню)\n"
+    "/addwallet <code>&lt;адрес&gt; [метка]</code> — добавить вручную\n"
+    "/delwallet <code>&lt;адрес&gt;</code> — убрать вручную\n"
 )
 HELP_SUPER = (
     "\n<b>Управление админами</b> (только главный админ)\n"
@@ -106,12 +119,14 @@ def build_admin_application() -> Application | None:
     app.add_handler(CommandHandler("newcode", cmd_newcode))
     app.add_handler(CommandHandler("subs", cmd_subs))
     app.add_handler(CommandHandler("user", cmd_user))
+    app.add_handler(CommandHandler("top", cmd_top))
     app.add_handler(CommandHandler("wallets", cmd_wallets))
     app.add_handler(CommandHandler("addwallet", cmd_addwallet))
     app.add_handler(CommandHandler("delwallet", cmd_delwallet))
     app.add_handler(CommandHandler("addadmin", cmd_addadmin))
     app.add_handler(CommandHandler("admins", cmd_admins))
     app.add_handler(CommandHandler("deladmin", cmd_deladmin))
+    app.add_handler(CallbackQueryHandler(on_callback))
     return app
 
 
@@ -280,23 +295,195 @@ async def cmd_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# ── Interactive wallet browser (top whales + tracked list) ────────────────────
+
+_PAGE = 10
+
+
+def _tracked_set() -> set[str]:
+    return {w["address"].lower() for w in list_tracked_wallets()}
+
+
+def _short_addr(addr: str) -> str:
+    return f"{addr[:6]}…{addr[-4:]}"
+
+
+def _top_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    wallets = top_profit_wallets("7d", 50)
+    if not wallets:
+        return ("⚠️ Не удалось загрузить лидерборд. Попробуй позже.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить", callback_data="tp:0")]]))
+    tracked = _tracked_set()
+    pages = (len(wallets) - 1) // _PAGE + 1
+    page = max(0, min(page, pages - 1))
+    chunk = wallets[page * _PAGE:(page + 1) * _PAGE]
+    rows = []
+    for w in chunk:
+        mark = "✅ " if w["wallet"].lower() in tracked else ""
+        name = (w["name"] or _short_addr(w["wallet"]))[:22]
+        rows.append([InlineKeyboardButton(
+            f"{mark}{name} · +${fmt_money(w['pnl'])}",
+            callback_data=f"wd:t:{w['wallet']}",
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"tp:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"tp:{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton("📋 Мои кошельки", callback_data="mp:0")])
+    text = ("🔥 <b>Топ китов по прибыли (7 дней)</b>\n"
+            "✅ — уже в белом списке. Нажми на кошелёк для деталей.")
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _mine_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    wallets = list_tracked_wallets()
+    if not wallets:
+        return ("📋 Белый список пуст.\nОткрой /top и добавь китов, "
+                "или вручную: <code>/addwallet &lt;адрес&gt;</code>",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Топ китов", callback_data="tp:0")]]))
+    pages = (len(wallets) - 1) // _PAGE + 1
+    page = max(0, min(page, pages - 1))
+    chunk = wallets[page * _PAGE:(page + 1) * _PAGE]
+    rows = []
+    for w in chunk:
+        label = (w.get("label") or _short_addr(w["address"]))[:24]
+        rows.append([InlineKeyboardButton(
+            f"🐳 {label}", callback_data=f"wd:m:{w['address']}",
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"mp:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"mp:{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton("🔥 Топ китов", callback_data="tp:0")])
+    text = f"📋 <b>Отслеживаемые кошельки: {len(wallets)}</b>\nНажми для деталей."
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _detail_view(addr: str, origin: str) -> tuple[str, InlineKeyboardMarkup]:
+    addr = addr.lower()
+    tracked = addr in _tracked_set()
+    def _pnl_str(v: float | None) -> str:
+        if v is None:
+            return "— <i>(вне топ-50)</i>"
+        sign = "+" if v >= 0 else "−"
+        return f"{sign}${fmt_money(abs(v))}"
+
+    p7s = _pnl_str(wallet_profit(addr, "7d"))
+    p30s = _pnl_str(wallet_profit(addr, "30d"))
+    text = (
+        f"🐳 <b>Кит</b>\n<code>{addr}</code>\n\n"
+        f"💰 Прибыль 7д: <b>{p7s}</b>\n"
+        f"💰 Прибыль 30д: <b>{p30s}</b>\n"
+        f"📥 В белом списке: {'✅ да' if tracked else '❌ нет'}"
+    )
+    rows = []
+    if tracked:
+        rows.append([InlineKeyboardButton("🗑 Убрать из списка", callback_data=f"dw:{origin}:{addr}")])
+    else:
+        rows.append([InlineKeyboardButton("➕ Добавить в список", callback_data=f"aw:{origin}:{addr}")])
+    rows.append([
+        InlineKeyboardButton("📊 Последние сделки", callback_data=f"wt:{origin}:{addr}"),
+        InlineKeyboardButton("🔗 Профиль", url=profile_url(addr)),
+    ])
+    back = "tp:0" if origin == "t" else "mp:0"
+    rows.append([InlineKeyboardButton("🔙 Назад", callback_data=back)])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _trades_view(addr: str, origin: str) -> tuple[str, InlineKeyboardMarkup]:
+    addr = addr.lower()
+    trades = wallet_recent_trades(addr, 8)
+    lines = [f"📊 <b>Последние сделки</b>\n<code>{_short_addr(addr)}</code>\n"]
+    if not trades:
+        lines.append("Нет недавних сделок (или API недоступен).")
+    for t in trades:
+        side = "🟢 BUY" if str(t.get("side", "")).upper() == "BUY" else "🔴 SELL"
+        title = (t.get("title") or "—")[:48]
+        outcome = t.get("outcome") or ""
+        oc = f" · {outcome}" if outcome else ""
+        price = float(t.get("price") or 0)
+        size = float(t.get("size_usdc") or 0)
+        lines.append(f"{side}{oc} · ${size:.0f} @ {price:.2f}\n   <i>{title}</i>")
+    rows = [[InlineKeyboardButton("🔙 К киту", callback_data=f"wd:{origin}:{addr}")]]
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg = update.effective_user
+    if not tg or not is_admin(tg.id):
+        await _deny(update)
+        return
+    text, kb = _top_view(0)
+    await update.message.reply_text(  # type: ignore[union-attr]
+        text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+
+
 async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tg = update.effective_user
     if not tg or not is_admin(tg.id):
         await _deny(update)
         return
-    wallets = list_tracked_wallets()
-    if not wallets:
-        await update.message.reply_text(  # type: ignore[union-attr]
-            "Белый список пуст.\nДобавь: <code>/addwallet &lt;адрес&gt; [метка]</code>",
-            parse_mode="HTML",
-        )
+    text, kb = _mine_view(0)
+    await update.message.reply_text(  # type: ignore[union-attr]
+        text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
         return
-    lines = [f"🐳 <b>Отслеживаемые кошельки: {len(wallets)}</b>\n"]
-    for w in wallets[:60]:
-        label = f" · {w['label']}" if w.get("label") else ""
-        lines.append(f"<code>{w['address']}</code>{label}")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)  # type: ignore[union-attr]
+    tg = update.effective_user
+    if not tg or not is_admin(tg.id):
+        await q.answer("⛔️ Только для админов", show_alert=True)
+        return
+    data = q.data or ""
+    toast = ""
+    try:
+        if data == "noop":
+            await q.answer()
+            return
+        elif data.startswith("tp:"):
+            text, kb = _top_view(int(data[3:]))
+        elif data.startswith("mp:"):
+            text, kb = _mine_view(int(data[3:]))
+        elif data.startswith("wd:"):
+            _, origin, addr = data.split(":", 2)
+            text, kb = _detail_view(addr, origin)
+        elif data.startswith("wt:"):
+            _, origin, addr = data.split(":", 2)
+            text, kb = _trades_view(addr, origin)
+        elif data.startswith("aw:"):
+            _, origin, addr = data.split(":", 2)
+            add_tracked_wallet(addr)
+            toast = "✅ Добавлен"
+            text, kb = _detail_view(addr, origin)
+        elif data.startswith("dw:"):
+            _, origin, addr = data.split(":", 2)
+            remove_tracked_wallet(addr)
+            toast = "🗑 Убран"
+            text, kb = _detail_view(addr, origin)
+        else:
+            await q.answer()
+            return
+
+        await q.answer(toast)
+        await q.edit_message_text(
+            text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+    except Exception as exc:
+        # "not modified" no-op edits happen after answer() was already sent — ignore.
+        if "not modified" in str(exc).lower():
+            return
+        log.warning("admin_callback_failed", data=data, error=str(exc))
+        try:
+            await q.answer("⚠️ Ошибка, попробуй снова")
+        except Exception:
+            pass
 
 
 async def cmd_addwallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

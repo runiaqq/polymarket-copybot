@@ -423,6 +423,7 @@ def fetch_donor_recent_trades(maker_address: str, limit: int = 10) -> list[dict]
                 "size_usdc":    float(t.get("usdcSize") or 0),
                 "timestamp":    t.get("timestamp", 0),
                 "title":        t.get("title", ""),
+                "outcome":      t.get("outcome", ""),
             })
         return normalised
     except Exception:
