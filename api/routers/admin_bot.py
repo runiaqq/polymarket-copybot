@@ -468,6 +468,17 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🧹 Убрано маркет-мейкеров: <b>{len(r.get('removed', []))}</b>",
         f"📋 Всего в списке: <b>{r['total']}</b>",
     ]
+    def _wallet_score_line(p: dict, icon: str) -> str:
+        name = f" · {p['name']}" if p.get("name") else ""
+        ratio = p.get("ratio")
+        ratio_txt = f" · edge {ratio * 100:.0f}%" if ratio else ""
+        d = p.get("directionality")
+        dir_txt = f" · dir {d:.2f}" if d is not None else ""
+        return (
+            f"{icon} <code>{_short_addr(p['wallet'])}</code>{name}\n"
+            f"   +${p['realized']:,.0f}{ratio_txt}{dir_txt}"
+        )
+
     if r.get("removed"):
         lines.append("\n<b>Убраны (маркет-мейкеры / LP):</b>")
         for p in r["removed"][:25]:
@@ -476,17 +487,13 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if r["added"]:
         lines.append("\n<b>Новые кошельки:</b>")
         for p in r["added"][:25]:
-            name = f" · {p['name']}" if p.get("name") else ""
-            ratio = p.get("ratio")
-            ratio_txt = f" · edge {ratio * 100:.0f}%" if ratio else ""
-            d = p.get("directionality")
-            dir_txt = f" · dir {d:.2f}" if d is not None else ""
-            lines.append(
-                f"🐳 <code>{_short_addr(p['wallet'])}</code>{name}\n"
-                f"   +${p['realized']:,.0f}{ratio_txt}{dir_txt}"
-            )
+            lines.append(_wallet_score_line(p, "🐳"))
     else:
         lines.append("\nНовых кошельков не нашлось — список уже актуален.")
+    if r.get("kept"):
+        lines.append("\n<b>Уже в списке (прошли фильтр):</b>")
+        for p in r["kept"][:15]:
+            lines.append(_wallet_score_line(p, "✅"))
     lines.append("\nОткрой /wallets для управления.")
     await msg.edit_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
 
