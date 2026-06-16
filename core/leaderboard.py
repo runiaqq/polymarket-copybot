@@ -13,14 +13,11 @@ log = structlog.get_logger(__name__)
 
 LB_URL = "https://lb-api.polymarket.com/profit"
 VOL_URL = "https://lb-api.polymarket.com/volume"
-POLYLOLY_TRADER_URL = "https://polyloly.com/api/trader"
 _H = {"User-Agent": "Mozilla/5.0 (PolyMind)"}
 PROFILE_URL = "https://polymarket.com/profile/{addr}"
-POLYLOLY_URL = "https://polyloly.com"
 
 _cache: dict[str, tuple[float, list]] = {}
 _vol_cache: dict[str, tuple[float, list]] = {}
-_polyloly_cache: dict[str, tuple[float, dict]] = {}  # addr -> (ts, stats)
 _TTL = 300  # 5 min
 
 
@@ -111,33 +108,6 @@ def wallet_recent_trades(addr: str, limit: int = 6) -> list[dict]:
 
 def profile_url(addr: str) -> str:
     return PROFILE_URL.format(addr=addr)
-
-
-def polyloly_stats(addr: str) -> dict | None:
-    """Fetch trader stats from Polyloly's free public API (no auth required).
-
-    Returns dict with keys: winRate, closedPositions, knownInsider, topCategory.
-    Returns None on error or timeout. Cached per address for 5 min.
-    """
-    a = addr.lower()
-    cached = _polyloly_cache.get(a)
-    if cached and (time.time() - cached[0]) < _TTL:
-        return cached[1]
-    import httpx
-    try:
-        r = httpx.get(
-            POLYLOLY_TRADER_URL,
-            params={"addr": addr},
-            headers=_H,
-            timeout=6.0,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            _polyloly_cache[a] = (time.time(), data)
-            return data
-    except Exception:
-        pass
-    return None
 
 
 def fmt_money(v: float) -> str:
