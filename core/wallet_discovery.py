@@ -85,6 +85,11 @@ def _activity_profile(addr: str) -> dict:
     first_ts = last_ts = 0
     maker_rebate = rewards = trades = 0
     total_size = 0.0
+    # Directionality: track BUY volume split by YES/NO per market.
+    # D = |V_yes - V_no| / (V_yes + V_no) per market, averaged across markets.
+    # MMs score near 0 (equal YES/NO); directional traders score near 1.
+    mkt_yes: dict[str, float] = {}
+    mkt_no: dict[str, float] = {}
 
     for a in rows:
         t = a.get("type")
@@ -96,7 +101,17 @@ def _activity_profile(addr: str) -> dict:
                     first_ts = ts
                 if ts > last_ts:
                     last_ts = ts
-            total_size += float(a.get("usdcSize") or 0)
+            size = float(a.get("usdcSize") or 0)
+            total_size += size
+            # Only BUY orders reveal directional intent; sells are exits.
+            if size > 0 and str(a.get("side", "")).upper() == "BUY":
+                mkt = a.get("conditionId") or ""
+                outcome = str(a.get("outcome") or "").upper()
+                if mkt:
+                    if "YES" in outcome:
+                        mkt_yes[mkt] = mkt_yes.get(mkt, 0.0) + size
+                    elif "NO" in outcome:
+                        mkt_no[mkt] = mkt_no.get(mkt, 0.0) + size
         elif t == "MAKER_REBATE":
             maker_rebate += 1
         elif t == "REWARD":
@@ -107,10 +122,20 @@ def _activity_profile(addr: str) -> dict:
         days_span = max((last_ts - first_ts) / 86400, 0.5)
         trades_per_day = trades / days_span
     else:
-        # All events in the same day — assume one-day window.
         trades_per_day = float(trades)
 
     avg_size = (total_size / trades) if trades > 0 else 0.0
+
+    # Directionality score (average D across all markets traded).
+    all_mkts = set(mkt_yes) | set(mkt_no)
+    d_scores = []
+    for mkt in all_mkts:
+        v_yes = mkt_yes.get(mkt, 0.0)
+        v_no = mkt_no.get(mkt, 0.0)
+        total = v_yes + v_no
+        if total > 0:
+            d_scores.append(abs(v_yes - v_no) / total)
+    directionality = round(sum(d_scores) / len(d_scores), 3) if d_scores else None
 
     return {
         "last_days": round((now - last_ts) / 86400, 1) if last_ts else 999.0,
@@ -118,6 +143,7 @@ def _activity_profile(addr: str) -> dict:
         "trades": trades,
         "trades_per_day": round(trades_per_day, 1),
         "avg_size": round(avg_size, 1),
+        "directionality": directionality,
     }
 
 
@@ -188,10 +214,19 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
             log.debug("discovery_skip_size",
                       addr=addr[:10], avg_size=prof["avg_size"])
             continue
+        # Directionality filter: MMs buy both YES and NO on the same market
+        # (D ≈ 0); directional traders consistently bet one side (D ≈ 1).
+        min_dir = settings.discovery_min_directionality
+        d = prof["directionality"]
+        if d is not None and d < min_dir:
+            log.debug("discovery_skip_directionality",
+                      addr=addr[:10], directionality=d)
+            continue
         qualified.append({
             "wallet": meta["wallet"], "name": meta["name"],
             "realized": pnl, "winrate": 0.0,
             "ratio": ratio,
+            "directionality": d,
             "existing": addr in existing,
         })
 

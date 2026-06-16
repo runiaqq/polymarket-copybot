@@ -202,6 +202,12 @@ class Settings(BaseSettings):
     # Min average trade size (USDC). MMs scalp with $50-500 orders;
     # copy-worthy directional whales bet $300+ per order on average.
     discovery_min_avg_trade_size: float = 300.0
+    # Directionality Score: D = |V_yes - V_no| / (V_yes + V_no) per market,
+    # averaged across all markets the wallet bought into.
+    # D = 1.0 → fully directional (only bought one outcome per market).
+    # D = 0.0 → perfectly hedged (equal YES/NO volume) → classic MM.
+    # MMs score 0.0-0.3; real directional traders typically 0.7-1.0.
+    discovery_min_directionality: float = 0.5
 
     # ── AI ───────────────────────────────────────────────────────────────────────
     # Risk score (1-10) at or above which the user gets a HIGH-RISK warning.
