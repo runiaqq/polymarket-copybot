@@ -39,6 +39,7 @@ MAIN_COMMANDS = [
 ADMIN_COMMANDS = [
     BotCommand("top", "🔥 Топ китов (неделя)"),
     BotCommand("wallets", "📋 Мои кошельки"),
+    BotCommand("refresh", "♻️ Обновить белый список"),
     BotCommand("addwallet", "Добавить кошелёк"),
     BotCommand("delwallet", "Убрать кошелёк"),
     BotCommand("grant", "Выдать/продлить подписку"),

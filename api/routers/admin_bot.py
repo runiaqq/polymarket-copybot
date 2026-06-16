@@ -9,6 +9,7 @@ main bot (own token + webhook); shares only the database.
 Disabled gracefully when TELEGRAM_ADMIN_BOT_TOKEN is not set.
 """
 
+import asyncio
 from datetime import datetime, timezone
 
 import structlog
@@ -98,6 +99,7 @@ HELP_ADMIN = (
     "\n<b>Белый список китов (копирование)</b>\n"
     "/top — 🔥 топ прибыльных китов за неделю (меню)\n"
     "/wallets — отслеживаемые кошельки (меню)\n"
+    "/refresh — обновить белый список лучшими трейдерами\n"
     "/addwallet <code>&lt;адрес&gt; [метка]</code> — добавить вручную\n"
     "/delwallet <code>&lt;адрес&gt;</code> — убрать вручную\n"
 )
@@ -120,6 +122,7 @@ def build_admin_application() -> Application | None:
     app.add_handler(CommandHandler("subs", cmd_subs))
     app.add_handler(CommandHandler("user", cmd_user))
     app.add_handler(CommandHandler("top", cmd_top))
+    app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("wallets", cmd_wallets))
     app.add_handler(CommandHandler("addwallet", cmd_addwallet))
     app.add_handler(CommandHandler("delwallet", cmd_delwallet))
@@ -432,6 +435,49 @@ async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text, kb = _mine_view(0)
     await update.message.reply_text(  # type: ignore[union-attr]
         text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+
+
+async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg = update.effective_user
+    if not tg or not is_admin(tg.id):
+        await _deny(update)
+        return
+    try:
+        target = int(context.args[0]) if context.args else 20
+    except ValueError:
+        target = 20
+
+    msg = await update.message.reply_text(  # type: ignore[union-attr]
+        "⏳ Сканирую лидерборд и отбираю лучших направленных трейдеров…\n"
+        "Это займёт 1–2 минуты.")
+    try:
+        from core.wallet_discovery import discover_quality
+        r = await asyncio.to_thread(discover_quality, target, True)
+    except Exception as exc:
+        log.exception("refresh_failed")
+        await msg.edit_text(f"❌ Ошибка обновления: <code>{str(exc)[:200]}</code>", parse_mode="HTML")
+        return
+
+    lines = [
+        "✅ <b>Белый список обновлён</b>\n",
+        f"🔎 Проверено кандидатов: <b>{r['scanned']}</b>",
+        f"🎯 Прошли фильтр качества: <b>{r['qualified']}</b>",
+        f"➕ Добавлено новых: <b>{len(r['added'])}</b>",
+        f"✓ Уже были в списке: <b>{len(r['kept'])}</b>",
+        f"📋 Всего в списке: <b>{r['total']}</b>",
+    ]
+    if r["added"]:
+        lines.append("\n<b>Новые кошельки:</b>")
+        for p in r["added"][:25]:
+            name = f" · {p['name']}" if p.get("name") else ""
+            lines.append(
+                f"🐳 <code>{_short_addr(p['wallet'])}</code>{name}\n"
+                f"   ${p['realized']:,.0f} · win {p['winrate']:.0%}"
+            )
+    else:
+        lines.append("\nНовых кошельков не нашлось — список уже актуален.")
+    lines.append("\nОткрой /wallets для управления.")
+    await msg.edit_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
