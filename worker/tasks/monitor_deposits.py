@@ -42,30 +42,40 @@ def monitor_deposits() -> dict:
             has_key = bool(user.get("wallet_private_key_enc"))
 
             # A DEPOSIT = fresh stablecoin arriving on the EOA (USDC / USDC.e).
-            # This is the ONLY unambiguous deposit signal: opening/closing positions
-            # and resolutions move funds inside the deposit wallet, never onto the EOA,
-            # so they can't be mistaken for deposits. (We don't track "withdrawals" here
-            # at all — the bot's own withdraw flow notifies separately.)
+            # This is the ONLY unambiguous deposit signal: wrapping funds REMOVES
+            # USDC from the EOA (balance goes down, never up), and opening/closing
+            # positions or resolutions move funds inside the deposit wallet — they
+            # never land on the EOA. So a rise in EOA stablecoin can ONLY be an
+            # external top-up, never an internal money move (wrap / enter / exit).
             eoa_stable = round(balances.get("usdc", 0.0) + balances.get("usdc_e", 0.0), 4)
             last_eoa_stable = float(user.get("balance_usdc") or 0.0)
             is_new_deposit = eoa_stable >= DEPOSIT_MIN and eoa_stable > last_eoa_stable + DEPOSIT_MIN
+            deposit_amt = round(eoa_stable - last_eoa_stable, 2) if eoa_stable > last_eoa_stable else eoa_stable
 
             # Auto-fund: convert EOA USDC -> pUSD and sweep into the deposit wallet.
+            # Runs independently of the deposit notification below.
             moved = 0.0
             if dw and eoa_stable >= 1.0 and has_pol and has_key:
                 try:
                     from core.polygon import fund_deposit_wallet
                     moved = fund_deposit_wallet(user["wallet_private_key_enc"], addr, dw)
-                    if moved >= 1.0:
-                        _notify_wrapped(user["telegram_id"], moved)
-                        notified += 1
                 except Exception:
                     log.warning("auto_fund_failed", user_id=user["id"])
 
-            # If we couldn't auto-fund a fresh deposit (no POL / no wallet yet),
-            # tell the user what to do — but only once per new deposit.
-            if is_new_deposit and moved < 1.0:
-                _notify_deposit(user["telegram_id"], eoa_stable, eoa_stable, has_pol, bool(dw))
+            # Notify. A fresh deposit ALWAYS gets a confirmation (even when it was
+            # auto-wrapped in the same cycle — that's the case the user kept missing
+            # because they have POL, so auto-fund always succeeded and silently
+            # swallowed the deposit message).
+            if is_new_deposit:
+                _notify_deposit(
+                    user["telegram_id"], eoa_stable, deposit_amt,
+                    has_pol, bool(dw), auto_moved=moved,
+                )
+                notified += 1
+            elif moved >= 1.0:
+                # Previously-stuck funds (e.g. POL arrived later) finally moved —
+                # no new deposit, just confirm they're now tradable.
+                _notify_wrapped(user["telegram_id"], moved)
                 notified += 1
 
             # Store the post-action EOA stablecoin balance as the new baseline.
@@ -104,12 +114,24 @@ def _notify_wrapped(telegram_id: int, amount: float) -> None:
 
 
 def _notify_deposit(telegram_id: int, new_balance: float, amount: float,
-                    has_pol: bool = True, has_dw: bool = True) -> None:
+                    has_pol: bool = True, has_dw: bool = True,
+                    auto_moved: float = 0.0) -> None:
     from telegram import Bot
     from core.config import settings
 
     async def _send() -> None:
         bot = Bot(token=settings.telegram_bot_token)
+
+        if auto_moved >= 1.0:
+            # Deposit landed AND was already converted to pUSD this cycle.
+            text = (
+                f"💚 <b>Пополнение получено!</b>\n\n"
+                f"➕ <b>+${amount:.2f} USDC</b>\n\n"
+                f"♻️ <b>${auto_moved:.2f}</b> переведены в торговый баланс (pUSD).\n"
+                f"▶️ PolyMind копирует сделки!"
+            )
+            await bot.send_message(chat_id=telegram_id, text=text, parse_mode="HTML")
+            return
 
         if not has_dw:
             # Wallet not registered yet — guide to /register first
