@@ -12,10 +12,12 @@ import structlog
 log = structlog.get_logger(__name__)
 
 LB_URL = "https://lb-api.polymarket.com/profit"
+VOL_URL = "https://lb-api.polymarket.com/volume"
 _H = {"User-Agent": "Mozilla/5.0 (PolyMind)"}
 PROFILE_URL = "https://polymarket.com/profile/{addr}"
 
 _cache: dict[str, tuple[float, list]] = {}
+_vol_cache: dict[str, tuple[float, list]] = {}
 _TTL = 300  # 5 min
 
 
@@ -43,6 +45,48 @@ def top_profit_wallets(window: str = "7d", limit: int = 50) -> list[dict]:
         return cached[1] if cached else []
     _cache[window] = (time.time(), out)
     return out
+
+
+def top_volume_wallets(window: str = "7d", limit: int = 50) -> list[dict]:
+    """[{wallet, volume, name}] sorted by traded volume desc. Cached 5 min.
+
+    The board caps at ~top-50 per window (offset is ignored upstream), which is
+    exactly where market makers live — they trade enormous volume. Used to
+    cross-reference profit: a high-profit wallet with a low profit/volume ratio
+    is an MM/churner, not a directional bettor worth copying.
+    """
+    cached = _vol_cache.get(window)
+    if cached and (time.time() - cached[0]) < _TTL:
+        return cached[1]
+    import httpx
+    out: list[dict] = []
+    try:
+        r = httpx.get(VOL_URL, params={"window": window, "limit": limit}, headers=_H, timeout=15)
+        r.raise_for_status()
+        for row in r.json():
+            w = row.get("proxyWallet")
+            if not w:
+                continue
+            out.append({
+                "wallet": w,
+                "volume": float(row.get("amount") or 0),
+                "name": row.get("name") or row.get("pseudonym") or "",
+            })
+    except Exception:
+        log.warning("volume_board_fetch_failed", window=window)
+        return cached[1] if cached else []
+    _vol_cache[window] = (time.time(), out)
+    return out
+
+
+def volume_map(windows: tuple[str, ...] = ("7d", "30d")) -> dict[str, float]:
+    """{wallet_lower: max traded volume} across the given windows (cached)."""
+    vm: dict[str, float] = {}
+    for win in windows:
+        for w in top_volume_wallets(win, 500):
+            a = w["wallet"].lower()
+            vm[a] = max(vm.get(a, 0.0), w["volume"])
+    return vm
 
 
 def wallet_profit(addr: str, window: str = "7d") -> float | None:

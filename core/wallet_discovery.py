@@ -7,20 +7,25 @@ directional bettors. Used by both the CLI seeder and the admin `/refresh`
 command (weekly whitelist refresh).
 
 Heuristics that separate directional traders from arbitrage/hedge bots:
+  * profit/volume ratio — THE primary discriminator. Market makers/churners earn
+    big absolute profit only because they trade enormous volume (ratio ~1-4%);
+    directional bettors clear 10%+. Computed by cross-referencing the profit and
+    volume leaderboards (no per-wallet scraping). Empirically separates skk1ch /
+    swisstony (MMs, ~4%) from mintblade / fishalive / weatherman12 (14-68%).
   * avg profit per resolved market — arbitrageurs earn cents across thousands
     of markets; directional traders earn hundreds/thousands on conviction wins.
   * winrate — pure arbitrage/hedging sits near 0.95-1.0 (near-riskless);
     real directional edge lives around 0.5-0.9.
   * resolved_count — absurdly high counts signal industrial arbitrage.
   * recency — must be actively trading (last trade within a few days).
-  * liquidity rewards — wallets earning MAKER_REBATE / REWARD payouts are
-    market makers / LPs (farming the spread), never copy-worthy takers.
   * 30d consistency — must appear on the 30d profit board, not just a 7d spike.
 """
 
 import time
 
 import structlog
+
+from core.config import settings
 
 log = structlog.get_logger(__name__)
 
@@ -35,7 +40,18 @@ MIN_AVG_PER_MARKET = 120   # directional conviction, not cent-scalping ($)
 WINRATE_LO = 0.45
 WINRATE_HI = 0.90          # exclude near-riskless arb/hedge
 MAX_LAST_DAYS = 5          # must be trading recently
-MAX_REWARDS = 2            # >this liquidity rewards => market maker / LP
+MAX_REWARDS = 2            # liquidity rewards in feed => MM/LP (secondary signal)
+
+
+def _profit_volume_ratio(pnl: float, volume: float | None) -> float | None:
+    """Profit / traded-volume. None when we can't compute it (wallet not on the
+    volume board, or no known profit) — caller then falls back to other signals
+    rather than wrongly excluding a low-volume directional trader."""
+    if not volume or volume <= 0:
+        return None
+    if pnl <= 0:
+        return None
+    return pnl / volume
 
 
 def _activity_profile(addr: str) -> dict:
@@ -84,23 +100,33 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
         list_tracked_wallets,
         remove_tracked_wallet,
     )
-    from core.leaderboard import top_profit_wallets
+    from core.leaderboard import top_profit_wallets, volume_map
     from core.wallet_score import score_wallet
 
+    min_ratio = settings.discovery_min_profit_volume_ratio
     c30 = top_profit_wallets("30d", 150)
     c7 = top_profit_wallets("7d", 100)
+    vmap = volume_map(("7d", "30d"))  # {wallet: traded volume} for MM cross-ref
     # Require consistent 30d profitability — a wallet that spikes in 7d but is
     # absent from the 30d board is usually an MM/arb, not a durable edge.
     addrs30 = {w["wallet"].lower() for w in c30}
+    # Best (max) leaderboard profit per wallet, for the profit/volume ratio.
+    pnl_map: dict[str, float] = {}
     by_addr: dict[str, dict] = {}
     for w in c30 + c7:
-        by_addr.setdefault(w["wallet"].lower(), {"wallet": w["wallet"], "name": w["name"]})
+        a = w["wallet"].lower()
+        pnl_map[a] = max(pnl_map.get(a, 0.0), float(w.get("pnl") or 0))
+        by_addr.setdefault(a, {"wallet": w["wallet"], "name": w["name"]})
 
     existing = {w["address"].lower() for w in list_tracked_wallets()}
     qualified: list[dict] = []
 
     for addr, meta in by_addr.items():
         if addr not in addrs30:
+            continue
+        # Primary MM filter: high profit on huge volume = churner, not a bettor.
+        ratio = _profit_volume_ratio(pnl_map.get(addr, 0.0), vmap.get(addr))
+        if ratio is not None and ratio < min_ratio:
             continue
         s = score_wallet(addr)
         time.sleep(0.05)
@@ -121,6 +147,7 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
         qualified.append({
             "wallet": meta["wallet"], "name": meta["name"],
             "realized": realized, "winrate": winrate,
+            "ratio": ratio,
             "existing": addr in existing,
         })
 
@@ -141,7 +168,9 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
         added.append(p)
 
     # Hygiene: drop already-tracked wallets that turn out to be market makers /
-    # LPs (they collect MAKER_REBATE / liquidity rewards — never copy-worthy).
+    # churners — a low profit/volume ratio on the leaderboards is the giveaway
+    # (e.g. skk1ch / swisstony at ~4%). Falls back to the activity feed when the
+    # wallet isn't on the volume board.
     qualified_addrs = {p["wallet"].lower() for p in qualified}
     removed: list[dict] = []
     if add:
@@ -149,9 +178,13 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
             a = w["address"].lower()
             if a in qualified_addrs:
                 continue
-            prof = _activity_profile(a)
-            time.sleep(0.05)
-            if prof["is_mm"]:
+            ratio = _profit_volume_ratio(pnl_map.get(a, 0.0), vmap.get(a))
+            is_mm = ratio is not None and ratio < min_ratio
+            if not is_mm:
+                prof = _activity_profile(a)
+                time.sleep(0.05)
+                is_mm = prof["is_mm"]
+            if is_mm:
                 try:
                     remove_tracked_wallet(w["address"])
                     removed.append({"wallet": w["address"], "name": w.get("name") or ""})

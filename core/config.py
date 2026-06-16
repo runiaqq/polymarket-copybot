@@ -189,6 +189,11 @@ class Settings(BaseSettings):
     # Retries/delay to resolve the buyer via the Data API (handles indexing lag).
     wallet_resolve_retries: int = 4
     wallet_resolve_delay_sec: float = 1.0
+    # Whitelist discovery: minimum profit/volume ratio to qualify as a directional
+    # trader. Market makers/churners earn big absolute profit on huge volume (ratio
+    # ~1-4%); directional bettors clear 10%+. Validated: catches skk1ch/swisstony
+    # (MMs, ~4%) while keeping mintblade/fishalive/weatherman12 (14-68%).
+    discovery_min_profit_volume_ratio: float = 0.08
 
     # ── AI ───────────────────────────────────────────────────────────────────────
     # Risk score (1-10) at or above which the user gets a HIGH-RISK warning.
