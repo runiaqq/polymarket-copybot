@@ -225,6 +225,51 @@ def trade(token_id: str, price: float) -> None:
     print("ORDER RESPONSE:", resp)
 
 
+def inspectpos() -> None:
+    """Dump raw position data + on-chain ERC-1155 balances for redeemable wins.
+    Diagnostic: figure out where the neg-risk outcome tokens actually live."""
+    import httpx
+    from core.clob import CONDITIONAL_TOKENS
+
+    sb = get_supabase()
+    res = (sb.table("users").select("wallet_address,deposit_wallet_address")
+           .eq("telegram_id", settings.admin_telegram_id).maybe_single().execute())
+    row = res.data
+    dw = row["deposit_wallet_address"]
+    eoa = row["wallet_address"]
+    print("EOA:", eoa, "| Deposit wallet:", dw)
+
+    raw = httpx.get("https://data-api.polymarket.com/positions",
+                    params={"user": dw, "limit": 100}, timeout=15).json()
+    if not isinstance(raw, list):
+        raw = raw.get("data", []) if isinstance(raw, dict) else []
+
+    w3 = _w3()
+    bal_abi = [{"inputs": [{"name": "account", "type": "address"},
+                           {"name": "id", "type": "uint256"}],
+                "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
+                "stateMutability": "view", "type": "function"}]
+    ctf = w3.eth.contract(address=Web3.to_checksum_address(CONDITIONAL_TOKENS), abi=bal_abi)
+
+    for p in raw:
+        if float(p.get("size") or 0) <= 0:
+            continue
+        asset = str(p.get("asset", ""))
+        print("\n---", p.get("title", "")[:50], "·", p.get("outcome"))
+        print("  conditionId :", p.get("conditionId"))
+        print("  asset(token):", asset)
+        print("  size/cur/redeemable:", p.get("size"), p.get("curPrice"), p.get("redeemable"))
+        print("  negativeRisk:", p.get("negativeRisk"))
+        for label, who in (("DW", dw), ("EOA", eoa)):
+            try:
+                b = ctf.functions.balanceOf(Web3.to_checksum_address(who), int(asset)).call()
+                print(f"  CTF.balanceOf({label}) = {b}")
+            except Exception as exc:
+                print(f"  CTF.balanceOf({label}) FAILED: {exc}")
+        # full raw keys so we can spot any alternate token field
+        print("  raw keys:", sorted(p.keys()))
+
+
 def redeem() -> None:
     """Redeem all resolved winning positions for the admin user into pUSD."""
     from core.polymarket import get_positions
@@ -264,8 +309,8 @@ def redeem() -> None:
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "derive"
     {"derive": derive, "deploy": deploy, "approve": approve, "creds": creds,
-     "redeem": redeem}.get(cmd, lambda: None)() \
-        if cmd in ("derive", "deploy", "approve", "creds", "redeem") else (
+     "redeem": redeem, "inspectpos": inspectpos}.get(cmd, lambda: None)() \
+        if cmd in ("derive", "deploy", "approve", "creds", "redeem", "inspectpos") else (
             fund(float(sys.argv[2]) if len(sys.argv) > 2 else 2.0) if cmd == "fund"
             else trade(sys.argv[2], float(sys.argv[3])) if cmd == "trade"
             else print("usage: derive | deploy | fund <amt> | approve | creds | redeem | trade <token_id> <price>"))
