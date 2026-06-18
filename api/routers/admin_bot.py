@@ -480,10 +480,17 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
     if r.get("removed"):
-        lines.append("\n<b>Убраны (маркет-мейкеры / LP):</b>")
+        reason_lbl = {
+            "low_ratio": "ММ/арб",
+            "mm": "ММ/ликвидность",
+            "scattershot": "разбрасыватель",
+        }
+        lines.append("\n<b>Убраны:</b>")
         for p in r["removed"][:25]:
             name = f" · {p['name']}" if p.get("name") else ""
-            lines.append(f"🧹 <code>{_short_addr(p['wallet'])}</code>{name}")
+            why = reason_lbl.get(p.get("reason", ""), "")
+            why_txt = f" — {why}" if why else ""
+            lines.append(f"🧹 <code>{_short_addr(p['wallet'])}</code>{name}{why_txt}")
     if r["added"]:
         lines.append("\n<b>Новые кошельки:</b>")
         for p in r["added"][:25]:

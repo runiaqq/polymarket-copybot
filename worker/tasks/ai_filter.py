@@ -143,7 +143,7 @@ def run_ai_analysis(signal: dict, user_ids: list[int]) -> dict:
         f"{link_line}"
         f"{cta}"
     )
-    asyncio.get_event_loop().run_until_complete(_broadcast(filtered_users, msg))
+    asyncio.run(_broadcast(filtered_users, msg))
 
     return {"score": score, "verdict": verdict, "reason": reason, "notified": True}
 

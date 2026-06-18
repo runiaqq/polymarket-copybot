@@ -208,6 +208,10 @@ class Settings(BaseSettings):
     # D = 0.0 → perfectly hedged (equal YES/NO volume) → classic MM.
     # MMs score 0.0-0.3; real directional traders typically 0.7-1.0.
     discovery_min_directionality: float = 0.5
+    # Scattershot/hedge filter: max distinct markets a wallet may buy within a
+    # single event before it's flagged a gambler (e.g. betting every exact
+    # football score 1:0, 2:1, ...). 3+ outcomes in one event → excluded/removed.
+    discovery_max_event_outcomes: int = 3
 
     # ── AI ───────────────────────────────────────────────────────────────────────
     # Risk score (1-10) at or above which the user gets a HIGH-RISK warning.

@@ -23,7 +23,7 @@ def _notify(telegram_id: int, text: str) -> None:
         )
 
     try:
-        asyncio.get_event_loop().run_until_complete(_send())
+        asyncio.run(_send())
     except Exception:
         log.warning("walletop_notify_failed", telegram_id=telegram_id)
 

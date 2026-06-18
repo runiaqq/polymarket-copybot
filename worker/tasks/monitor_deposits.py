@@ -108,7 +108,7 @@ def _notify_wrapped(telegram_id: int, amount: float) -> None:
         )
 
     try:
-        asyncio.get_event_loop().run_until_complete(_send())
+        asyncio.run(_send())
     except Exception:
         log.exception("wrapped_notify_failed", telegram_id=telegram_id)
 
@@ -169,6 +169,6 @@ def _notify_deposit(telegram_id: int, new_balance: float, amount: float,
         await bot.send_message(chat_id=telegram_id, text=text, parse_mode="HTML")
 
     try:
-        asyncio.get_event_loop().run_until_complete(_send())
+        asyncio.run(_send())
     except Exception:
         log.exception("deposit_notify_failed", telegram_id=telegram_id)

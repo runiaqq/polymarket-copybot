@@ -330,7 +330,7 @@ def _notify_consensus(telegram_id: int, signal: dict, consensus: int) -> None:
         )
 
     try:
-        asyncio.get_event_loop().run_until_complete(_send())
+        asyncio.run(_send())
     except Exception:
         log.exception("notify_consensus_failed", telegram_id=telegram_id)
 
@@ -353,7 +353,7 @@ def _notify_not_registered(telegram_id: int) -> None:
         )
 
     try:
-        asyncio.get_event_loop().run_until_complete(_send())
+        asyncio.run(_send())
     except Exception:
         log.exception("notify_not_registered_failed", telegram_id=telegram_id)
 

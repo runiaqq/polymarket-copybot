@@ -79,7 +79,8 @@ def _activity_profile(addr: str) -> dict:
             rows = rows.get("data", [])
     except Exception:
         return {"last_days": 999.0, "is_mm": False, "trades": 0,
-                "trades_per_day": 0.0, "avg_size": 0.0}
+                "trades_per_day": 0.0, "avg_size": 0.0,
+                "directionality": None, "max_event_outcomes": 0}
 
     now = time.time()
     first_ts = last_ts = 0
@@ -90,6 +91,10 @@ def _activity_profile(addr: str) -> dict:
     # MMs score near 0 (equal YES/NO); directional traders score near 1.
     mkt_yes: dict[str, float] = {}
     mkt_no: dict[str, float] = {}
+    # Scattershot/hedge detection: distinct markets bought per event (slug).
+    # A wallet betting many mutually-exclusive outcomes of one event (e.g. every
+    # exact football score) is gambling/hedging — low EV, not worth copying.
+    evt_markets: dict[str, set[str]] = {}
 
     for a in rows:
         t = a.get("type")
@@ -112,6 +117,10 @@ def _activity_profile(addr: str) -> dict:
                         mkt_yes[mkt] = mkt_yes.get(mkt, 0.0) + size
                     elif "NO" in outcome:
                         mkt_no[mkt] = mkt_no.get(mkt, 0.0) + size
+                    # Group markets under their parent event for hedge detection.
+                    slug = a.get("eventSlug") or a.get("slug") or ""
+                    if slug:
+                        evt_markets.setdefault(slug, set()).add(mkt)
         elif t == "MAKER_REBATE":
             maker_rebate += 1
         elif t == "REWARD":
@@ -137,6 +146,9 @@ def _activity_profile(addr: str) -> dict:
             d_scores.append(abs(v_yes - v_no) / total)
     directionality = round(sum(d_scores) / len(d_scores), 3) if d_scores else None
 
+    # Most distinct markets the wallet bought within a single event.
+    max_event_outcomes = max((len(s) for s in evt_markets.values()), default=0)
+
     return {
         "last_days": round((now - last_ts) / 86400, 1) if last_ts else 999.0,
         "is_mm": maker_rebate > 0 or rewards > MAX_REWARDS,
@@ -144,6 +156,7 @@ def _activity_profile(addr: str) -> dict:
         "trades_per_day": round(trades_per_day, 1),
         "avg_size": round(avg_size, 1),
         "directionality": directionality,
+        "max_event_outcomes": max_event_outcomes,
     }
 
 
@@ -222,6 +235,13 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
             log.debug("discovery_skip_directionality",
                       addr=addr[:10], directionality=d)
             continue
+        # Scattershot/hedge filter: betting many mutually-exclusive outcomes of
+        # one event (e.g. every exact football score) is a low-EV gamble.
+        max_evt = settings.discovery_max_event_outcomes
+        if prof["max_event_outcomes"] >= max_evt:
+            log.debug("discovery_skip_scattershot",
+                      addr=addr[:10], event_outcomes=prof["max_event_outcomes"])
+            continue
         qualified.append({
             "wallet": meta["wallet"], "name": meta["name"],
             "realized": pnl, "winrate": 0.0,
@@ -247,10 +267,11 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
         added.append(p)
 
     # Hygiene: drop already-tracked wallets that turn out to be market makers /
-    # churners — a low profit/volume ratio on the leaderboards is the giveaway
-    # (e.g. skk1ch / swisstony at ~4%). Falls back to the activity feed when the
-    # wallet isn't on the volume board.
+    # churners (low profit/volume ratio, e.g. skk1ch / swisstony at ~4%) or
+    # scattershot/hedge bettors (many outcomes in one event). Falls back to the
+    # activity feed when the wallet isn't on the volume board.
     qualified_addrs = {p["wallet"].lower() for p in qualified}
+    max_evt = settings.discovery_max_event_outcomes
     removed: list[dict] = []
     if add:
         for w in list_tracked_wallets():
@@ -258,15 +279,20 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
             if a in qualified_addrs:
                 continue
             ratio = _profit_volume_ratio(pnl_map.get(a, 0.0), vmap.get(a))
-            is_mm = ratio is not None and ratio < min_ratio
-            if not is_mm:
+            bad = ratio is not None and ratio < min_ratio
+            reason = "low_ratio" if bad else ""
+            if not bad:
                 prof = _activity_profile(a)
                 time.sleep(0.05)
-                is_mm = prof["is_mm"]
-            if is_mm:
+                if prof["is_mm"]:
+                    bad, reason = True, "mm"
+                elif prof["max_event_outcomes"] >= max_evt:
+                    bad, reason = True, "scattershot"
+            if bad:
                 try:
                     remove_tracked_wallet(w["address"])
-                    removed.append({"wallet": w["address"], "name": w.get("name") or ""})
+                    removed.append({"wallet": w["address"], "name": w.get("name") or "",
+                                    "reason": reason})
                 except Exception:
                     log.warning("prune_remove_failed", wallet=w["address"])
 

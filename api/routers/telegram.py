@@ -557,16 +557,31 @@ def _trading_wallet(db_user: dict) -> str | None:
     return db_user.get("deposit_wallet_address") or db_user.get("wallet_address")
 
 
+def _is_dead_loss(p: dict) -> bool:
+    """A resolved-and-lost position: market settled (redeemable) but this outcome
+    is worth ~$0. It can never be sold (no bid) and clutters the active view —
+    the loss is already reported via the resolution notification."""
+    return bool(p.get("redeemable")) and float(p.get("cur_price") or 0) < 0.05
+
+
+def _live_positions(wallet: str | None) -> list[dict]:
+    """Open positions the user still has real exposure to (excludes settled losses)."""
+    if not wallet:
+        return []
+    try:
+        from core.polymarket import get_positions
+        return [
+            p for p in get_positions(wallet)
+            if p["shares"] > 0 and not _is_dead_loss(p)
+        ]
+    except Exception:
+        return []
+
+
 def _build_positions(db_user: dict, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, InlineKeyboardMarkup]:
     """Render live positions (real P&L from data-api) with per-position close buttons."""
     wallet = _trading_wallet(db_user)
-    positions = []
-    if wallet:
-        try:
-            from core.polymarket import get_positions
-            positions = [p for p in get_positions(wallet) if p["shares"] > 0]
-        except Exception:
-            positions = []
+    positions = _live_positions(wallet)
 
     # Cache token_ids for the close-by-index callback (callback_data is 64-byte capped).
     context.user_data["pos_cache"] = [p["token_id"] for p in positions]
@@ -639,8 +654,8 @@ def _build_pnl(db_user: dict, period: str = "day") -> str:
     open_pos, closed = [], []
     if wallet:
         try:
-            from core.polymarket import get_closed_positions, get_positions
-            open_pos = [p for p in get_positions(wallet) if p["shares"] > 0]
+            from core.polymarket import get_closed_positions
+            open_pos = _live_positions(wallet)
             closed = get_closed_positions(wallet)
         except Exception:
             pass
