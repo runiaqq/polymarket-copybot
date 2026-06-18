@@ -367,15 +367,21 @@ def redeem() -> None:
         outcome = p.get("outcome") or ""
         idx = int(p.get("outcomeIndex")) if p.get("outcomeIndex") is not None else (
             0 if outcome.strip().lower().startswith("yes") else 1)
-        print(f"Redeeming: {str(p.get('title',''))[:40]} · {outcome} · "
-              f"neg_risk={p.get('negativeRisk')} idx={idx}")
-        try:
-            r = redeem_winnings(pk_enc, p["conditionId"], bool(p.get("negativeRisk")),
-                                idx, p["asset"])
-            print("  ->", r)
-        except Exception as exc:
-            print("  FAILED:", exc)
-    time.sleep(5)
+        print(f"Redeeming: {str(p.get('title',''))[:40]} · {outcome} · idx={idx}")
+        # The relayer allows one in-flight action per wallet → serialise w/ retry.
+        for attempt in range(6):
+            try:
+                r = redeem_winnings(pk_enc, p["conditionId"], bool(p.get("negativeRisk")),
+                                    idx, p["asset"])
+                print("  ->", r)
+                break
+            except Exception as exc:
+                if "wallet busy" in str(exc).lower() and attempt < 5:
+                    time.sleep(8)
+                    continue
+                print("  FAILED:", exc)
+                break
+        time.sleep(8)  # let the relayer clear the action lock before the next redeem
     print("pUSD after:", get_balances(dw).get("pusd"))
 
 

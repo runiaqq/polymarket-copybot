@@ -123,20 +123,56 @@ def set_trading_approvals(private_key_enc: str) -> dict:
     return {"deposit_wallet": dw, "approved": True, "tx": resp.get("transactionHash")}
 
 
-_CTF_BALANCE_ABI = [{
-    "inputs": [{"name": "account", "type": "address"}, {"name": "id", "type": "uint256"}],
-    "name": "balanceOf",
-    "outputs": [{"name": "", "type": "uint256"}],
-    "stateMutability": "view", "type": "function",
-}]
+_CTF_ABI = [
+    {"inputs": [{"name": "account", "type": "address"}, {"name": "id", "type": "uint256"}],
+     "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "parentCollectionId", "type": "bytes32"},
+                {"name": "conditionId", "type": "bytes32"},
+                {"name": "indexSet", "type": "uint256"}],
+     "name": "getCollectionId", "outputs": [{"name": "", "type": "bytes32"}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "collateralToken", "type": "address"},
+                {"name": "collectionId", "type": "bytes32"}],
+     "name": "getPositionId", "outputs": [{"name": "", "type": "uint256"}],
+     "stateMutability": "view", "type": "function"},
+]
+
+# Binary CTF markets can be collateralized by different stables across versions.
+# We auto-detect which one matches the held token id.
+USDC_BRIDGED = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e
+USDC_NATIVE  = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"   # native USDC
+
+_wcol_cache: str | None = None
+
+
+def _ctf():
+    w3 = Web3(Web3.HTTPProvider(settings.polygon_rpc_url))
+    return w3.eth.contract(address=Web3.to_checksum_address(CONDITIONAL_TOKENS), abi=_CTF_ABI)
+
+
+def _wrapped_collateral() -> str | None:
+    """WrappedCollateral address the NegRiskAdapter uses for neg-risk positions."""
+    global _wcol_cache
+    if _wcol_cache is not None:
+        return _wcol_cache
+    w3 = Web3(Web3.HTTPProvider(settings.polygon_rpc_url))
+    for fn in ("wcol", "getWrappedCollateral", "wrappedCollateral"):
+        try:
+            ad = w3.eth.contract(
+                address=Web3.to_checksum_address(NEG_RISK_ADAPTER),
+                abi=[{"inputs": [], "name": fn, "outputs": [{"name": "", "type": "address"}],
+                      "stateMutability": "view", "type": "function"}])
+            _wcol_cache = getattr(ad.functions, fn)().call()
+            return _wcol_cache
+        except Exception:
+            continue
+    return None
 
 
 def ctf_token_balance(deposit_wallet: str, token_id: str) -> int:
     """Raw ERC-1155 outcome-token balance held by the deposit wallet."""
-    w3 = Web3(Web3.HTTPProvider(settings.polygon_rpc_url))
-    ctf = w3.eth.contract(address=Web3.to_checksum_address(CONDITIONAL_TOKENS),
-                          abi=_CTF_BALANCE_ABI)
-    return int(ctf.functions.balanceOf(
+    return int(_ctf().functions.balanceOf(
         Web3.to_checksum_address(deposit_wallet), int(token_id)).call())
 
 
@@ -144,37 +180,64 @@ def redeem_winnings(private_key_enc: str, condition_id: str, neg_risk: bool,
                     outcome_index: int, token_id: str) -> dict:
     """Redeem a resolved winning position into pUSD on the deposit wallet (gasless).
 
-    * neg-risk markets  → NegRiskAdapter.redeemPositions(conditionId, amounts)
-    * binary markets    → ConditionalTokens.redeemPositions(pUSD, 0x0, conditionId, [1,2])
+    Auto-detects how the held outcome token is collateralized by matching the
+    on-chain positionId against candidate collaterals — this is bulletproof and
+    does NOT rely on the (often missing) `negativeRisk` API flag:
+      * WrappedCollateral match → neg-risk → NegRiskAdapter.redeemPositions
+      * stable (pUSD/USDC.e/USDC) match → binary → CTF.redeemPositions
 
-    Payout (pUSD) is sent to the deposit wallet (msg.sender). Idempotent: a second
-    call after the tokens are already burned simply redeems nothing.
+    Payout lands in the deposit wallet (msg.sender). Idempotent: once the tokens
+    are burned a repeat call redeems nothing.
     """
     from py_builder_relayer_client.models import DepositWalletCall, TransactionType
 
     pk = decrypt_key(private_key_enc)
     c = _client(pk)
     dw = c.get_expected_deposit_wallet()
+    dw_cs = Web3.to_checksum_address(dw)
 
     cond = condition_id if condition_id.startswith("0x") else "0x" + condition_id
     cond_b = Web3.to_bytes(hexstr=cond)
+    asset_int = int(token_id)
+    idx = int(outcome_index)
 
-    if neg_risk:
-        bal = ctf_token_balance(dw, token_id)
+    ctf = _ctf()
+    coll_id = ctf.functions.getCollectionId(b"\x00" * 32, cond_b, 1 << idx).call()
+    wcol = _wrapped_collateral()
+
+    # 1) neg-risk: token is WrappedCollateral-collateralized.
+    if wcol and int(ctf.functions.getPositionId(
+            Web3.to_checksum_address(wcol), coll_id).call()) == asset_int:
+        bal = int(ctf.functions.balanceOf(dw_cs, asset_int).call())
         if bal <= 0:
             return {"skipped": True, "reason": "no_token_balance", "deposit_wallet": dw}
         amounts = [0, 0]
-        amounts[outcome_index] = bal
+        amounts[idx] = bal
         sel = Web3.keccak(text="redeemPositions(bytes32,uint256[])")[:4]
         data = "0x" + (sel + encode(["bytes32", "uint256[]"], [cond_b, amounts])).hex()
         target = NEG_RISK_ADAPTER
+        mode = "neg_risk"
     else:
+        # 2) binary: find the stable collateral whose positionId matches the token.
+        matched = None
+        for coll in (PUSD_ADDRESS, USDC_BRIDGED, USDC_NATIVE):
+            pid = int(ctf.functions.getPositionId(
+                Web3.to_checksum_address(coll), coll_id).call())
+            if pid == asset_int:
+                matched = coll
+                break
+        if not matched:
+            return {"skipped": True, "reason": "collateral_unmatched",
+                    "deposit_wallet": dw}
+        if int(ctf.functions.balanceOf(dw_cs, asset_int).call()) <= 0:
+            return {"skipped": True, "reason": "no_token_balance", "deposit_wallet": dw}
         sel = Web3.keccak(text="redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
         data = "0x" + (sel + encode(
             ["address", "bytes32", "bytes32", "uint256[]"],
-            [Web3.to_checksum_address(PUSD_ADDRESS), b"\x00" * 32, cond_b, [1, 2]],
+            [Web3.to_checksum_address(matched), b"\x00" * 32, cond_b, [1, 2]],
         )).hex()
         target = CONDITIONAL_TOKENS
+        mode = "binary"
 
     call = DepositWalletCall(target=Web3.to_checksum_address(target), value="0", data=data)
     nonce = str(c.get_nonce(c.signer.address(), TransactionType.WALLET.value)["nonce"])
@@ -184,9 +247,10 @@ def redeem_winnings(private_key_enc: str, condition_id: str, neg_risk: bool,
     ).wait()
     if not resp or resp.get("state") not in ("STATE_MINED", "STATE_CONFIRMED"):
         raise RuntimeError(f"redeem did not confirm: {resp}")
-    log.info("redeemed", dw=dw[:12], neg_risk=neg_risk,
+    log.info("redeemed", dw=dw[:12], mode=mode,
              tx=(resp.get("transactionHash") or "")[:14])
-    return {"deposit_wallet": dw, "tx": resp.get("transactionHash"), "redeemed": True}
+    return {"deposit_wallet": dw, "tx": resp.get("transactionHash"),
+            "redeemed": True, "mode": mode}
 
 
 def transfer_from_deposit_wallet(private_key_enc: str, to_address: str, raw_amount: int) -> dict:
