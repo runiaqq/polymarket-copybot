@@ -229,45 +229,92 @@ def inspectpos() -> None:
     """Dump raw position data + on-chain ERC-1155 balances for redeemable wins.
     Diagnostic: figure out where the neg-risk outcome tokens actually live."""
     import httpx
-    from core.clob import CONDITIONAL_TOKENS
+    from core.clob import CONDITIONAL_TOKENS, NEG_RISK_ADAPTER
 
     sb = get_supabase()
     res = (sb.table("users").select("wallet_address,deposit_wallet_address")
            .eq("telegram_id", settings.admin_telegram_id).maybe_single().execute())
     row = res.data
-    dw = row["deposit_wallet_address"]
-    eoa = row["wallet_address"]
+    dw = Web3.to_checksum_address(row["deposit_wallet_address"])
+    eoa = Web3.to_checksum_address(row["wallet_address"])
     print("EOA:", eoa, "| Deposit wallet:", dw)
 
-    raw = httpx.get("https://data-api.polymarket.com/positions",
-                    params={"user": dw, "limit": 100}, timeout=15).json()
-    if not isinstance(raw, list):
-        raw = raw.get("data", []) if isinstance(raw, dict) else []
-
     w3 = _w3()
-    bal_abi = [{"inputs": [{"name": "account", "type": "address"},
-                           {"name": "id", "type": "uint256"}],
-                "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
-                "stateMutability": "view", "type": "function"}]
-    ctf = w3.eth.contract(address=Web3.to_checksum_address(CONDITIONAL_TOKENS), abi=bal_abi)
+    ctf_abi = [
+        {"inputs": [{"name": "account", "type": "address"}, {"name": "id", "type": "uint256"}],
+         "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
+         "stateMutability": "view", "type": "function"},
+        {"inputs": [{"name": "parentCollectionId", "type": "bytes32"},
+                    {"name": "conditionId", "type": "bytes32"},
+                    {"name": "indexSet", "type": "uint256"}],
+         "name": "getCollectionId", "outputs": [{"name": "", "type": "bytes32"}],
+         "stateMutability": "view", "type": "function"},
+        {"inputs": [{"name": "collateralToken", "type": "address"},
+                    {"name": "collectionId", "type": "bytes32"}],
+         "name": "getPositionId", "outputs": [{"name": "", "type": "uint256"}],
+         "stateMutability": "view", "type": "function"},
+    ]
+    ctf = w3.eth.contract(address=Web3.to_checksum_address(CONDITIONAL_TOKENS), abi=ctf_abi)
 
-    for p in raw:
-        if float(p.get("size") or 0) <= 0:
+    # WrappedCollateral used by the NegRiskAdapter for neg-risk positions.
+    wcol = None
+    for fn in ("wcol", "getWrappedCollateral", "wrappedCollateral"):
+        try:
+            adapter = w3.eth.contract(
+                address=Web3.to_checksum_address(NEG_RISK_ADAPTER),
+                abi=[{"inputs": [], "name": fn, "outputs": [{"name": "", "type": "address"}],
+                      "stateMutability": "view", "type": "function"}])
+            wcol = getattr(adapter.functions, fn)().call()
+            print(f"NegRiskAdapter.{fn}() = {wcol}")
+            break
+        except Exception:
             continue
+    if not wcol:
+        print("Could not read WrappedCollateral address from NegRiskAdapter")
+
+    def _bal(who, tid):
+        try:
+            return ctf.functions.balanceOf(who, int(tid)).call()
+        except Exception as exc:
+            return f"ERR {exc}"
+
+    def _probe(p, kind):
         asset = str(p.get("asset", ""))
-        print("\n---", p.get("title", "")[:50], "·", p.get("outcome"))
-        print("  conditionId :", p.get("conditionId"))
+        cond = p.get("conditionId", "")
+        neg = p.get("negativeRisk")
+        oidx = p.get("outcomeIndex")
+        print(f"\n--- [{kind}] {str(p.get('title',''))[:50]} · {p.get('outcome')}")
+        print("  conditionId :", cond)
         print("  asset(token):", asset)
-        print("  size/cur/redeemable:", p.get("size"), p.get("curPrice"), p.get("redeemable"))
-        print("  negativeRisk:", p.get("negativeRisk"))
-        for label, who in (("DW", dw), ("EOA", eoa)):
+        print("  size/cur/redeemable/mergeable:",
+              p.get("size"), p.get("curPrice"), p.get("redeemable"), p.get("mergeable"))
+        print("  negativeRisk/outcomeIndex:", neg, oidx)
+        print(f"  CTF.balanceOf(DW, asset)  = {_bal(dw, asset)}")
+        print(f"  CTF.balanceOf(EOA, asset) = {_bal(eoa, asset)}")
+        # Derive candidate positionIds for the held outcome under pUSD vs WCOL.
+        if cond and oidx is not None:
             try:
-                b = ctf.functions.balanceOf(Web3.to_checksum_address(who), int(asset)).call()
-                print(f"  CTF.balanceOf({label}) = {b}")
+                idx_set = 1 << int(oidx)
+                coll = ctf.functions.getCollectionId(b"\x00" * 32, Web3.to_bytes(hexstr=cond), idx_set).call()
+                for clabel, caddr in (("pUSD", PUSD_ADDRESS), ("WCOL", wcol)):
+                    if not caddr:
+                        continue
+                    pid = ctf.functions.getPositionId(Web3.to_checksum_address(caddr), coll).call()
+                    print(f"  posId[{clabel}] = {pid}")
+                    print(f"    balanceOf(DW)  = {_bal(dw, pid)}")
             except Exception as exc:
-                print(f"  CTF.balanceOf({label}) FAILED: {exc}")
-        # full raw keys so we can spot any alternate token field
-        print("  raw keys:", sorted(p.keys()))
+                print("  positionId derivation FAILED:", exc)
+
+    for url, kind in (("positions", "OPEN"), ("closed-positions", "CLOSED")):
+        raw = httpx.get(f"https://data-api.polymarket.com/{url}",
+                        params={"user": dw, "limit": 100}, timeout=15).json()
+        if not isinstance(raw, list):
+            raw = raw.get("data", []) if isinstance(raw, dict) else []
+        for p in raw:
+            if abs(float(p.get("size") or 0)) <= 0 and kind == "OPEN":
+                continue
+            # focus on neg-risk or recently-resolved entries
+            _probe(p, kind)
 
 
 def redeem() -> None:
