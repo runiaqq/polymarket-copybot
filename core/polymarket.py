@@ -345,6 +345,7 @@ def get_positions(wallet_address: str) -> list[dict]:
                 "realized_pnl": float(p.get("realizedPnl") or 0),
                 "redeemable":   bool(p.get("redeemable", False)),
                 "neg_risk":     bool(p.get("negativeRisk", False)),
+                "outcome_index": p.get("outcomeIndex"),
                 "end_date":     p.get("endDate"),
                 "event_slug":   p.get("eventSlug") or p.get("slug"),
             })

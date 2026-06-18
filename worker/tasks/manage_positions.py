@@ -104,6 +104,7 @@ def sync_positions() -> dict:
                         uid, token_id, condition_id,
                         bool(p.get("neg_risk", False)), p.get("outcome"),
                         p.get("title"), p.get("event_slug"),
+                        p.get("outcome_index"),
                     )
                     actions += 1
                 continue
@@ -316,7 +317,8 @@ def close_position(self, user_id: int, token_id: str, reason: str = "manual") ->
 )
 def redeem_position(self, user_id: int, token_id: str, condition_id: str,
                     neg_risk: bool, outcome: str | None,
-                    title: str | None = None, event_slug: str | None = None) -> dict:
+                    title: str | None = None, event_slug: str | None = None,
+                    outcome_index: int | None = None) -> dict:
     """Redeem a resolved winning position into pUSD and notify the user."""
     from core.db import get_supabase
     from core.polygon import get_balances
@@ -331,8 +333,10 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
     if not dw:
         return {"skipped": True, "reason": "not_registered"}
 
-    # Polymarket convention: outcome index 0 = "Yes", 1 = "No".
-    outcome_index = 0 if str(outcome or "").strip().lower().startswith("yes") else 1
+    # Prefer the API's outcomeIndex; fall back to the name (0 = "Yes", 1 = "No").
+    if outcome_index is None:
+        outcome_index = 0 if str(outcome or "").strip().lower().startswith("yes") else 1
+    outcome_index = int(outcome_index)
     try:
         bal_before = get_balances(dw).get("pusd", 0.0)
         r = redeem_winnings(user["wallet_private_key_enc"], condition_id,

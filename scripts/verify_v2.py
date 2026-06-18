@@ -318,9 +318,10 @@ def inspectpos() -> None:
 
 
 def redeem() -> None:
-    """Redeem all resolved winning positions for the admin user into pUSD."""
-    from core.polymarket import get_positions
-    from core.relayer import redeem_winnings
+    """Redeem every resolved winning position that still has on-chain tokens
+    (open OR closed) for the admin user. Proves the redeem flow end-to-end."""
+    import httpx
+    from core.relayer import ctf_token_balance, redeem_winnings
 
     sb = get_supabase()
     res = (sb.table("users").select("wallet_private_key_enc,deposit_wallet_address")
@@ -333,19 +334,44 @@ def redeem() -> None:
 
     print("Deposit wallet:", dw)
     print("pUSD before:", get_balances(dw).get("pusd"))
-    positions = [p for p in get_positions(dw) if p["shares"] > 0 and p.get("redeemable")]
-    wins = [p for p in positions if float(p.get("cur_price") or 0) >= 0.5]
-    if not wins:
-        print("No redeemable winning positions.")
+
+    seen: set[str] = set()
+    candidates = []
+    for url in ("positions", "closed-positions"):
+        raw = httpx.get(f"https://data-api.polymarket.com/{url}",
+                        params={"user": dw, "limit": 100}, timeout=15).json()
+        if not isinstance(raw, list):
+            raw = raw.get("data", []) if isinstance(raw, dict) else []
+        for p in raw:
+            asset = str(p.get("asset", ""))
+            cond = p.get("conditionId", "")
+            if not asset or not cond or asset in seen:
+                continue
+            seen.add(asset)
+            # Won + still holding tokens on-chain → redeemable for real value.
+            if float(p.get("curPrice") or 0) < 0.98:
+                continue
+            try:
+                bal = ctf_token_balance(dw, asset)
+            except Exception:
+                bal = 0
+            if bal <= 0:
+                continue
+            candidates.append(p)
+
+    if not candidates:
+        print("No winning positions with on-chain tokens to redeem.")
         return
-    for p in wins:
+
+    for p in candidates:
         outcome = p.get("outcome") or ""
-        idx = 0 if outcome.strip().lower().startswith("yes") else 1
-        print(f"Redeeming: {p.get('title','')[:40]} · {outcome} · "
-              f"neg_risk={p.get('neg_risk')} shares={p['shares']}")
+        idx = int(p.get("outcomeIndex")) if p.get("outcomeIndex") is not None else (
+            0 if outcome.strip().lower().startswith("yes") else 1)
+        print(f"Redeeming: {str(p.get('title',''))[:40]} · {outcome} · "
+              f"neg_risk={p.get('negativeRisk')} idx={idx}")
         try:
-            r = redeem_winnings(pk_enc, p["condition_id"], bool(p.get("neg_risk")),
-                                idx, p["token_id"])
+            r = redeem_winnings(pk_enc, p["conditionId"], bool(p.get("negativeRisk")),
+                                idx, p["asset"])
             print("  ->", r)
         except Exception as exc:
             print("  FAILED:", exc)
