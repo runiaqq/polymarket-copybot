@@ -82,18 +82,29 @@ def sync_positions() -> dict:
             condition_id = p["condition_id"]
 
             if p.get("redeemable"):
+                # "redeemable" only means the market resolved — it does NOT mean
+                # we won. The losing outcome token is also redeemable (for $0).
+                # Decide win/loss by the resolved price (≈1 = won, ≈0 = lost).
+                cur = float(p.get("cur_price") or 0)
+                pnl = p.get("cash_pnl", 0)
+                won = cur >= 0.5
                 if _notify_once(f"settle:{uid}:{condition_id}"):
-                    # "redeemable" only means the market resolved — it does NOT mean
-                    # we won. The losing outcome token is also redeemable (for $0).
-                    # Decide win/loss by the resolved price (≈1 = won, ≈0 = lost).
-                    cur = float(p.get("cur_price") or 0)
-                    pnl = p.get("cash_pnl", 0)
-                    if cur >= 0.5:
+                    if won:
                         _emit_win(tg, p.get("title"), p.get("outcome"), pnl,
                                   claimable=True, event_slug=p.get("event_slug"))
                     else:
                         _emit_loss(tg, p.get("title"), p.get("outcome"), pnl,
                                    event_slug=p.get("event_slug"))
+                    actions += 1
+                # Auto-redeem winnings into pUSD (separate guard so a prior
+                # notification doesn't block the on-chain redeem).
+                if (won and settings.auto_redeem_enabled
+                        and _notify_once(f"redeem:{uid}:{condition_id}")):
+                    redeem_position.delay(
+                        uid, token_id, condition_id,
+                        bool(p.get("neg_risk", False)), p.get("outcome"),
+                        p.get("title"), p.get("event_slug"),
+                    )
                     actions += 1
                 continue
 
@@ -297,6 +308,57 @@ def close_position(self, user_id: int, token_id: str, reason: str = "manual") ->
         raise self.retry(exc=exc)
     finally:
         _closing.discard((user_id, token_id))
+
+
+@celery_app.task(
+    bind=True, name="worker.tasks.redeem_position", queue="trades", max_retries=2,
+    default_retry_delay=15,
+)
+def redeem_position(self, user_id: int, token_id: str, condition_id: str,
+                    neg_risk: bool, outcome: str | None,
+                    title: str | None = None, event_slug: str | None = None) -> dict:
+    """Redeem a resolved winning position into pUSD and notify the user."""
+    from core.db import get_supabase
+    from core.polygon import get_balances
+    from core.relayer import redeem_winnings
+
+    sb = get_supabase()
+    res = sb.table("users").select("*").eq("id", user_id).maybe_single().execute()
+    user = res.data if res else None
+    if not user or not user.get("wallet_private_key_enc"):
+        return {"skipped": True, "reason": "no_wallet"}
+    dw = user.get("deposit_wallet_address")
+    if not dw:
+        return {"skipped": True, "reason": "not_registered"}
+
+    # Polymarket convention: outcome index 0 = "Yes", 1 = "No".
+    outcome_index = 0 if str(outcome or "").strip().lower().startswith("yes") else 1
+    try:
+        bal_before = get_balances(dw).get("pusd", 0.0)
+        r = redeem_winnings(user["wallet_private_key_enc"], condition_id,
+                            bool(neg_risk), outcome_index, token_id)
+        if r.get("skipped"):
+            log.info("redeem_skipped", user_id=user_id, reason=r.get("reason"))
+            return r
+        import time as _t
+        _t.sleep(5)  # let payout settle to pUSD
+        bal_after = get_balances(dw).get("pusd", 0.0)
+        credited = max(0.0, bal_after - bal_before)
+        _notify(
+            user["telegram_id"],
+            f"💸 <b>Выигрыш зачислен</b>\n\n"
+            f"📌 {(title or '—')[:50]}\n"
+            f"🎯 Исход: <b>{outcome or '—'}</b>\n"
+            f"➕ Зачислено: <b>+${credited:.2f} pUSD</b>\n"
+            f"💼 Торговый баланс: <b>${bal_after:.2f} pUSD</b>"
+            f"{_event_link(event_slug)}",
+        )
+        log.info("redeem_done", user_id=user_id, credited=round(credited, 2),
+                 tx=(r.get("tx") or "")[:14])
+        return {"redeemed": True, "credited": credited}
+    except Exception as exc:
+        log.exception("redeem_failed", user_id=user_id, token=token_id[:14])
+        raise self.retry(exc=exc)
 
 
 # ── Notifications ────────────────────────────────────────────────────────────

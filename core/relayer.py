@@ -123,6 +123,72 @@ def set_trading_approvals(private_key_enc: str) -> dict:
     return {"deposit_wallet": dw, "approved": True, "tx": resp.get("transactionHash")}
 
 
+_CTF_BALANCE_ABI = [{
+    "inputs": [{"name": "account", "type": "address"}, {"name": "id", "type": "uint256"}],
+    "name": "balanceOf",
+    "outputs": [{"name": "", "type": "uint256"}],
+    "stateMutability": "view", "type": "function",
+}]
+
+
+def ctf_token_balance(deposit_wallet: str, token_id: str) -> int:
+    """Raw ERC-1155 outcome-token balance held by the deposit wallet."""
+    w3 = Web3(Web3.HTTPProvider(settings.polygon_rpc_url))
+    ctf = w3.eth.contract(address=Web3.to_checksum_address(CONDITIONAL_TOKENS),
+                          abi=_CTF_BALANCE_ABI)
+    return int(ctf.functions.balanceOf(
+        Web3.to_checksum_address(deposit_wallet), int(token_id)).call())
+
+
+def redeem_winnings(private_key_enc: str, condition_id: str, neg_risk: bool,
+                    outcome_index: int, token_id: str) -> dict:
+    """Redeem a resolved winning position into pUSD on the deposit wallet (gasless).
+
+    * neg-risk markets  → NegRiskAdapter.redeemPositions(conditionId, amounts)
+    * binary markets    → ConditionalTokens.redeemPositions(pUSD, 0x0, conditionId, [1,2])
+
+    Payout (pUSD) is sent to the deposit wallet (msg.sender). Idempotent: a second
+    call after the tokens are already burned simply redeems nothing.
+    """
+    from py_builder_relayer_client.models import DepositWalletCall, TransactionType
+
+    pk = decrypt_key(private_key_enc)
+    c = _client(pk)
+    dw = c.get_expected_deposit_wallet()
+
+    cond = condition_id if condition_id.startswith("0x") else "0x" + condition_id
+    cond_b = Web3.to_bytes(hexstr=cond)
+
+    if neg_risk:
+        bal = ctf_token_balance(dw, token_id)
+        if bal <= 0:
+            return {"skipped": True, "reason": "no_token_balance", "deposit_wallet": dw}
+        amounts = [0, 0]
+        amounts[outcome_index] = bal
+        sel = Web3.keccak(text="redeemPositions(bytes32,uint256[])")[:4]
+        data = "0x" + (sel + encode(["bytes32", "uint256[]"], [cond_b, amounts])).hex()
+        target = NEG_RISK_ADAPTER
+    else:
+        sel = Web3.keccak(text="redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
+        data = "0x" + (sel + encode(
+            ["address", "bytes32", "bytes32", "uint256[]"],
+            [Web3.to_checksum_address(PUSD_ADDRESS), b"\x00" * 32, cond_b, [1, 2]],
+        )).hex()
+        target = CONDITIONAL_TOKENS
+
+    call = DepositWalletCall(target=Web3.to_checksum_address(target), value="0", data=data)
+    nonce = str(c.get_nonce(c.signer.address(), TransactionType.WALLET.value)["nonce"])
+    resp = c.execute_deposit_wallet_batch(
+        calls=[call], wallet_address=dw, nonce=nonce,
+        deadline=str(int(time.time()) + 600),
+    ).wait()
+    if not resp or resp.get("state") not in ("STATE_MINED", "STATE_CONFIRMED"):
+        raise RuntimeError(f"redeem did not confirm: {resp}")
+    log.info("redeemed", dw=dw[:12], neg_risk=neg_risk,
+             tx=(resp.get("transactionHash") or "")[:14])
+    return {"deposit_wallet": dw, "tx": resp.get("transactionHash"), "redeemed": True}
+
+
 def transfer_from_deposit_wallet(private_key_enc: str, to_address: str, raw_amount: int) -> dict:
     """Move pUSD out of the deposit wallet (e.g. for withdrawals) via a gasless batch."""
     from py_builder_relayer_client.models import DepositWalletCall, TransactionType

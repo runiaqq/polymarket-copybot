@@ -138,9 +138,10 @@ class Settings(BaseSettings):
     # Only emit win/loss notices for settlements newer than this lookback (anti-spam
     # on restart). Settlements older than this are considered already handled.
     settlement_lookback_sec: int = 7200
-    # On-chain redemption after resolution. OFF by default — requires verifying the
-    # V2/pUSD collateral-adapter flow on a live wallet before enabling.
-    auto_redeem_enabled: bool = False
+    # On-chain redemption after resolution: converts winning outcome tokens back to
+    # pUSD on the deposit wallet (gasless via relayer). When ON, the bot credits
+    # winnings automatically; when OFF, the user must claim on Polymarket manually.
+    auto_redeem_enabled: bool = True
 
     # ── Legacy donor-copy / REST-scan knobs (optional) ──────────────────────────
     whale_min_usdc: float = 5000.0

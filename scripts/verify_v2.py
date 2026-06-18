@@ -225,10 +225,47 @@ def trade(token_id: str, price: float) -> None:
     print("ORDER RESPONSE:", resp)
 
 
+def redeem() -> None:
+    """Redeem all resolved winning positions for the admin user into pUSD."""
+    from core.polymarket import get_positions
+    from core.relayer import redeem_winnings
+
+    sb = get_supabase()
+    res = (sb.table("users").select("wallet_private_key_enc,deposit_wallet_address")
+           .eq("telegram_id", settings.admin_telegram_id).maybe_single().execute())
+    row = res.data
+    if not row or not row.get("deposit_wallet_address"):
+        raise SystemExit("No deposit wallet for admin user.")
+    dw = row["deposit_wallet_address"]
+    pk_enc = row["wallet_private_key_enc"]
+
+    print("Deposit wallet:", dw)
+    print("pUSD before:", get_balances(dw).get("pusd"))
+    positions = [p for p in get_positions(dw) if p["shares"] > 0 and p.get("redeemable")]
+    wins = [p for p in positions if float(p.get("cur_price") or 0) >= 0.5]
+    if not wins:
+        print("No redeemable winning positions.")
+        return
+    for p in wins:
+        outcome = p.get("outcome") or ""
+        idx = 0 if outcome.strip().lower().startswith("yes") else 1
+        print(f"Redeeming: {p.get('title','')[:40]} · {outcome} · "
+              f"neg_risk={p.get('neg_risk')} shares={p['shares']}")
+        try:
+            r = redeem_winnings(pk_enc, p["condition_id"], bool(p.get("neg_risk")),
+                                idx, p["token_id"])
+            print("  ->", r)
+        except Exception as exc:
+            print("  FAILED:", exc)
+    time.sleep(5)
+    print("pUSD after:", get_balances(dw).get("pusd"))
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "derive"
-    {"derive": derive, "deploy": deploy, "approve": approve, "creds": creds}.get(cmd, lambda: None)() \
-        if cmd in ("derive", "deploy", "approve", "creds") else (
+    {"derive": derive, "deploy": deploy, "approve": approve, "creds": creds,
+     "redeem": redeem}.get(cmd, lambda: None)() \
+        if cmd in ("derive", "deploy", "approve", "creds", "redeem") else (
             fund(float(sys.argv[2]) if len(sys.argv) > 2 else 2.0) if cmd == "fund"
             else trade(sys.argv[2], float(sys.argv[3])) if cmd == "trade"
-            else print("usage: derive | deploy | fund <amt> | approve | creds | trade <token_id> <price>"))
+            else print("usage: derive | deploy | fund <amt> | approve | creds | redeem | trade <token_id> <price>"))
