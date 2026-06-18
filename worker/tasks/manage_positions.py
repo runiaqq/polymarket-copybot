@@ -322,7 +322,7 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
     """Redeem a resolved winning position into pUSD and notify the user."""
     from core.db import get_supabase
     from core.polygon import get_balances
-    from core.relayer import redeem_winnings
+    from core.relayer import convert_dw_usdce_to_pusd, redeem_winnings
 
     sb = get_supabase()
     res = sb.table("users").select("*").eq("id", user_id).maybe_single().execute()
@@ -345,7 +345,13 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
             log.info("redeem_skipped", user_id=user_id, reason=r.get("reason"))
             return r
         import time as _t
-        _t.sleep(5)  # let payout settle to pUSD
+        _t.sleep(5)  # let the redeem settle (payout arrives as USDC.e)
+        # Redeem pays out USDC.e — wrap it into tradeable pUSD on the deposit wallet.
+        try:
+            convert_dw_usdce_to_pusd(user["wallet_private_key_enc"])
+            _t.sleep(4)
+        except Exception:
+            log.warning("post_redeem_wrap_failed", user_id=user_id)
         bal_after = get_balances(dw).get("pusd", 0.0)
         credited = max(0.0, bal_after - bal_before)
         _notify(

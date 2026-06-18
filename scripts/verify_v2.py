@@ -382,14 +382,37 @@ def redeem() -> None:
                 print("  FAILED:", exc)
                 break
         time.sleep(8)  # let the relayer clear the action lock before the next redeem
-    print("pUSD after:", get_balances(dw).get("pusd"))
+
+    # Redeem pays out USDC.e — wrap it into tradeable pUSD.
+    from core.relayer import convert_dw_usdce_to_pusd
+    try:
+        print("Wrapping USDC.e -> pUSD:", convert_dw_usdce_to_pusd(pk_enc))
+    except Exception as exc:
+        print("wrap FAILED:", exc)
+    time.sleep(5)
+    print("balances after:", get_balances(dw))
+
+
+def wrap_dw() -> None:
+    """Wrap any USDC.e in the deposit wallet into tradeable pUSD (gasless)."""
+    from core.relayer import convert_dw_usdce_to_pusd
+
+    sb = get_supabase()
+    res = (sb.table("users").select("wallet_private_key_enc,deposit_wallet_address")
+           .eq("telegram_id", settings.admin_telegram_id).maybe_single().execute())
+    row = res.data
+    dw = row["deposit_wallet_address"]
+    print("balances before:", get_balances(dw))
+    print("result:", convert_dw_usdce_to_pusd(row["wallet_private_key_enc"]))
+    time.sleep(5)
+    print("balances after:", get_balances(dw))
 
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "derive"
     {"derive": derive, "deploy": deploy, "approve": approve, "creds": creds,
-     "redeem": redeem, "inspectpos": inspectpos}.get(cmd, lambda: None)() \
-        if cmd in ("derive", "deploy", "approve", "creds", "redeem", "inspectpos") else (
+     "redeem": redeem, "inspectpos": inspectpos, "wrapdw": wrap_dw}.get(cmd, lambda: None)() \
+        if cmd in ("derive", "deploy", "approve", "creds", "redeem", "inspectpos", "wrapdw") else (
             fund(float(sys.argv[2]) if len(sys.argv) > 2 else 2.0) if cmd == "fund"
             else trade(sys.argv[2], float(sys.argv[3])) if cmd == "trade"
             else print("usage: derive | deploy | fund <amt> | approve | creds | redeem | trade <token_id> <price>"))

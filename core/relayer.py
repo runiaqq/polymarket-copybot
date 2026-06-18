@@ -253,6 +253,51 @@ def redeem_winnings(private_key_enc: str, condition_id: str, neg_risk: bool,
             "redeemed": True, "mode": mode}
 
 
+def convert_dw_usdce_to_pusd(private_key_enc: str) -> dict:
+    """Wrap any USDC.e sitting in the deposit wallet into tradeable pUSD (gasless).
+
+    Redeemed winnings arrive as USDC.e (binary markets and neg-risk WrappedCollateral
+    both settle to USDC.e). This makes them usable as trading collateral (pUSD).
+    """
+    from py_builder_relayer_client.models import DepositWalletCall, TransactionType
+    from core.polygon import COLLATERAL_ONRAMP
+
+    usdce = USDC_BRIDGED
+    pk = decrypt_key(private_key_enc)
+    c = _client(pk)
+    dw = c.get_expected_deposit_wallet()
+    dw_cs = Web3.to_checksum_address(dw)
+
+    w3 = Web3(Web3.HTTPProvider(settings.polygon_rpc_url))
+    erc20 = w3.eth.contract(address=Web3.to_checksum_address(usdce), abi=[{
+        "inputs": [{"name": "a", "type": "address"}], "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view", "type": "function"}])
+    bal = int(erc20.functions.balanceOf(dw_cs).call())
+    if bal <= 0:
+        return {"skipped": True, "reason": "no_usdce", "deposit_wallet": dw}
+
+    approve = DepositWalletCall(target=Web3.to_checksum_address(usdce), value="0",
+                               data=_approve_data(COLLATERAL_ONRAMP))
+    sel = Web3.keccak(text="wrap(address,address,uint256)")[:4]
+    wrap_data = "0x" + (sel + encode(
+        ["address", "address", "uint256"],
+        [Web3.to_checksum_address(usdce), dw_cs, bal])).hex()
+    wrap = DepositWalletCall(target=Web3.to_checksum_address(COLLATERAL_ONRAMP),
+                             value="0", data=wrap_data)
+
+    nonce = str(c.get_nonce(c.signer.address(), TransactionType.WALLET.value)["nonce"])
+    resp = c.execute_deposit_wallet_batch(
+        calls=[approve, wrap], wallet_address=dw, nonce=nonce,
+        deadline=str(int(time.time()) + 600),
+    ).wait()
+    if not resp or resp.get("state") not in ("STATE_MINED", "STATE_CONFIRMED"):
+        raise RuntimeError(f"usdce->pusd wrap did not confirm: {resp}")
+    log.info("dw_usdce_wrapped", dw=dw[:12], amount=round(bal / 1e6, 4),
+             tx=(resp.get("transactionHash") or "")[:14])
+    return {"wrapped": bal / 1e6, "tx": resp.get("transactionHash"), "deposit_wallet": dw}
+
+
 def transfer_from_deposit_wallet(private_key_enc: str, to_address: str, raw_amount: int) -> dict:
     """Move pUSD out of the deposit wallet (e.g. for withdrawals) via a gasless batch."""
     from py_builder_relayer_client.models import DepositWalletCall, TransactionType
