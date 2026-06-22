@@ -771,4 +771,109 @@ super-admin (`ADMIN_TELEGRAM_ID` from env) is always authorized regardless of th
 ### 6.10 Migration order
 
 `001` whale strategy → `002` access codes → `003` username → `004` admins → `005` deposit wallets →
-`006` wallet score → `007` tracked wallets → (planned) `008`–`010`.
+`006` wallet score → `007` tracked wallets → `008` settlement ledger → `009` tracked avg size →
+`010` risk controls.
+
+---
+
+## 7. Server & Deploy Guide
+
+### 7.1 Infrastructure
+
+| Component | Where |
+|---|---|
+| **VPS** | AWS EC2 — `ubuntu@ip-172-26-8-174` |
+| **Project root** | `/home/ubuntu/app` |
+| **Process manager** | Docker (plugin, `docker compose` without hyphen) |
+| **Redis** | container `app-redis-1` (redis:7-alpine, port 6379, internal only) |
+
+Running containers (check with `docker compose ps`):
+
+| Container | Image | Role |
+|---|---|---|
+| `app-api-1` | `app-api` | FastAPI (uvicorn), port 8000 → host |
+| `app-worker-1` | built image | Celery worker (gevent, queues: trades/ai/periodic) |
+| `app-beat-1` | `app-beat` | Celery beat scheduler — **must be exactly 1 replica** |
+| `app-redis-1` | redis:7-alpine | Broker + backend |
+
+### 7.2 Standard deploy (after `git push` from local)
+
+```bash
+# 1. SSH into the server
+ssh ubuntu@ip-172-26-8-174
+
+# 2. Pull latest code
+cd /home/ubuntu/app
+git pull origin master
+
+# 3. Apply any new migrations in Supabase SQL Editor (see §7.4)
+
+# 4. Rebuild images and restart containers
+docker compose build --no-cache api worker beat
+docker compose up -d api worker beat
+
+# 5. Verify
+docker compose ps
+docker compose logs --tail=50 worker
+docker compose logs --tail=50 beat
+```
+
+### 7.3 Quick restart (no code changes, just config / env)
+
+```bash
+cd /home/ubuntu/app
+docker compose restart api worker beat
+```
+
+### 7.4 Applying database migrations
+
+Migrations are plain idempotent SQL files in `migrations/`. They **must be applied manually**
+in the Supabase SQL Editor **before** restarting the worker, because new code may write to
+columns that don't exist yet.
+
+1. Open [supabase.com](https://supabase.com) → your project → **SQL Editor**.
+2. Copy-paste the contents of each new `migrations/00X_*.sql` file and click **Run**.
+3. Apply in order: `008` → `009` → `010` → …
+
+**Migrations applied as of the last deploy (2026-06-22):** 001–010.
+
+### 7.5 Useful diagnostic commands
+
+```bash
+cd /home/ubuntu/app
+
+# Tail live worker logs
+docker compose logs -f worker
+
+# Tail beat logs
+docker compose logs -f beat
+
+# Check all container health
+docker compose ps
+
+# Drop into a running worker shell (for one-off scripts)
+docker compose exec worker bash
+
+# Run a one-off Python script inside the worker context
+docker compose exec worker python scripts/seed_quality.py
+
+# Restart only the beat scheduler (e.g. after beat_schedule change)
+docker compose restart beat
+
+# Hard rebuild a single service
+docker compose build --no-cache worker
+docker compose up -d worker
+```
+
+### 7.6 Environment / secrets
+
+Secrets are in `.env` at the project root (not committed). After SSH-ing in:
+
+```bash
+cat /home/ubuntu/app/.env   # view current config
+nano /home/ubuntu/app/.env  # edit (then restart the affected containers)
+```
+
+Key variables to verify are set: `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `ENCRYPTION_KEY`,
+`TELEGRAM_BOT_TOKEN`, `POLYGON_RPC_URL`, `ALCHEMY_API_KEY`, `BUILDER_API_KEY`,
+`BUILDER_SECRET`, `BUILDER_PASSPHRASE`, `REDIS_URL`, `AUTO_COPY_ENABLED`.
