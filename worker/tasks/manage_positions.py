@@ -569,6 +569,129 @@ def reconcile_settlements() -> dict:
     return {"checked": len(trades), "processed": processed}
 
 
+# ── Blueprint 1 REMAINING GAP: backfill legacy positions ─────────────────────
+
+@celery_app.task(name="worker.tasks.backfill_legacy_redemptions", queue="periodic")
+def backfill_legacy_redemptions() -> dict:
+    """
+    Recover funds for positions opened **before** migration 008 was applied.
+
+    Those copy_trades rows have NULL condition_id/token_id, so reconcile_settlements
+    skips them entirely. This task goes directly to the Data API + on-chain state
+    to find resolved-won holdings that have not yet been redeemed, and dispatches
+    redeem_position for each one.
+
+    Also catches positions that Polymarket's own keeper already redeemed as USDC.e
+    on the deposit wallet — convert_dw_usdce_to_pusd handles those.
+
+    Safe to run repeatedly: deduped by Redis notify_once "redeem:{uid}:{cond}".
+    """
+    from core.db import get_supabase
+    from core.polymarket import get_positions, get_closed_positions
+    from core.relayer import is_condition_resolved, get_payout_numerator
+
+    sb = get_supabase()
+    # All users with deposit wallets (not just active subscribers — legacy funds
+    # can be recovered regardless of subscription status).
+    res = sb.table("users").select(
+        "id, telegram_id, wallet_private_key_enc, deposit_wallet_address"
+    ).not_.is_("deposit_wallet_address", "null").execute()
+    users = res.data or []
+
+    dispatched = 0
+    wrapped = 0
+
+    for user in users:
+        uid = user["id"]
+        dw = user.get("deposit_wallet_address")
+        if not dw or not user.get("wallet_private_key_enc"):
+            continue
+
+        # ── 1. Open positions: check if redeemable but not yet redeemed ──────
+        try:
+            positions = get_positions(dw)
+        except Exception:
+            log.warning("backfill_positions_failed", user_id=uid)
+            positions = []
+
+        for p in positions:
+            if p.get("shares", 0) <= 0:
+                continue
+            token_id = p.get("token_id")
+            condition_id = p.get("condition_id")
+            if not (token_id and condition_id):
+                continue
+
+            # Data API says redeemable — use existing fast path.
+            if p.get("redeemable"):
+                cur = float(p.get("cur_price") or 0)
+                if cur < 0.5:
+                    continue  # loss — nothing to redeem
+                if not notify_once(f"redeem:{uid}:{condition_id}"):
+                    continue
+                outcome_idx = p.get("outcome_index")
+                if outcome_idx is None:
+                    outcome_name = str(p.get("outcome") or "").strip().lower()
+                    outcome_idx = 0 if outcome_name.startswith("yes") else 1
+                redeem_position.delay(
+                    uid, token_id, condition_id,
+                    bool(p.get("neg_risk", False)),
+                    p.get("outcome"), p.get("title"), p.get("event_slug"),
+                    int(outcome_idx),
+                )
+                dispatched += 1
+                log.info("backfill_redeemable_dispatched", user_id=uid,
+                         cond=condition_id[:14])
+                continue
+
+            # Not marked redeemable by API — check on-chain directly (catches
+            # neg-risk positions that vanish from the Data API).
+            try:
+                if not is_condition_resolved(condition_id):
+                    continue
+                outcome_idx = p.get("outcome_index")
+                if outcome_idx is None:
+                    outcome_name = str(p.get("outcome") or "").strip().lower()
+                    outcome_idx = 0 if outcome_name.startswith("yes") else 1
+                won = get_payout_numerator(condition_id, int(outcome_idx)) > 0
+                if not won:
+                    continue
+                if not notify_once(f"redeem:{uid}:{condition_id}"):
+                    continue
+                redeem_position.delay(
+                    uid, token_id, condition_id,
+                    bool(p.get("neg_risk", False)),
+                    p.get("outcome"), p.get("title"), p.get("event_slug"),
+                    int(outcome_idx),
+                )
+                dispatched += 1
+                log.info("backfill_onchain_won_dispatched", user_id=uid,
+                         cond=condition_id[:14])
+            except Exception:
+                log.warning("backfill_onchain_check_failed", user_id=uid,
+                            cond=condition_id[:14])
+
+        # ── 2. Self-healing USDC.e sweep ──────────────────────────────────────
+        # If the deposit wallet holds USDC.e (e.g. already redeemed by Polymarket's
+        # keeper or a prior partial run), wrap it to pUSD so it becomes tradeable.
+        try:
+            from core.polygon import get_balances as _gb
+            dw_bals = _gb(dw)
+            if dw_bals.get("usdc_e", 0) >= 0.10:
+                from core.relayer import convert_dw_usdce_to_pusd
+                r = convert_dw_usdce_to_pusd(user["wallet_private_key_enc"])
+                if not r.get("skipped"):
+                    wrapped += 1
+                    log.info("backfill_usdc_e_wrapped", user_id=uid,
+                             amount=round(dw_bals["usdc_e"], 4))
+        except Exception:
+            log.warning("backfill_wrap_failed", user_id=uid)
+
+    log.info("backfill_legacy_redemptions_done",
+             users=len(users), dispatched=dispatched, wrapped=wrapped)
+    return {"users": len(users), "dispatched": dispatched, "wrapped": wrapped}
+
+
 def _resolve_user_for_notification(sb, uid: int, cond: str,
                                    won: bool, entry_cost: float) -> None:
     """Load the user record and send a win/loss notification."""

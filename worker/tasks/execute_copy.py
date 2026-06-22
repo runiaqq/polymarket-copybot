@@ -173,22 +173,27 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         equity = tradeable + open_value
         score = None
 
-    # BP3: below minimum balance, disable copying rather than placing dust trades.
-    if equity < settings.min_balance_usdc:
-        _notify_low_balance(
-            user["telegram_id"], tradeable, settings.min_balance_usdc, signal,
-            reason="min_balance",
-        )
-        log.warning("skip_below_min_balance", user_id=user_id,
-                    equity=round(equity, 2), min_balance=settings.min_balance_usdc)
-        return {"skipped": True, "reason": "below_min_balance"}
+    # ── BP3.1: soft balance warning — warn but never hard-block ─────────────
+    # A $3 wallet trades at the $1 platform minimum; we only skip when the wallet
+    # genuinely cannot afford even that minimum order.
+    exchange_min = settings.exchange_min_order_usdc
+    if equity < settings.recommended_min_balance_usdc:
+        from core.cache import notify_once as _no
+        if _no(f"trading_min:{user_id}", ttl=settings.lowbal_alert_throttle_sec):
+            _notify_trading_at_minimum(
+                user["telegram_id"], tradeable, settings.recommended_min_balance_usdc,
+            )
+        log.info("equity_below_recommended", user_id=user_id,
+                 equity=round(equity, 2),
+                 recommended=settings.recommended_min_balance_usdc)
 
-    if size_usdc < settings.min_order_usdc:
-        log.debug("skip_below_min", user_id=user_id, size=size_usdc)
-        return {"skipped": True, "reason": "below_min_size"}
+    # Floor size up to the exchange minimum so Kelly's tiny fractions still execute.
+    size_usdc = max(size_usdc, exchange_min)
+    # Never spend more than we actually have free.
+    size_usdc = min(size_usdc, tradeable)
 
     # ── Fund deposit wallet on demand if short ───────────────────────────────
-    if tradeable < size_usdc:
+    if tradeable < exchange_min:
         eoa = {}
         try:
             from core.polygon import get_balances as _gb
@@ -196,7 +201,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         except Exception:
             pass
         on_eoa = eoa.get("pusd", 0) + eoa.get("usdc_e", 0) + eoa.get("usdc", 0)
-        if (tradeable + on_eoa) >= size_usdc and on_eoa >= 0.5:
+        if on_eoa >= 0.5:
             try:
                 from core.polygon import fund_deposit_wallet
                 fund_deposit_wallet(
@@ -207,12 +212,16 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
                 tradeable = get_balances(deposit_wallet).get("pusd", 0)
             except Exception:
                 log.warning("ondemand_fund_failed", user_id=user_id)
-        if tradeable < size_usdc:
-            # BP2: throttled low-balance alert (at most once per 6h per user).
-            _notify_low_balance(user["telegram_id"], tradeable, size_usdc, signal)
-            log.warning("skip_low_balance", user_id=user_id,
-                        pusd=tradeable, needed=size_usdc)
-            return {"skipped": True, "reason": "low_balance"}
+
+    # Re-clamp after possible sweep.
+    size_usdc = min(max(size_usdc, exchange_min), tradeable)
+
+    # Only skip if the wallet genuinely cannot afford the platform minimum.
+    if tradeable < exchange_min:
+        _notify_low_balance(user["telegram_id"], tradeable, exchange_min, signal)
+        log.warning("skip_insufficient_for_min_order", user_id=user_id,
+                    pusd=round(tradeable, 4), min_order=exchange_min)
+        return {"skipped": True, "reason": "insufficient_for_min_order"}
 
     # ── Portfolio guards: already-in-market + max open positions ─────────────
     cond = signal.get("market_id")
@@ -276,9 +285,14 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     except Exception:
         log.warning("exec_book_check_failed", user_id=user_id)
 
-    if size_usdc < settings.min_order_usdc:
-        log.debug("skip_below_min_after_book", user_id=user_id, size=size_usdc)
-        return {"skipped": True, "reason": "below_min_after_book"}
+    # After book re-check, ensure we still meet the platform minimum.
+    # Also re-apply the exchange_min floor (book cap may have pushed below it).
+    size_usdc = max(size_usdc, exchange_min)
+    size_usdc = min(size_usdc, tradeable)
+    if size_usdc < exchange_min or tradeable < exchange_min:
+        log.debug("skip_depth_below_min", user_id=user_id,
+                  size=round(size_usdc, 4), exchange_min=exchange_min)
+        return {"skipped": True, "reason": "depth_below_min_order"}
 
     # ── BP4: tail-risk gates ─────────────────────────────────────────────────
     try:
@@ -558,6 +572,35 @@ def _notify_low_balance(
         asyncio.run(_send())
     except Exception:
         log.exception("notify_low_balance_failed", telegram_id=telegram_id)
+
+
+def _notify_trading_at_minimum(telegram_id: int, balance: float, recommended: float) -> None:
+    """
+    BP3.1: soft warning — balance below recommended, but we still trade at minimum.
+    Throttled via notify_once in the caller (once per lowbal_alert_throttle_sec).
+    """
+    from telegram import Bot
+    from core.config import settings
+
+    async def _send() -> None:
+        bot = Bot(token=settings.telegram_bot_token)
+        await bot.send_message(
+            chat_id=telegram_id,
+            text=(
+                f"⚠️ <b>Торгуем на минимальном объёме</b>\n\n"
+                f"💼 Баланс: <b>${balance:.2f} pUSD</b> "
+                f"(рекомендуется ≥ ${recommended:.0f})\n\n"
+                f"Бот продолжает копировать сделки, но использует минимально "
+                f"допустимый размер ордера.\n"
+                f"Пополни кошелёк через /wallet для нормального риск-менеджмента."
+            ),
+            parse_mode="HTML",
+        )
+
+    try:
+        asyncio.run(_send())
+    except Exception:
+        log.exception("notify_trading_at_minimum_failed", telegram_id=telegram_id)
 
 
 def _notify_risk_pause(telegram_id: int, reason: str) -> None:

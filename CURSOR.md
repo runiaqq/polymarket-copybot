@@ -217,6 +217,15 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   (`kelly_lambda=0.25`) → hard cap at `max_risk_per_trade=0.05` of equity. `sizing_mode="fixed"`
   reproduces the legacy flat-cap behaviour for instant rollback. Copying disabled below
   `min_balance_usdc=$100` to avoid dust trades eaten by fees.
+- **[BP3.1] Soft minimum-balance + minimum-order fallback**: removed the hard `$100` block.
+  Below `recommended_min_balance_usdc=$100` a throttled soft warning is sent and the bot trades
+  at the exchange minimum (`exchange_min_order_usdc=$1`). Copying is only skipped when
+  `free_pusd < $1` (cannot afford even the platform minimum). `_notify_trading_at_minimum`
+  replaces the old hard `below_min_balance` skip.
+- **[BP1-GAP] Backfill legacy redemptions** (`backfill_legacy_redemptions`, beat every 600s):
+  recovers funds for positions opened before migration 008 (NULL ledger fields). Enumerates
+  resolved-won holdings from the Data API and on-chain CTF contract, dispatches `redeem_position`
+  for each. Self-healing USDC.e sweep also added to `monitor_deposits` (every 120s).
 - **[BP4] Tail-risk portfolio controls** (`core/risk.py`): four pre-trade gates —
   aggregate exposure cap (60% of equity), per-event correlation cap (15% of equity), drawdown
   circuit breaker (25% drawdown from HWM → 24h pause), daily loss limit (10% of equity → pause
@@ -319,9 +328,75 @@ create index if not exists idx_copy_trades_open
   on copy_trades (status) where redeemed_at is null;
 ```
 
+#### Canonical `redeemPositions` reference (Problem 2 — read carefully, correct the misconceptions)
+
+The on-chain claim **is already implemented and verified on mainnet** (`core/relayer.redeem_winnings`,
+confirmed tx hashes, pUSD recovered). It is **NOT** a missing feature. Do **not** rewrite it from
+scratch or with ethers.js. The canonical flow below documents exactly how it works so future edits
+stay correct.
+
+**Three misconceptions to reject:**
+1. ❌ *"Send the tx from the user's wallet with ethers.js."* — Wrong stack and wrong signer. We use
+   **Python `web3.py`** and the user **EOA usually holds no POL for gas**. The claim is executed
+   **gaslessly** as a **relayer `DepositWalletCall` batch from the user's deposit wallet** (the
+   ERC-1967 proxy that actually holds the outcome tokens). See `relayer.execute_deposit_wallet_batch`.
+2. ❌ *"Listen to the `ConditionResolution` event."* — Event-log subscriptions miss events on restart
+   and need reorg handling. Our beat-driven architecture **polls on-chain state** instead:
+   `payoutDenominator(conditionId) > 0` ⟺ resolved. Idempotent, restart-safe, no missed events. (The
+   event may be added later only as an optional latency accelerator, never as the source of truth.)
+3. ❌ *"Plain CTF `redeemPositions` works for everything."* — **Neg-risk markets do not redeem through
+   the CTF directly.** They redeem through the **NegRiskAdapter**. `redeem_winnings` auto-detects which
+   by matching the held token's on-chain `positionId` (see below). Never trust the Data API
+   `negativeRisk` flag.
+
+**Contracts (import from `core/clob.py`, never hardcode):**
+| Constant | Address | Role |
+|---|---|---|
+| `CONDITIONAL_TOKENS` | `0x4D97DCd97eC945f40cF65F87097ACe5EA0476045` | CTF (binary redeem, payout reads, ERC-1155 balances) |
+| `NEG_RISK_ADAPTER` | `0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296` | neg-risk redeem + WrappedCollateral |
+| `PUSD_ADDRESS` | `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB` | V2 collateral |
+
+**Market-type detection (web3.py `eth_call`, no tx):** with `idx = 1 << outcome_index`,
+`collectionId = CTF.getCollectionId(0x00…00, conditionId, idx)`:
+- if `CTF.getPositionId(NegRiskAdapter.wcol(), collectionId) == held_token_id` → **neg-risk**;
+- elif `CTF.getPositionId(collateral, collectionId) == held_token_id` for `collateral ∈
+  {pUSD, USDC.e, USDC}` → **binary** with that collateral.
+
+**Claim calldata (encode with `eth_abi`, wrap in a `DepositWalletCall`, send via the relayer batch):**
+- **Binary:** `ConditionalTokens.redeemPositions(address collateralToken, bytes32 parentCollectionId,
+  bytes32 conditionId, uint256[] indexSets)` with `parentCollectionId = 0x00…00` and
+  `indexSets = [1, 2]`. The CTF burns the deposit wallet's outcome tokens and pays the collateral to
+  the deposit wallet (msg.sender).
+- **Neg-risk:** `NegRiskAdapter.redeemPositions(bytes32 conditionId, uint256[] amounts)` where
+  `amounts[outcome_index] = on-chain ERC-1155 balance of the held token` (read via
+  `CTF.balanceOf(dw, token_id)`), others `0`.
+- **Payout currency = USDC.e** (empirically confirmed for both paths). The flow then calls
+  `convert_dw_usdce_to_pusd` (CollateralOnramp `wrap`, also a gasless relayer batch) so the winnings
+  become tradeable pUSD. **This second step is mandatory — without it the balance "doesn't update".**
+
+**Approvals:** the deposit wallet must have `setApprovalForAll(NEG_RISK_ADAPTER, true)` on the CTF
+(done at registration in `relayer.set_trading_approvals`) and USDC.e `approve(CollateralOnramp)` (done
+inside `convert_dw_usdce_to_pusd`).
+
+**Serialization:** the relayer permits **one in-flight action per deposit wallet**. On
+`"wallet busy"`, retry with backoff (see `scripts/verify_v2.py redeem`). Manual recovery commands:
+`python scripts/verify_v2.py inspectpos | redeem | wrapdw`.
+
+**REMAINING GAP — ✅ IMPLEMENTED:**
+1. **Migration 008 must be applied** in the target DB (see §7.4).
+2. **Legacy positions (NULL ledger fields) — now recovered by `backfill_legacy_redemptions`**
+   (beat every 600s, `worker/tasks/manage_positions.py`): enumerates resolved-won holdings via
+   Data API (`get_positions(dw)`) and on-chain (`is_condition_resolved` + `get_payout_numerator`),
+   dispatches `redeem_position` for each winner not yet redeemed. Deduped by Redis.
+   Also self-heals stranded USDC.e on the deposit wallet (`convert_dw_usdce_to_pusd`).
+3. **Self-healing USDC.e sweep** also added to `monitor_deposits` (runs every 120s): wraps any
+   USDC.e ≥ $0.10 on the deposit wallet into tradeable pUSD opportunistically.
+4. **Deploy/rebuild**: the worker image must be rebuilt (`docker compose up -d --build worker`).
+
 **Acceptance:** a won position credits pUSD within ~2 min of on-chain resolution **even if it never
-appears as `redeemable` in the Data API**; no double-redeem; loss recorded with correct P&L; restart
-mid-flight resumes safely.
+appears as `redeemable` in the Data API**; legacy positions with NULL ledger fields are recovered by
+the backfill reconciler; no double-redeem; loss recorded with correct P&L; restart mid-flight resumes
+safely.
 
 ---
 
@@ -429,34 +504,24 @@ q_hat = min(p + edge_hat, 0.99)
 `wins` and `resolved_count` come from `core.wallet_score.score_wallet`; `consensus` is already on the
 signal. If the wallet is unscored (lag), use `edge_hat = base_edge * 0.5` (minimum trust).
 
-**Final stake (caps dominate):**
+**Final stake (caps dominate, with a minimum-order FLOOR — see Problem 1 below):**
 ```
 f_kelly = max((q_hat - p) / (1 - p), 0)
 f       = kelly_lambda * f_kelly                 # kelly_lambda = 0.25 (quarter-Kelly)
 f       = min(f, max_risk_per_trade)             # hard ceiling, e.g. 0.05 of equity
 stake   = f * equity(user)
 stake   = min(stake, user.max_position_usdc, depth_cap)   # existing depth/cap clamps stay
-stake   = 0 if (stake < min_order_usdc or free_pusd < stake or equity < min_balance)
+# Floor up to the exchange minimum so small accounts still trade (NOT a hard block):
+stake   = max(stake, exchange_min_order(market))          # see Problem 1
+stake   = min(stake, free_pusd)                           # never spend more than we have
+stake   = 0 only if free_pusd < exchange_min_order(market) OR depth < exchange_min_order(market)
 ```
 This **replaces** the flat `size_usdc = min(user_max, depth_cap)` in `execute_copy_trade`. Keep all
-existing depth/book-safety/price-band clamps; Kelly only sets the **upper** bound more intelligently.
+existing depth/book-safety/price-band clamps; Kelly sets the **upper** bound, the exchange minimum sets
+the **lower** bound.
 
-**Minimum balance — derived, not guessed.** Require that the smallest trade we'd place is meaningful
-and that risk-per-trade stays ≤ `max_risk_per_trade`:
-```
-min_balance = max(
-    min_order_usdc / max_risk_per_trade,   # so f_max·B ≥ exchange/effective min order
-    n_target_positions * min_order_usdc    # so equity can diversify across N concurrent bets
-)
-# with min_order_usdc = $5 (effective, fees+slippage make sub-$5 copies pointless),
-# max_risk_per_trade = 0.05, n_target = 5  →  min_balance = max($100, $25) = $100
-```
-Below `min_balance`, **disable copying** for that user with a clear one-time message (do not place
-dust trades that slippage/fees eat). Surface `min_balance` in onboarding and `/balance`.
-
-**Files:** `core/sizing.py` (new pure module: `kelly_stake(p, score, consensus, equity, free_pusd,
-cfg) -> float`, fully unit-testable, no I/O), `worker/tasks/execute_copy.py` (call it),
-`core/config.py` (knobs below). Keep it a **pure function** so it can be tested without the chain.
+**Files:** `core/sizing.py` (pure module: `kelly_stake(p, score, consensus, equity, free_pusd, cfg)
+-> float`, unit-testable, no I/O), `worker/tasks/execute_copy.py` (call it), `core/config.py` (knobs).
 
 **Config:**
 ```python
@@ -466,14 +531,83 @@ kelly_base_edge: float = 0.03       # edge for a fully-trusted single wallet
 kelly_edge_cap: float = 0.06        # absolute edge ceiling
 kelly_prior_strength: float = 10.0  # α=β for winrate shrinkage
 max_risk_per_trade: float = 0.05    # hard cap: ≤5% of equity per position
-min_order_usdc: float = 5.0
-min_balance_usdc: float = 100.0     # below this, copying disabled
+recommended_min_balance_usdc: float = 100.0  # SOFT target (warn only, never blocks)
+exchange_min_order_usdc: float = 1.0         # Polymarket platform floor (fallback size)
 n_target_positions: int = 5
 ```
 
 **Acceptance:** stake scales up with wallet quality/consensus and **down** as `p → 1` (favorites get
-small bets), never exceeds `max_risk_per_trade · equity`, never below `min_order_usdc`, and copying is
-disabled below `min_balance_usdc`. `sizing_mode="fixed"` reproduces current behavior for rollback.
+small bets), never exceeds `max_risk_per_trade · equity`. `sizing_mode="fixed"` reproduces legacy
+behavior for rollback. **(See Problem 1 below for small-balance behavior.)**
+
+---
+
+### Blueprint 3.1 — Soft minimum balance + minimum-order fallback ✅ IMPLEMENTED
+
+**Current bug:** `execute_copy_trade` does `if equity < settings.min_balance_usdc ($100): skip` and
+`if size_usdc < settings.min_order_usdc ($5): skip`. A real $3.06 wallet is **hard-blocked** and never
+trades. For a SaaS this silently breaks the product for small accounts.
+
+**Reject the hard block.** `$100` is a **risk-management recommendation**, not a gate. Below it we
+**still trade**, at the smallest valid Polymarket order, and **warn** the user to top up.
+
+**Polymarket minimum order size.** The CLOB enforces a per-market minimum. Use **`$1` USDC notional**
+as the platform floor, and prefer the market-specific value when available:
+```
+# /markets/{conditionId} → minimum_order_size (shares) and minimum_tick_size; the order book
+# (get_order_book) also exposes these. Notional floor for a BUY:
+exchange_min_order(market) = max(
+    exchange_min_order_usdc,                       # platform floor, default $1
+    minimum_order_size_shares * entry_price        # per-market share minimum × price, if known
+)
+```
+Round up to satisfy tick/size rules; if the market min can't be read, fall back to `$1`.
+
+**Fallback algorithm (replace the two hard `return skip` blocks):**
+```
+stake = kelly_or_fixed_stake(...)                 # may be tiny for a small account
+floor = exchange_min_order(market)
+
+# 1) SOFT recommendation: warn (throttled) when equity is below the recommended target,
+#    but DO NOT block.
+if equity < recommended_min_balance_usdc:
+    warn_once(user, "trading_min", ttl=6h,
+              text="⚠️ Баланс ниже рекомендованного. Торгуем на минималках — пополни баланс для нормального риск-менеджмента.")
+
+# 2) Size: respect Kelly/caps, but never below the exchange minimum.
+stake = max(stake, floor)
+stake = min(stake, free_pusd)                     # can't spend more than we have
+
+# 3) ONLY skip if we genuinely cannot place a valid order:
+if free_pusd < floor:
+    notify_low_balance_once(user, free_pusd, floor)   # throttled (BP2)
+    return skip("insufficient_for_min_order")
+if fillable_depth < floor:
+    return skip("depth_below_min_order")              # book too thin even for the minimum
+
+place_order(stake)                                    # otherwise: TRADE at the minimum
+```
+So a $3.06 wallet places a ~$1 order (capped by free balance), gets **one** "trading at minimum" warning,
+and keeps copying. It is only skipped when it can't afford even the $1 platform minimum.
+
+**Notes / guardrails:**
+- Keep `max_position_usdc` and depth caps as the **upper** bounds; this change only fixes the **lower**
+  bound. Risk gates (Blueprint 4: exposure %, drawdown) still apply and are percentage-based, so they
+  scale correctly for small accounts.
+- The "trading at minimum" warning and the "insufficient for minimum order" alert are **separate** and
+  both throttled via `notify_once` (BP2) so small accounts are not spammed.
+- Optional: at the very low end the bot can also auto-sweep the EOA (existing `fund_deposit_wallet`)
+  before deciding it's underfunded (already attempted in current code).
+
+**Files:** `worker/tasks/execute_copy.py` (remove the `below_min_balance` hard return and the flat
+`min_order_usdc` skip; implement the fallback above), `core/sizing.py` (add `exchange_min_order` helper
+or compute in the task from the book), `core/polymarket.py` (expose `minimum_order_size` from the
+market/book if not already), `core/config.py` (replace `min_balance_usdc`/`min_order_usdc` with
+`recommended_min_balance_usdc` + `exchange_min_order_usdc`).
+
+**Acceptance:** a $3.06 wallet trades at the ~$1 minimum and receives exactly one throttled
+"trading at minimum" warning; copying is skipped **only** when free pUSD or book depth is below the
+platform minimum order; large accounts are unaffected; no hard `$100` block remains anywhere.
 
 ---
 

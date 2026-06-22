@@ -55,6 +55,7 @@ celery_app.conf.update(
         "worker.tasks.run_ai_analysis": {"queue": "ai"},
         "worker.tasks.sync_positions": {"queue": "periodic"},
         "worker.tasks.reconcile_settlements": {"queue": "periodic"},
+        "worker.tasks.backfill_legacy_redemptions": {"queue": "periodic"},
         "worker.tasks.check_subscription_expiry": {"queue": "periodic"},
         "worker.tasks.scan_whale_trades": {"queue": "periodic"},
         "worker.tasks.poll_donor_trades": {"queue": "periodic"},
@@ -76,6 +77,14 @@ celery_app.conf.update(
         "reconcile-settlements": {
             "task": "worker.tasks.reconcile_settlements",
             "schedule": 120.0,
+        },
+        # BP1 GAP: backfill legacy positions (NULL ledger fields) and self-heal
+        # stranded USDC.e on deposit wallets.  Runs every 10 min — lightweight
+        # because it only acts on positions the Data API marks redeemable or that
+        # on-chain state confirms as won.
+        "backfill-legacy-redemptions": {
+            "task": "worker.tasks.backfill_legacy_redemptions",
+            "schedule": 600.0,
         },
         "monitor-deposits": {
             "task": "worker.tasks.monitor_deposits",

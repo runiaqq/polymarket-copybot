@@ -112,9 +112,9 @@ def poll_tracked_wallets() -> dict:
     wallets_with_activity = 0
 
     # ── Pre-fan-out balance check ─────────────────────────────────────────────
-    # Build a set of user_ids that have enough pUSD to be worth dispatching.
-    # Users below min_balance_usdc get a throttled nudge; we skip their dispatch
-    # entirely so we don't enqueue hundreds of doomed tasks per signal.
+    # Skip users who cannot afford even the exchange minimum order ($1).
+    # Users below the recommended balance get a soft warning but are NOT excluded —
+    # execute_copy_trade will floor their size to the exchange minimum.
     eligible_users: list[dict] = []
     for user in subscribers:
         dw = user.get("deposit_wallet_address")
@@ -125,13 +125,16 @@ def poll_tracked_wallets() -> dict:
             bal = _gb(dw).get("pusd", 0.0)
         except Exception:
             bal = 0.0
-        if bal < settings.min_balance_usdc:
-            _notify_low_balance_pre(user["telegram_id"], bal, settings.min_balance_usdc)
+        if bal < settings.exchange_min_order_usdc:
+            _notify_low_balance_pre(user["telegram_id"], bal, settings.recommended_min_balance_usdc)
             log.debug("pre_fanout_skip_lowbal", user_id=user["id"],
                       balance=round(bal, 2))
         else:
             eligible_users.append(user)
 
+    # All subscribers with any balance get dispatched; those below exchange_min
+    # are filtered above. The soft recommended-balance warning fires from
+    # execute_copy_trade for users below recommended_min_balance_usdc.
     user_ids = [u["id"] for u in eligible_users]
     if not user_ids:
         log.info("poll_no_eligible_users", total_subs=len(subscribers))

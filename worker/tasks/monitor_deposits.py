@@ -84,6 +84,23 @@ def monitor_deposits() -> dict:
             new_baseline = 0.0 if moved >= 1.0 else eoa_stable
             sb.table("users").update({"balance_usdc": new_baseline}).eq("id", user["id"]).execute()
 
+            # ── BP1 self-healing: wrap any stranded USDC.e on the deposit wallet ──
+            # Winnings from resolved positions arrive as USDC.e.  If a prior redeem
+            # run finished the on-chain claim but crashed before the wrap step, the
+            # funds are stuck as USDC.e.  Detect and wrap opportunistically here.
+            if dw and user.get("wallet_private_key_enc"):
+                try:
+                    dw_bals = get_balances(dw)
+                    if dw_bals.get("usdc_e", 0) >= 0.10:
+                        from core.relayer import convert_dw_usdce_to_pusd
+                        r = convert_dw_usdce_to_pusd(user["wallet_private_key_enc"])
+                        if not r.get("skipped"):
+                            log.info("monitor_usdc_e_wrapped",
+                                     user_id=user["id"],
+                                     amount=round(dw_bals["usdc_e"], 4))
+                except Exception:
+                    log.warning("monitor_wrap_failed", user_id=user["id"])
+
         except Exception:
             log.exception("balance_check_failed", user_id=user["id"])
 
