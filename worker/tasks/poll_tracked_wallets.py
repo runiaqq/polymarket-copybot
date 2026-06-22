@@ -1,10 +1,13 @@
 """
 Model B — copy a curated whitelist of profitable wallets.
 
-Every few seconds we poll each tracked wallet's recent activity. When a tracked
-("pro") wallet makes a fresh BUY on a fast-resolving market, we copy it to every
-subscriber. If multiple tracked wallets back the SAME market, that's "consensus"
-(higher confidence) — surfaced in the AI score / notification, never blocks entry.
+Blueprint 2 redesign:
+  * In-memory `_seen` is replaced by a cross-process Redis accumulation bucket
+    per (wallet, cond, token) so the signal fires **once after slicing settles**
+    (quiet_period_sec since the last fill) rather than mid-slice on a partial sum.
+  * VWAP of the completed burst is used as the signal price.
+  * Pre-fan-out balance gate: users below min_balance_usdc are skipped at this
+    layer with a throttled low-balance nudge, avoiding doomed task enqueues.
 """
 
 import time
@@ -12,15 +15,11 @@ from datetime import datetime, timedelta, timezone
 
 import structlog
 
+from core.cache import accum_add, accum_get, accum_mark_fired, notify_once
 from core.config import settings
 from worker.celery_app import celery_app
 
 log = structlog.get_logger(__name__)
-
-# In-memory dedup: (wallet:market:token) -> last emit epoch. A sliced entry is
-# one logical signal even though it lands as dozens of fills across poll cycles.
-_seen: dict[str, float] = {}
-_SEEN_MAX = 8000
 
 
 def _consensus_count(sb, condition_id: str, token_id: str, this_wallet: str) -> int:
@@ -42,6 +41,44 @@ def _consensus_count(sb, condition_id: str, token_id: str, this_wallet: str) -> 
     return len(wallets)
 
 
+def _threshold(wallet: dict) -> float:
+    """
+    Dynamic conviction threshold for this wallet:
+      max(abs_floor, conviction_frac × wallet avg_trade_usdc)
+    Falls back to abs_floor when avg_trade_usdc is not populated.
+    """
+    avg = float(wallet.get("avg_trade_usdc") or 0)
+    dynamic = settings.slice_conviction_frac * avg if avg > 0 else 0
+    return max(settings.tracked_min_copy_usdc, dynamic)
+
+
+def _notify_low_balance_pre(telegram_id: int, balance: float, min_bal: float) -> None:
+    """Throttled low-balance alert fired from the fan-out gate (not per-signal)."""
+    from telegram import Bot
+    import asyncio
+
+    if not notify_once(f"lowbal:{telegram_id}", ttl=settings.lowbal_alert_throttle_sec):
+        return
+
+    async def _send() -> None:
+        bot = Bot(token=settings.telegram_bot_token)
+        await bot.send_message(
+            chat_id=telegram_id,
+            text=(
+                f"⚠️ <b>Недостаточно средств для копирования</b>\n\n"
+                f"💰 Минимальный баланс: <b>${min_bal:.2f} USDC</b>\n"
+                f"💼 На счету: <b>${balance:.2f} USDC</b>\n\n"
+                "Пополни кошелёк через /wallet чтобы не пропускать сделки."
+            ),
+            parse_mode="HTML",
+        )
+
+    try:
+        asyncio.run(_send())
+    except Exception:
+        log.warning("pre_fanout_lowbal_failed", tg=telegram_id)
+
+
 @celery_app.task(name="worker.tasks.poll_tracked_wallets", queue="periodic")
 def poll_tracked_wallets() -> dict:
     if not settings.auto_copy_enabled:
@@ -61,33 +98,60 @@ def poll_tracked_wallets() -> dict:
     fast = get_fast_markets()
     sb = get_supabase()
     now = time.time()
-    user_ids = [u["id"] for u in subscribers]
-    dispatched = 0
 
     max_age = settings.tracked_max_trade_age_sec
     reentry_sec = settings.tracked_reentry_hours * 3600
-    min_copy = settings.tracked_min_copy_usdc
+    # TTL for accumulator buckets: reentry window + max_window (some buffer).
+    bucket_ttl = reentry_sec + settings.slice_max_window_sec + 60
 
+    dispatched = 0
     skipped_age_total = 0
     skipped_small_total = 0
     skipped_no_market_total = 0
     skipped_dedup_total = 0
     wallets_with_activity = 0
 
+    # ── Pre-fan-out balance check ─────────────────────────────────────────────
+    # Build a set of user_ids that have enough pUSD to be worth dispatching.
+    # Users below min_balance_usdc get a throttled nudge; we skip their dispatch
+    # entirely so we don't enqueue hundreds of doomed tasks per signal.
+    eligible_users: list[dict] = []
+    for user in subscribers:
+        dw = user.get("deposit_wallet_address")
+        if not dw:
+            continue
+        try:
+            from core.polygon import get_balances as _gb
+            bal = _gb(dw).get("pusd", 0.0)
+        except Exception:
+            bal = 0.0
+        if bal < settings.min_balance_usdc:
+            _notify_low_balance_pre(user["telegram_id"], bal, settings.min_balance_usdc)
+            log.debug("pre_fanout_skip_lowbal", user_id=user["id"],
+                      balance=round(bal, 2))
+        else:
+            eligible_users.append(user)
+
+    user_ids = [u["id"] for u in eligible_users]
+    if not user_ids:
+        log.info("poll_no_eligible_users", total_subs=len(subscribers))
+        return {"dispatched": 0, "skipped_no_balance": len(subscribers)}
+
+    # ── Per-wallet fill collection → Redis accumulator ────────────────────────
     for w in wallets:
         addr = (w.get("address") or "").lower()
         if not addr:
             continue
+        threshold = _threshold(w)
+
         try:
             trades = fetch_donor_recent_trades(addr, limit=settings.tracked_fetch_limit)
         except Exception:
             log.warning("tracked_fetch_failed", wallet=addr[:10])
             continue
 
-        # Aggregate sliced fills: a whale that builds a position with dozens of
-        # tiny buys in one market+outcome is ONE entry, not dozens of signals.
-        groups: dict[tuple[str, str], dict] = {}
         skipped_old = 0
+        has_activity = False
         for t in trades:
             if (t.get("side") or "").upper() != "BUY":
                 continue
@@ -99,45 +163,62 @@ def poll_tracked_wallets() -> dict:
             ts = int(t.get("timestamp") or 0)
             if ts and (now - ts) > max_age:
                 skipped_old += 1
-                continue  # only fresh fills count toward the burst
+                continue
             size = float(t.get("size_usdc") or 0)
             price = float(t.get("price") or 0)
-            g = groups.get((cond, token))
-            if g is None:
-                g = {"size": 0.0, "notional": 0.0, "fills": 0,
-                     "last_ts": 0, "last_tx": tx, "title": t.get("title", "")}
-                groups[(cond, token)] = g
-            g["size"] += size
-            g["notional"] += price * size
-            g["fills"] += 1
-            if ts >= g["last_ts"]:
-                g["last_ts"] = ts
-                g["last_tx"] = tx
+            bucket_key = f"{addr}:{cond}:{token}"
+            accum_add(bucket_key, str(tx), size, price, ts or int(now), ttl=bucket_ttl)
+            has_activity = True
 
         skipped_age_total += skipped_old
-        if groups:
+        if has_activity:
             wallets_with_activity += 1
 
-        for (cond, token), g in groups.items():
-            agg_size = g["size"]
-            if agg_size < min_copy:
-                skipped_small_total += 1
-                continue  # below conviction floor — dust/noise
+        # ── Evaluate firing condition for each (cond, token) this wallet has ──
+        # We must enumerate possible keys. Since we just fed fills into buckets,
+        # re-read them by scanning the fills we just saw.
+        seen_keys: set[str] = set()
+        for t in trades:
+            cond = t.get("condition_id")
+            token = t.get("token_id")
+            if cond and token:
+                seen_keys.add(f"{addr}:{cond}:{token}")
 
-            key = f"{addr}:{cond}:{token}"
-            last = _seen.get(key)
-            if last and (now - last) < reentry_sec:
+        for bucket_key in seen_keys:
+            bkt = accum_get(bucket_key)
+            if bkt is None or bkt["fired"]:
                 skipped_dedup_total += 1
-                continue  # already copied this entry burst
+                continue
+
+            parts = bucket_key.split(":", 2)
+            if len(parts) != 3:
+                continue
+            _, cond, token = parts
+
+            agg_size = bkt["acc_usdc"]
+            if agg_size < threshold:
+                skipped_small_total += 1
+                continue
+
+            age_since_first = now - bkt["first_ts"]
+            age_since_last = now - bkt["last_ts"]
+
+            fire = (
+                age_since_last >= settings.slice_quiet_period_sec   # whale settled
+                or age_since_first >= settings.slice_max_window_sec  # hard window
+            )
+            if not fire:
+                log.debug("accum_waiting", wallet=addr[:10],
+                          market=cond[:14], acc=round(agg_size, 2),
+                          quiet=round(age_since_last, 0))
+                continue
 
             meta = fast.get(cond)
             if meta is None:
                 skipped_no_market_total += 1
-                # Don't poison _seen here — we want to retry once this market
-                # enters our resolution window (or config changes).
-                continue  # not a fast/liquid market in range — skip
+                continue
 
-            # Cross-restart dedup: did we already signal this wallet→market+outcome?
+            # Cross-restart dedup: DB check.
             try:
                 since = (datetime.now(timezone.utc)
                          - timedelta(hours=settings.tracked_reentry_hours)).isoformat()
@@ -146,31 +227,35 @@ def poll_tracked_wallets() -> dict:
                       .eq("token_id", token).gte("created_at", since)
                       .limit(1).execute())
                 if ex.data:
-                    _seen[key] = now
+                    accum_mark_fired(bucket_key, ttl=bucket_ttl)
+                    skipped_dedup_total += 1
                     continue
             except Exception:
                 pass
-            _seen[key] = now
 
-            vwap = (g["notional"] / agg_size) if agg_size else 0
-            tx = g["last_tx"]
+            # Atomic fire — only the process that wins this CAS actually emits.
+            if not accum_mark_fired(bucket_key, ttl=bucket_ttl):
+                skipped_dedup_total += 1
+                continue
+
+            vwap = (bkt["acc_notional"] / agg_size) if agg_size else 0
             outcome = (meta.get("token_outcomes") or {}).get(token, "")
             consensus = _consensus_count(sb, cond, token, addr)
 
             signal = {
                 "market_id":        cond,
                 "token_id":         token,
-                "title":            meta.get("title") or g["title"],
+                "title":            meta.get("title") or "",
                 "outcome":          outcome,
                 "side":             "BUY",
                 "price":            round(vwap, 4),
                 "size_usdc":        round(agg_size, 2),
-                "fills":            g["fills"],
+                "fills":            bkt["fills"],
                 "tick_size":        meta.get("tick_size", "0.01"),
                 "neg_risk":         bool(meta.get("neg_risk", False)),
                 "hours_to_resolve": meta.get("hours_to_resolve"),
                 "event_slug":       meta.get("event_slug"),
-                "source_tx_hash":   tx,
+                "source_tx_hash":   f"{addr}:{cond}:{token}",
                 "source_wallet":    addr,
                 "consensus":        consensus,
                 "whale_wallet":     addr,
@@ -183,7 +268,7 @@ def poll_tracked_wallets() -> dict:
                     "price":          signal["price"],
                     "size_usdc":      signal["size_usdc"],
                     "token_id":       token,
-                    "source_tx_hash": tx,
+                    "source_tx_hash": signal["source_tx_hash"],
                     "source_wallet":  addr,
                     "consensus":      consensus,
                 })
@@ -195,16 +280,19 @@ def poll_tracked_wallets() -> dict:
             for uid in user_ids:
                 execute_copy_trade.delay(uid, signal)
             dispatched += 1
-            log.info("tracked_signal", wallet=addr[:10], market=cond[:14],
-                     outcome=outcome, size=round(agg_size, 2), fills=g["fills"],
-                     consensus=consensus, subs=len(user_ids))
+            log.info(
+                "tracked_signal_fired",
+                wallet=addr[:10],
+                market=cond[:14],
+                outcome=outcome,
+                size=round(agg_size, 2),
+                fills=bkt["fills"],
+                vwap=round(vwap, 4),
+                quiet_s=round(age_since_last, 0),
+                consensus=consensus,
+                eligible_users=len(user_ids),
+            )
 
-    if len(_seen) > _SEEN_MAX:
-        cutoff = now - reentry_sec
-        for k in [k for k, v in _seen.items() if v < cutoff]:
-            del _seen[k]
-
-    # Log a summary every cycle so we can diagnose why dispatched stays 0.
     if dispatched == 0 and (wallets_with_activity or skipped_age_total):
         log.info(
             "poll_no_dispatch",
@@ -215,5 +303,6 @@ def poll_tracked_wallets() -> dict:
             skipped_no_market=skipped_no_market_total,
             skipped_dedup=skipped_dedup_total,
             fast_markets=len(fast),
+            eligible_users=len(user_ids),
         )
-    return {"dispatched": dispatched}
+    return {"dispatched": dispatched, "eligible_users": len(user_ids)}

@@ -52,11 +52,13 @@ def remove_tracked_wallet(address: str) -> bool:
 
 
 def get_active_subscribers() -> list[dict]:
-    """Active paying subscribers.
+    """Active paying subscribers whose copying is not currently paused.
 
     In signals mode (auto_copy disabled) the only requirement is a valid paid
     subscription. The copy_active / wallet_address filters are auto-copy
     (custodial) concerns and are applied only when auto-copy is enabled.
+    Blueprint 4: subscribers with copy_paused_until > now() are excluded so
+    the fan-out never dispatches doomed trades during a risk pause.
     """
     from core.config import settings
 
@@ -67,6 +69,8 @@ def get_active_subscribers() -> list[dict]:
         .select("*")
         .neq("sub_tier", "free")
         .gt("sub_expires_at", now)
+        # Honor drawdown / daily-loss pause (null = not paused, past date = expired pause).
+        .or_(f"copy_paused_until.is.null,copy_paused_until.lt.{now}")
     )
     if settings.auto_copy_enabled:
         q = q.eq("copy_active", True).not_.is_("wallet_address", "null")
@@ -367,3 +371,79 @@ def get_user_pnl_stats(user_id: int) -> dict:
     volume = sum(r["size_usdc"] or 0 for r in rows)
     pnl = sum(r["pnl_usdc"] or 0 for r in rows)
     return {"total": total, "volume": volume, "pnl": pnl}
+
+
+# ── Blueprint 1: on-chain settlement reconciler helpers ──────────────────────
+
+def get_outstanding_copy_trades() -> list[dict]:
+    """
+    All confirmed trades that still need on-chain settlement reconciliation
+    (status='confirmed', redeemed_at IS NULL, condition_id IS NOT NULL).
+    """
+    sb = get_supabase()
+    res = (
+        sb.table("copy_trades")
+        .select("id, user_id, condition_id, token_id, outcome_index, neg_risk,"
+                " entry_price, shares, size_usdc")
+        .eq("status", "confirmed")
+        .is_("redeemed_at", "null")
+        .not_.is_("condition_id", "null")
+        .execute()
+    )
+    return res.data or []
+
+
+def mark_trade_settled(trade_id: int, result: str, realized_pnl: float,
+                       redeem_tx: str | None = None) -> None:
+    """Mark a copy_trade row as resolved on-chain (win or loss)."""
+    sb = get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+    payload: dict = {
+        "result": result,
+        "realized_pnl": round(realized_pnl, 4),
+        "resolved_at": now,
+        "redeemed_at": now,
+    }
+    if redeem_tx:
+        payload["redeem_tx"] = redeem_tx
+    sb.table("copy_trades").update(payload).eq("id", trade_id).execute()
+
+
+# ── Blueprint 4: HWM + copy-pause helpers ────────────────────────────────────
+
+def get_user_equity_hwm(user_id: int) -> float:
+    sb = get_supabase()
+    res = sb.table("users").select("equity_hwm").eq("id", user_id).maybe_single().execute()
+    return float((res.data or {}).get("equity_hwm") or 0.0)
+
+
+def update_user_equity_hwm(user_id: int, hwm: float) -> None:
+    sb = get_supabase()
+    sb.table("users").update({"equity_hwm": round(hwm, 4)}).eq("id", user_id).execute()
+
+
+def pause_user_copying(user_id: int, until_iso: str) -> None:
+    sb = get_supabase()
+    sb.table("users").update({"copy_paused_until": until_iso}).eq("id", user_id).execute()
+
+
+def resume_user_copying(user_id: int) -> None:
+    sb = get_supabase()
+    sb.table("users").update({"copy_paused_until": None}).eq("id", user_id).execute()
+
+
+def get_daily_realized_pnl(user_id: int) -> float:
+    """Sum of realized_pnl for trades settled in the trailing 24 h."""
+    sb = get_supabase()
+    from datetime import timedelta
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    res = (
+        sb.table("copy_trades")
+        .select("realized_pnl")
+        .eq("user_id", user_id)
+        .not_.is_("realized_pnl", "null")
+        .not_.is_("resolved_at", "null")
+        .gte("resolved_at", since)
+        .execute()
+    )
+    return sum(float(r["realized_pnl"] or 0) for r in (res.data or []))

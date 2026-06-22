@@ -20,6 +20,7 @@ _includes = [
     "worker.tasks.poll_donors",
     "worker.tasks.poll_tracked_wallets",
     "worker.tasks.monitor_deposits",
+    "worker.tasks.execute_copy",
 ]
 # Model B copies a curated whitelist via polling (poll_tracked_wallets), so the
 # anonymous WS large-buy listener is no longer the entry source and stays off.
@@ -48,10 +49,12 @@ celery_app.conf.update(
     task_routes={
         "worker.tasks.execute_copy_trade": {"queue": "trades"},
         "worker.tasks.close_position": {"queue": "trades"},
+        "worker.tasks.redeem_position": {"queue": "trades"},
         "worker.tasks.wrap_collateral": {"queue": "trades"},
         "worker.tasks.withdraw_funds": {"queue": "trades"},
         "worker.tasks.run_ai_analysis": {"queue": "ai"},
         "worker.tasks.sync_positions": {"queue": "periodic"},
+        "worker.tasks.reconcile_settlements": {"queue": "periodic"},
         "worker.tasks.check_subscription_expiry": {"queue": "periodic"},
         "worker.tasks.scan_whale_trades": {"queue": "periodic"},
         "worker.tasks.poll_donor_trades": {"queue": "periodic"},
@@ -67,6 +70,12 @@ celery_app.conf.update(
         "sync-positions": {
             "task": "worker.tasks.sync_positions",
             "schedule": 120.0,  # TP/SL + resolution checks every 2 min
+        },
+        # BP1: on-chain settlement reconciler — catches neg-risk positions that
+        # vanish from the Data API before appearing as 'redeemable'.
+        "reconcile-settlements": {
+            "task": "worker.tasks.reconcile_settlements",
+            "schedule": 120.0,
         },
         "monitor-deposits": {
             "task": "worker.tasks.monitor_deposits",

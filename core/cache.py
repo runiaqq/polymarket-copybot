@@ -41,3 +41,77 @@ def claim(key: str, ttl: int = 7 * 86400) -> None:
         _client().set(f"once:{key}", "1", nx=True, ex=ttl)
     except Exception:
         pass
+
+
+# ── Blueprint 2: cross-process slice-accumulation buckets ────────────────────
+# Each bucket is a Redis hash keyed by "accum:<wallet>:<cond>:<token>".
+# Fields: first_ts, last_ts, acc_usdc, acc_notional, fills, fired
+
+_ACCUM_PREFIX = "accum:"
+
+
+def accum_add(key: str, tx_hash: str, size: float, price: float,
+              ts: int, ttl: int) -> None:
+    """
+    Merge one fill into the accumulation bucket.  Uses a pipeline to minimise
+    round-trips: HSETNX sets first_ts only if missing, then increments running
+    totals and refreshes the TTL (sliding window).  Individual fills are deduped
+    via a small Redis set so the same tx_hash is never double-counted.
+    """
+    r = _client()
+    dedup_key = f"accum_seen:{tx_hash}"
+    try:
+        # Skip already-counted fills (cross-process dedup by tx_hash).
+        if not r.set(dedup_key, "1", nx=True, ex=ttl):
+            return
+        hkey = f"{_ACCUM_PREFIX}{key}"
+        pipe = r.pipeline()
+        pipe.hsetnx(hkey, "first_ts", ts)
+        pipe.hset(hkey, "last_ts", ts)
+        pipe.hincrbyfloat(hkey, "acc_usdc", size)
+        pipe.hincrbyfloat(hkey, "acc_notional", price * size)
+        pipe.hincrby(hkey, "fills", 1)
+        pipe.hsetnx(hkey, "fired", "0")
+        pipe.expire(hkey, ttl)
+        pipe.execute()
+    except Exception:
+        log.warning("accum_add_failed", key=key)
+
+
+def accum_get(key: str) -> dict | None:
+    """Return the current accumulation bucket, or None if it doesn't exist."""
+    try:
+        hkey = f"{_ACCUM_PREFIX}{key}"
+        data = _client().hgetall(hkey)
+        if not data:
+            return None
+        return {
+            "first_ts":    int(float(data.get("first_ts", 0))),
+            "last_ts":     int(float(data.get("last_ts", 0))),
+            "acc_usdc":    float(data.get("acc_usdc", 0)),
+            "acc_notional": float(data.get("acc_notional", 0)),
+            "fills":       int(data.get("fills", 0)),
+            "fired":       data.get("fired", "0") == "1",
+        }
+    except Exception:
+        log.warning("accum_get_failed", key=key)
+        return None
+
+
+def accum_mark_fired(key: str, ttl: int) -> bool:
+    """
+    Atomically set fired=1 only if it was 0 (prevents double-fire on the same
+    bucket).  Returns True when this call was the one that fired it.
+    """
+    try:
+        hkey = f"{_ACCUM_PREFIX}{key}"
+        pipe = _client().pipeline()
+        # GETSET fired → old value; if "0" we won the race.
+        pipe.hget(hkey, "fired")
+        pipe.hset(hkey, "fired", "1")
+        results = pipe.execute()
+        old = results[0]
+        return old in (None, "0", b"0")
+    except Exception:
+        log.warning("accum_mark_fired_failed", key=key)
+        return False

@@ -7,11 +7,17 @@ Hybrid exit policy:
   * resolved (redeemable) positions        → notify user (on-chain redeem is gated
                                              behind AUTO_REDEEM_ENABLED, off by default,
                                              pending live V2/pUSD verification).
+
+Blueprint 1: reconcile_settlements scans copy_trades rows on-chain directly, so
+  neg-risk positions that disappear from the Data API are never missed.
+
+Blueprint 4: sync_positions updates equity_hwm per user and triggers the drawdown /
+  daily-loss circuit breaker.
 """
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import structlog
 
@@ -168,6 +174,19 @@ def sync_positions() -> dict:
                            event_slug=c.get("event_slug"))
             actions += 1
 
+        # ── BP4: update HWM + check circuit breakers ──────────────────────────
+        try:
+            from core.polygon import get_balances as _gb
+            free_pusd = _gb(wallet).get("pusd", 0.0) if wallet else 0.0
+            open_val = sum(
+                float(p.get("current_value") or 0)
+                for p in (positions or []) if p.get("shares", 0) > 0
+            )
+            equity = free_pusd + open_val
+            _update_hwm_and_check_breakers(user, equity)
+        except Exception:
+            log.warning("hwm_update_failed", user_id=uid)
+
     log.info("sync_positions_done", users=len(subscribers), actions=actions)
     return {"users": len(subscribers), "actions": actions}
 
@@ -318,8 +337,16 @@ def close_position(self, user_id: int, token_id: str, reason: str = "manual") ->
 def redeem_position(self, user_id: int, token_id: str, condition_id: str,
                     neg_risk: bool, outcome: str | None,
                     title: str | None = None, event_slug: str | None = None,
-                    outcome_index: int | None = None) -> dict:
-    """Redeem a resolved winning position into pUSD and notify the user."""
+                    outcome_index: int | None = None,
+                    trade_id: int | None = None,
+                    entry_cost: float | None = None) -> dict:
+    """
+    Redeem a resolved winning position into pUSD and notify the user.
+
+    BP1 extra args:
+      trade_id   — copy_trades.id to update with result + redeem_tx.
+      entry_cost — original cost basis for P&L calculation.
+    """
     from core.db import get_supabase
     from core.polygon import get_balances
     from core.relayer import convert_dw_usdce_to_pusd, redeem_winnings
@@ -345,8 +372,7 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
             log.info("redeem_skipped", user_id=user_id, reason=r.get("reason"))
             return r
         import time as _t
-        _t.sleep(5)  # let the redeem settle (payout arrives as USDC.e)
-        # Redeem pays out USDC.e — wrap it into tradeable pUSD on the deposit wallet.
+        _t.sleep(5)
         try:
             convert_dw_usdce_to_pusd(user["wallet_private_key_enc"])
             _t.sleep(4)
@@ -354,6 +380,18 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
             log.warning("post_redeem_wrap_failed", user_id=user_id)
         bal_after = get_balances(dw).get("pusd", 0.0)
         credited = max(0.0, bal_after - bal_before)
+        redeem_tx = r.get("tx") or ""
+
+        # BP1: write result + redeem_tx back onto the copy_trades ledger row.
+        if trade_id:
+            try:
+                from core.db import mark_trade_settled
+                pnl = credited - float(entry_cost or 0)
+                mark_trade_settled(trade_id, result="win",
+                                   realized_pnl=pnl, redeem_tx=redeem_tx)
+            except Exception:
+                log.warning("mark_trade_settled_failed", trade_id=trade_id)
+
         _notify(
             user["telegram_id"],
             f"💸 <b>Выигрыш зачислен</b>\n\n"
@@ -364,7 +402,7 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
             f"{_event_link(event_slug)}",
         )
         log.info("redeem_done", user_id=user_id, credited=round(credited, 2),
-                 tx=(r.get("tx") or "")[:14])
+                 tx=redeem_tx[:14])
         return {"redeemed": True, "credited": credited}
     except Exception as exc:
         log.exception("redeem_failed", user_id=user_id, token=token_id[:14])
@@ -448,3 +486,180 @@ def _emit_loss(telegram_id: int, title: str | None, outcome: str | None,
         f"📉 Результат: <b>{pnl:+.2f}$</b>"
         f"{_event_link(event_slug)}",
     )
+
+
+# ── Blueprint 1: on-chain settlement reconciler ──────────────────────────────
+
+@celery_app.task(name="worker.tasks.reconcile_settlements", queue="periodic")
+def reconcile_settlements() -> dict:
+    """
+    Source-of-truth settlement pass: reads CTF contract payoutDenominator on-chain
+    for every confirmed-but-unredeemed copy_trade.  Handles neg-risk positions that
+    disappear from the Data API before they appear as 'redeemable'.
+
+    Dedup with Redis so a concurrent sync_positions pass never double-redeems.
+    """
+    from core.db import get_outstanding_copy_trades, get_supabase, mark_trade_settled
+    from core.relayer import is_condition_resolved, get_payout_numerator
+
+    trades = get_outstanding_copy_trades()
+    if not trades:
+        return {"checked": 0}
+
+    sb = get_supabase()
+    processed = 0
+
+    for trade in trades:
+        uid = trade["user_id"]
+        cond = trade.get("condition_id")
+        token_id = trade.get("token_id")
+        outcome_idx = trade.get("outcome_index")
+        neg_risk = bool(trade.get("neg_risk", False))
+
+        if not (cond and token_id and outcome_idx is not None):
+            continue
+
+        # Redis dedup: only one process handles each (user, condition) at a time.
+        if not notify_once(f"reconcile:{uid}:{cond}", ttl=300):
+            continue
+
+        try:
+            if not is_condition_resolved(cond):
+                continue  # not resolved yet — check again next cycle
+
+            won = get_payout_numerator(cond, int(outcome_idx)) > 0
+            entry_cost = float(trade.get("size_usdc") or 0)
+
+            if not won:
+                mark_trade_settled(
+                    trade["id"],
+                    result="loss",
+                    realized_pnl=-entry_cost,
+                )
+                if _notify_once(f"settle:{uid}:{cond}"):
+                    _resolve_user_for_notification(sb, uid, cond, won=False,
+                                                   entry_cost=entry_cost)
+                log.info("reconcile_loss", user_id=uid, cond=cond[:14],
+                         cost=round(entry_cost, 2))
+            else:
+                # Win: dispatch the existing idempotent redeem_position task.
+                # mark_trade_settled is called inside _on_redeem_done after tx confirmed.
+                if not notify_once(f"redeem:{uid}:{cond}"):
+                    continue  # already dispatched
+                res = sb.table("users").select("*").eq("id", uid).maybe_single().execute()
+                user = res.data if res else None
+                if not user:
+                    continue
+                redeem_position.delay(
+                    uid, token_id, cond, neg_risk,
+                    outcome=None,     # resolve_name not needed for on-chain path
+                    title=None,
+                    event_slug=None,
+                    outcome_index=int(outcome_idx),
+                    trade_id=trade["id"],
+                    entry_cost=entry_cost,
+                )
+                log.info("reconcile_win_dispatched", user_id=uid, cond=cond[:14])
+
+            processed += 1
+        except Exception:
+            log.exception("reconcile_error", user_id=uid, cond=(cond or "")[:14])
+
+    log.info("reconcile_settlements_done", checked=len(trades), processed=processed)
+    return {"checked": len(trades), "processed": processed}
+
+
+def _resolve_user_for_notification(sb, uid: int, cond: str,
+                                   won: bool, entry_cost: float) -> None:
+    """Load the user record and send a win/loss notification."""
+    try:
+        res = sb.table("users").select("telegram_id").eq("id", uid).maybe_single().execute()
+        user = res.data if res else None
+        if not user:
+            return
+        tg = user["telegram_id"]
+        if won:
+            _emit_win(tg, None, None, entry_cost)
+        else:
+            _emit_loss(tg, None, None, -entry_cost)
+    except Exception:
+        log.warning("resolve_user_notify_failed", user_id=uid)
+
+
+# ── Blueprint 4: HWM + circuit-breaker update in sync_positions ──────────────
+
+def _update_hwm_and_check_breakers(user: dict, equity: float) -> None:
+    """
+    Called once per sync cycle per user.  Updates the equity HWM and evaluates
+    drawdown / daily-loss circuit breakers.  Sets copy_paused_until when tripped.
+    """
+    from core.db import (
+        get_daily_realized_pnl, get_user_equity_hwm,
+        pause_user_copying, resume_user_copying, update_user_equity_hwm,
+    )
+    from core.cache import notify_once as _no
+
+    uid = user["id"]
+    tg = user["telegram_id"]
+
+    try:
+        hwm = max(get_user_equity_hwm(uid), equity)
+        if equity > get_user_equity_hwm(uid):
+            update_user_equity_hwm(uid, equity)
+
+        # Auto-resume an expired pause.
+        paused_until = user.get("copy_paused_until")
+        if paused_until:
+            try:
+                from dateutil.parser import parse as _parse_dt
+                pu = _parse_dt(paused_until)
+                if pu.tzinfo is None:
+                    pu = pu.replace(tzinfo=timezone.utc)
+                if pu <= datetime.now(timezone.utc):
+                    resume_user_copying(uid)
+                    log.info("copy_pause_expired", user_id=uid)
+                    return  # paused was active but now cleared — no breach checks
+            except Exception:
+                pass
+
+        if equity <= 0:
+            return
+
+        # Drawdown circuit breaker.
+        drawdown = (hwm - equity) / hwm if hwm > 0 else 0.0
+        if drawdown >= settings.max_drawdown_pct:
+            pause_until = (
+                datetime.now(timezone.utc) + timedelta(seconds=settings.drawdown_cooldown_sec)
+            ).isoformat()
+            pause_user_copying(uid, pause_until)
+            if _no(f"drawdown_alert:{uid}", ttl=settings.drawdown_cooldown_sec):
+                _notify(tg,
+                    f"🛑 <b>Просадка {drawdown*100:.1f}%</b>\n\n"
+                    f"Капитал упал до <b>${equity:.2f}</b> от пика <b>${hwm:.2f}</b>.\n"
+                    f"Копирование приостановлено на 24 ч для защиты депозита.\n"
+                    f"Бот возобновится автоматически."
+                )
+            log.info("drawdown_breaker_tripped", user_id=uid,
+                     drawdown=round(drawdown, 4), equity=round(equity, 2))
+            return
+
+        # Daily loss limit.
+        daily_pnl = get_daily_realized_pnl(uid)
+        if daily_pnl <= -(settings.daily_loss_limit_pct * equity):
+            next_utc_day = (
+                datetime.now(timezone.utc).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                ) + timedelta(days=1)
+            ).isoformat()
+            pause_user_copying(uid, next_utc_day)
+            if _no(f"daily_loss_alert:{uid}", ttl=86400):
+                _notify(tg,
+                    f"📉 <b>Дневной лимит убытков</b>\n\n"
+                    f"Убыток сегодня: <b>${abs(daily_pnl):.2f}</b> "
+                    f"(>{settings.daily_loss_limit_pct*100:.0f}% капитала).\n"
+                    f"Копирование остановлено до 00:00 UTC."
+                )
+            log.info("daily_loss_limit_tripped", user_id=uid,
+                     daily_pnl=round(daily_pnl, 2), equity=round(equity, 2))
+    except Exception:
+        log.warning("hwm_check_failed", user_id=uid)

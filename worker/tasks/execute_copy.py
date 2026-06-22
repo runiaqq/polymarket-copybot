@@ -1,6 +1,14 @@
 """
 Fast-path Celery task: copy a donor trade to a subscriber's wallet.
 Uses Polymarket CLOB v2 for real order placement.
+
+Integrations in this file:
+  BP1 — denormalize condition_id / token_id / outcome_index / neg_risk /
+         entry_price / shares onto copy_trades row for on-chain reconciliation.
+  BP2 — throttle _notify_low_balance to ≤1 alert per lowbal_alert_throttle_sec.
+  BP3 — fractional Kelly sizing (sizing_mode="kelly"); "fixed" keeps legacy behavior.
+  BP4 — tail-risk gates (exposure cap, event cap, drawdown, daily loss) evaluated
+         before place_order; pauses stored on users table.
 """
 
 import asyncio
@@ -38,12 +46,10 @@ def _confirm_fill(wallet_address: str, token_id: str, intended_usdc: float) -> t
                 if filled < 0.9 * intended_usdc:
                     return filled, "partial"
                 return filled, "full"
-            # Position not visible yet — retry unless this is the last attempt.
             log.debug("confirm_fill_retry", token=token_id[:18], attempt=attempt + 1)
         except Exception:
             log.warning("confirm_fill_failed", token=token_id[:18], attempt=attempt + 1)
 
-    # After all retries still nothing — could be the order truly didn't fill.
     return 0.0, "none"
 
 
@@ -86,50 +92,137 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         log.debug("skip_sell_signal", user_id=user_id)
         return {"skipped": True, "reason": "sell_not_supported"}
 
-    user_max = float(user.get("max_position_usdc") or 25)
-    # Whale-detector signals carry a depth-derived cap (max_copy_usdc); donor/REST
-    # signals don't, so fall back to the whale size there.
-    depth_cap = float(signal.get("max_copy_usdc") or signal.get("size_usdc") or 0)
-    size_usdc = min(user_max, depth_cap) if depth_cap > 0 else user_max
-    if size_usdc < 1.0:
-        log.debug("skip_below_min", user_id=user_id, size=size_usdc)
-        return {"skipped": True, "reason": "below_min_size"}
+    # Honor Blueprint 4 drawdown / daily-loss pause (belt-and-suspenders: the
+    # fan-out in get_active_subscribers also excludes paused users, but a
+    # concurrent pause could arrive between fan-out and task execution).
+    from datetime import datetime, timezone
+    paused_until = user.get("copy_paused_until")
+    if paused_until:
+        try:
+            from dateutil.parser import parse as _parse_dt
+            pu = _parse_dt(paused_until)
+            if pu.tzinfo is None:
+                pu = pu.replace(tzinfo=timezone.utc)
+            if pu > datetime.now(timezone.utc):
+                log.info("skip_copy_paused", user_id=user_id,
+                         paused_until=paused_until)
+                return {"skipped": True, "reason": "copy_paused"}
+        except Exception:
+            pass
 
-    # Check collateral: in V2 the tradeable pUSD lives in the DEPOSIT WALLET.
-    # The deposit monitor sweeps EOA funds into it; if it's short, try a sweep
-    # on demand before giving up.
+    # ── Check collateral ─────────────────────────────────────────────────────
     try:
         from core.polygon import get_balances, fund_deposit_wallet
         tradeable = get_balances(deposit_wallet).get("pusd", 0)
-        if tradeable < size_usdc:
-            eoa = get_balances(user["wallet_address"])
-            on_eoa = eoa.get("pusd", 0) + eoa.get("usdc_e", 0) + eoa.get("usdc", 0)
-            if (tradeable + on_eoa) >= size_usdc and on_eoa >= 0.5:
-                try:
-                    fund_deposit_wallet(user["wallet_private_key_enc"], user["wallet_address"], deposit_wallet)
-                    tradeable = get_balances(deposit_wallet).get("pusd", 0)
-                except Exception:
-                    log.warning("ondemand_fund_failed", user_id=user_id)
-            if tradeable < size_usdc:
-                _notify_low_balance(user["telegram_id"], tradeable, size_usdc, signal)
-                log.warning("skip_low_balance", user_id=user_id, pusd=tradeable, needed=size_usdc)
-                return {"skipped": True, "reason": "low_balance"}
     except Exception:
         log.warning("balance_check_failed", user_id=user_id)
+        tradeable = 0.0
 
-    # Portfolio guards: already-in-this-market (consensus) + max open positions.
+    # ── BP3: Kelly sizing or fixed cap ───────────────────────────────────────
+    user_max = float(user.get("max_position_usdc") or 25)
+    depth_cap = float(signal.get("max_copy_usdc") or signal.get("size_usdc") or 0)
+
+    if settings.sizing_mode == "kelly":
+        from core.sizing import kelly_stake
+        from core.wallet_score import score_wallet
+        try:
+            score = score_wallet(signal.get("source_wallet") or signal.get("whale_wallet") or "")
+        except Exception:
+            score = None
+        # Equity = free pUSD + open-position value (positions loaded below for
+        # risk gates anyway; use free_pusd as a conservative lower bound here).
+        try:
+            from core.polymarket import get_positions as _gp
+            positions = _gp(deposit_wallet)
+            open_value = sum(
+                float(p.get("current_value") or 0)
+                for p in positions if p.get("shares", 0) > 0
+            )
+        except Exception:
+            positions = []
+            open_value = 0.0
+        equity = tradeable + open_value
+        k_stake = kelly_stake(
+            p=float(signal.get("price") or 0),
+            score=score,
+            consensus=int(signal.get("consensus") or 1),
+            equity=equity,
+            free_pusd=tradeable,
+            cfg=settings,
+        )
+        if k_stake > 0:
+            size_usdc = min(k_stake, user_max)
+            if depth_cap > 0:
+                size_usdc = min(size_usdc, depth_cap)
+        else:
+            # kelly returned 0 (fixed mode fallback or no edge) — use legacy cap
+            size_usdc = min(user_max, depth_cap) if depth_cap > 0 else user_max
+    else:
+        # Legacy fixed cap
+        size_usdc = min(user_max, depth_cap) if depth_cap > 0 else user_max
+        try:
+            from core.polymarket import get_positions as _gp
+            positions = _gp(deposit_wallet)
+            open_value = sum(
+                float(p.get("current_value") or 0)
+                for p in positions if p.get("shares", 0) > 0
+            )
+        except Exception:
+            positions = []
+            open_value = 0.0
+        equity = tradeable + open_value
+        score = None
+
+    # BP3: below minimum balance, disable copying rather than placing dust trades.
+    if equity < settings.min_balance_usdc:
+        _notify_low_balance(
+            user["telegram_id"], tradeable, settings.min_balance_usdc, signal,
+            reason="min_balance",
+        )
+        log.warning("skip_below_min_balance", user_id=user_id,
+                    equity=round(equity, 2), min_balance=settings.min_balance_usdc)
+        return {"skipped": True, "reason": "below_min_balance"}
+
+    if size_usdc < settings.min_order_usdc:
+        log.debug("skip_below_min", user_id=user_id, size=size_usdc)
+        return {"skipped": True, "reason": "below_min_size"}
+
+    # ── Fund deposit wallet on demand if short ───────────────────────────────
+    if tradeable < size_usdc:
+        eoa = {}
+        try:
+            from core.polygon import get_balances as _gb
+            eoa = _gb(user["wallet_address"])
+        except Exception:
+            pass
+        on_eoa = eoa.get("pusd", 0) + eoa.get("usdc_e", 0) + eoa.get("usdc", 0)
+        if (tradeable + on_eoa) >= size_usdc and on_eoa >= 0.5:
+            try:
+                from core.polygon import fund_deposit_wallet
+                fund_deposit_wallet(
+                    user["wallet_private_key_enc"],
+                    user["wallet_address"],
+                    deposit_wallet,
+                )
+                tradeable = get_balances(deposit_wallet).get("pusd", 0)
+            except Exception:
+                log.warning("ondemand_fund_failed", user_id=user_id)
+        if tradeable < size_usdc:
+            # BP2: throttled low-balance alert (at most once per 6h per user).
+            _notify_low_balance(user["telegram_id"], tradeable, size_usdc, signal)
+            log.warning("skip_low_balance", user_id=user_id,
+                        pusd=tradeable, needed=size_usdc)
+            return {"skipped": True, "reason": "low_balance"}
+
+    # ── Portfolio guards: already-in-market + max open positions ─────────────
+    cond = signal.get("market_id")
+    consensus = int(signal.get("consensus") or 1)
     try:
-        from core.polymarket import get_positions
-        positions = get_positions(deposit_wallet)
-        cond = signal.get("market_id")
-        consensus = int(signal.get("consensus") or 1)
-
-        # Already holding a position in this event? Don't double-enter — instead,
-        # if another tracked pro just backed it (consensus≥2), send a confidence boost.
         if any(p for p in positions if p.get("condition_id") == cond and p["shares"] > 0):
             if consensus >= 2:
                 _notify_consensus(user["telegram_id"], signal, consensus)
-            log.info("skip_already_in_market", user_id=user_id, market=(cond or "")[:14], consensus=consensus)
+            log.info("skip_already_in_market", user_id=user_id,
+                     market=(cond or "")[:14], consensus=consensus)
             return {"skipped": True, "reason": "already_in_market"}
 
         open_count = sum(1 for p in positions if p["shares"] > 0)
@@ -139,7 +232,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     except Exception:
         log.warning("positions_count_failed", user_id=user_id)
 
-    # Ensure CLOB API credentials exist
+    # ── Ensure CLOB API credentials ──────────────────────────────────────────
     api_creds = {
         "clob_api_key":    user.get("clob_api_key"),
         "clob_secret":     user.get("clob_secret"),
@@ -147,14 +240,15 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     }
     if not api_creds["clob_api_key"]:
         try:
-            api_creds = generate_api_creds(user["wallet_private_key_enc"], funder=deposit_wallet)
+            api_creds = generate_api_creds(user["wallet_private_key_enc"],
+                                           funder=deposit_wallet)
             sb.table("users").update(api_creds).eq("id", user_id).execute()
             log.info("clob_creds_generated", user_id=user_id)
         except Exception as exc:
             log.exception("clob_creds_failed", user_id=user_id)
             raise self.retry(exc=exc)
 
-    # Resolve token_id (whale signals already carry the exact outcome token).
+    # ── Resolve token_id ─────────────────────────────────────────────────────
     token_id: str | None = signal.get("token_id")
     if not token_id:
         token_id = get_market_token_id(signal["market_id"], signal.get("side", "YES"))
@@ -162,7 +256,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         log.warning("skip_no_token_id", market_id=signal["market_id"])
         return {"skipped": True, "reason": "no_token_id"}
 
-    # Fresh order-book re-check: price/depth may have moved since detection.
+    # ── Fresh order-book re-check ────────────────────────────────────────────
     entry_price = float(signal.get("price") or 0)
     try:
         from core.polymarket import get_order_book
@@ -182,11 +276,50 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     except Exception:
         log.warning("exec_book_check_failed", user_id=user_id)
 
-    if size_usdc < 1.0:
+    if size_usdc < settings.min_order_usdc:
         log.debug("skip_below_min_after_book", user_id=user_id, size=size_usdc)
         return {"skipped": True, "reason": "below_min_after_book"}
 
-    # Reuse the signal row persisted by the scanner; only insert for legacy donor mode.
+    # ── BP4: tail-risk gates ─────────────────────────────────────────────────
+    try:
+        from core.risk import check_risk_gates
+        from core.db import get_user_equity_hwm, get_daily_realized_pnl
+        hwm = get_user_equity_hwm(user_id)
+        daily_pnl = get_daily_realized_pnl(user_id)
+        decision = check_risk_gates(
+            signal=signal,
+            stake=size_usdc,
+            open_positions=positions,
+            equity=equity,
+            equity_hwm=hwm,
+            daily_pnl=daily_pnl,
+            cfg=settings,
+        )
+        if not decision.allowed:
+            from core.cache import notify_once
+            gate = decision.gate
+            if notify_once(f"risk_gate:{user_id}:{gate}", ttl=3600):
+                _notify_risk_pause(user["telegram_id"], decision.reason)
+
+            # Drawdown breaker: record pause in DB so fan-out excludes next signals.
+            if gate == "drawdown":
+                from datetime import timedelta
+                from core.db import pause_user_copying
+                from core.db import update_user_equity_hwm
+                pause_until = (
+                    datetime.now(timezone.utc) + timedelta(seconds=settings.drawdown_cooldown_sec)
+                ).isoformat()
+                pause_user_copying(user_id, pause_until)
+                update_user_equity_hwm(user_id, max(hwm, equity))
+                log.info("drawdown_pause_set", user_id=user_id, until=pause_until)
+
+            log.info("skip_risk_gate", user_id=user_id,
+                     gate=gate, reason=decision.reason[:80])
+            return {"skipped": True, "reason": f"risk_gate:{gate}"}
+    except Exception:
+        log.warning("risk_gate_check_failed", user_id=user_id)
+
+    # ── Idempotency guard & signal insert ────────────────────────────────────
     signal_id = signal.get("signal_id")
     if not signal_id:
         sig_row = insert_trade_signal({
@@ -200,9 +333,6 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         })
         signal_id = sig_row["id"]
 
-    # ── Guard against Celery retry re-executing an already-placed order ──────
-    # If a copy_trade row for this (user, signal) already exists with a non-failed
-    # terminal status, this is a Celery retry after a transient error — skip.
     try:
         existing = (
             sb.table("copy_trades")
@@ -220,11 +350,24 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     except Exception:
         pass
 
+    # ── BP1: denormalize settlement fields onto copy_trades row ──────────────
+    outcome_index = signal.get("outcome_index")
+    if outcome_index is None:
+        # Infer from outcome name when not explicitly provided.
+        outcome_name = str(signal.get("outcome") or "").strip().lower()
+        outcome_index = 0 if outcome_name.startswith("yes") else 1
+
     trade_row = insert_copy_trade({
-        "user_id":   user["id"],
-        "signal_id": signal_id,
-        "status":    "executing",
-        "size_usdc": size_usdc,
+        "user_id":        user["id"],
+        "signal_id":      signal_id,
+        "status":         "executing",
+        "size_usdc":      size_usdc,
+        # Settlement ledger fields (migration 008)
+        "condition_id":   cond,
+        "token_id":       token_id,
+        "outcome_index":  int(outcome_index),
+        "neg_risk":       bool(signal.get("neg_risk", False)),
+        "entry_price":    round(entry_price, 6),
     })
 
     try:
@@ -243,7 +386,6 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
 
         order_id = result.get("orderID") or result.get("order_id") or ""
 
-        # Mark as placed immediately so retries won't double-execute.
         try:
             sb.table("copy_trades").update({
                 "status":   "placed",
@@ -252,39 +394,53 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         except Exception:
             pass
 
-        # Confirm actual fill from on-chain positions (deposit wallet).
         filled, fill_status = _confirm_fill(deposit_wallet, token_id, size_usdc)
 
-        # Remaining balance after the trade.
+        # BP1: persist shares filled (needed for on-chain reconciliation).
+        shares_filled = round(filled / entry_price, 6) if entry_price > 0 and filled > 0 else 0.0
+
         try:
             from core.polygon import get_balances
             remaining = get_balances(deposit_wallet).get("pusd", 0.0)
         except Exception:
             remaining = 0.0
 
-        # Get AI analysis to include in the single combined notification.
-        score, verdict, reason = None, None, None
+        score_val, verdict, reason = None, None, None
         try:
             from worker.tasks.ai_filter import _call_gpt
-            score, verdict, reason = _call_gpt(signal)
+            score_val, verdict, reason = _call_gpt(signal)
         except Exception:
             log.warning("ai_inline_failed", user_id=user_id)
 
         final_status = "confirmed" if fill_status != "none" else "unfilled"
         try:
-            sb.table("copy_trades").update({
+            update_payload: dict = {
                 "status":   final_status,
                 "size_usdc": round(filled, 2) if fill_status in ("full", "partial") else size_usdc,
-            }).eq("id", trade_row["id"]).execute()
+            }
+            if fill_status in ("full", "partial") and shares_filled > 0:
+                update_payload["shares"] = shares_filled
+            sb.table("copy_trades").update(update_payload).eq("id", trade_row["id"]).execute()
+        except Exception:
+            pass
+
+        # BP4: update HWM after a successful trade (equity may have changed).
+        try:
+            from core.db import get_user_equity_hwm, update_user_equity_hwm
+            current_hwm = get_user_equity_hwm(user_id)
+            if equity > current_hwm:
+                update_user_equity_hwm(user_id, equity)
         except Exception:
             pass
 
         log.info("copy_trade_ok", user_id=user_id, order_id=order_id,
-                 fill=fill_status, filled=round(filled, 2))
+                 fill=fill_status, filled=round(filled, 2),
+                 shares=shares_filled, cond=(cond or "")[:14])
         _notify(user["telegram_id"], signal, order_id, size_usdc, filled,
-                fill_status, remaining, score, verdict, reason)
+                fill_status, remaining, score_val, verdict, reason)
 
-        return {"order_id": order_id, "user_id": user_id, "fill": fill_status, "filled": filled}
+        return {"order_id": order_id, "user_id": user_id,
+                "fill": fill_status, "filled": filled}
 
     except Exception as exc:
         try:
@@ -298,15 +454,15 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         raise self.retry(exc=exc)
 
 
+# ── Notifications ─────────────────────────────────────────────────────────────
+
 def _notify_consensus(telegram_id: int, signal: dict, consensus: int) -> None:
-    """A second+ tracked pro entered an event the user already holds → confidence boost."""
     from telegram import Bot
     from core.config import settings
     from core.cache import notify_once
     from core.polymarket import event_url
 
     cond = signal.get("market_id", "")
-    # Dedup per (user, market, consensus level) so we don't repeat the same boost.
     if not notify_once(f"consensus:{telegram_id}:{cond}:{consensus}"):
         return
 
@@ -336,7 +492,6 @@ def _notify_consensus(telegram_id: int, signal: dict, consensus: int) -> None:
 
 
 def _notify_not_registered(telegram_id: int) -> None:
-    """User hasn't set up their deposit wallet yet — can't trade."""
     from telegram import Bot
     from core.config import settings
 
@@ -358,21 +513,67 @@ def _notify_not_registered(telegram_id: int) -> None:
         log.exception("notify_not_registered_failed", telegram_id=telegram_id)
 
 
-def _notify_low_balance(telegram_id: int, balance: float, needed: float, signal: dict) -> None:
+def _notify_low_balance(
+    telegram_id: int,
+    balance: float,
+    needed: float,
+    signal: dict,
+    reason: str = "low_balance",
+) -> None:
+    """
+    BP2: at most one low-balance alert per user per lowbal_alert_throttle_sec.
+    The throttle key is per-user, independent of the signal, so a high-volume
+    signal day does not produce alert spam.
+    """
     from telegram import Bot
     from core.config import settings
+    from core.cache import notify_once
+
+    # Throttled per-user regardless of which signal triggered it.
+    if not notify_once(f"lowbal:{telegram_id}", ttl=settings.lowbal_alert_throttle_sec):
+        return
 
     async def _send() -> None:
         bot = Bot(token=settings.telegram_bot_token)
         title = signal.get("title") or "—"
-        await bot.send_message(
-            chat_id=telegram_id,
-            text=(
+        if reason == "min_balance":
+            text = (
+                f"⚠️ <b>Баланс ниже минимума для копирования</b>\n\n"
+                f"📌 {title}\n\n"
+                f"💰 Минимальный баланс: <b>${needed:.2f} USDC</b>\n"
+                f"💼 Текущий капитал: <b>${balance:.2f} USDC</b>\n\n"
+                f"Пополни кошелёк через /wallet чтобы не пропускать сделки."
+            )
+        else:
+            text = (
                 f"⚠️ <b>Недостаточно средств для сделки</b>\n\n"
                 f"📌 {title}\n\n"
                 f"💰 Нужно: <b>${needed:.2f} USDC</b>\n"
                 f"💼 На балансе: <b>${balance:.2f} USDC</b>\n\n"
                 f"Пополни кошелёк через /wallet чтобы не пропускать сделки."
+            )
+        await bot.send_message(chat_id=telegram_id, text=text, parse_mode="HTML")
+
+    try:
+        asyncio.run(_send())
+    except Exception:
+        log.exception("notify_low_balance_failed", telegram_id=telegram_id)
+
+
+def _notify_risk_pause(telegram_id: int, reason: str) -> None:
+    """BP4: notify user that copying was paused by a risk gate."""
+    from telegram import Bot
+    from core.config import settings
+
+    async def _send() -> None:
+        bot = Bot(token=settings.telegram_bot_token)
+        await bot.send_message(
+            chat_id=telegram_id,
+            text=(
+                f"🛡 <b>Риск-защита сработала</b>\n\n"
+                f"{reason}\n\n"
+                f"Копирование приостановлено автоматически для защиты депозита. "
+                f"После отдыха бот возобновится сам."
             ),
             parse_mode="HTML",
         )
@@ -380,7 +581,7 @@ def _notify_low_balance(telegram_id: int, balance: float, needed: float, signal:
     try:
         asyncio.run(_send())
     except Exception:
-        log.exception("notify_low_balance_failed", telegram_id=telegram_id)
+        log.exception("notify_risk_pause_failed", telegram_id=telegram_id)
 
 
 def _notify(
@@ -427,13 +628,10 @@ def _notify(
             head = "✅ <b>Бот открыл позицию</b>"
             if fill_status == "partial":
                 head = "✅ <b>Бот открыл позицию (частично)</b>"
-            elif fill_status == "unknown":
-                head = "✅ <b>Бот открыл позицию</b>"
 
             invested = filled_usdc if fill_status in ("full", "partial") else intended_usdc
             partial_note = f" из ${intended_usdc:.2f} (тонкий стакан)" if fill_status == "partial" else ""
 
-            # AI block
             ai_block = ""
             if ai_score is not None and ai_verdict and ai_reason:
                 risk_icon = "🟢" if ai_score <= 4 else ("🟡" if ai_score <= 6 else "🔴")
@@ -456,7 +654,8 @@ def _notify(
                 f"{link_line}"
             )
         await bot.send_message(
-            chat_id=telegram_id, text=msg, parse_mode="HTML", disable_web_page_preview=True
+            chat_id=telegram_id, text=msg, parse_mode="HTML",
+            disable_web_page_preview=True,
         )
 
     try:

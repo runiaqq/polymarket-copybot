@@ -221,5 +221,47 @@ class Settings(BaseSettings):
     # Default False: per product spec the bot enters first, AI sends its analysis after.
     ai_block_enabled: bool = False
 
+    # ── Blueprint 2: slice aggregation (Redis accumulator) ────────────────────
+    # Quiet period after last fill before firing a signal (whale still slicing?).
+    slice_quiet_period_sec: int = 45
+    # Hard max window: fire even if whale is still slicing after this time.
+    slice_max_window_sec: int = 180
+    # Conviction fraction: threshold = max(abs_floor, conviction_frac * whale_avg_size).
+    slice_conviction_frac: float = 0.5
+    # Low-balance alert throttle: at most one nudge per user per this interval.
+    lowbal_alert_throttle_sec: int = 21600   # 6 h
+
+    # ── Blueprint 3: fractional Kelly position sizing ─────────────────────────
+    # "fixed" = legacy flat cap; "kelly" = risk-based fractional Kelly.
+    sizing_mode: str = "fixed"
+    # Fraction of full Kelly to bet (0.25 = quarter-Kelly; keeps variance low).
+    kelly_lambda: float = 0.25
+    # Edge attributed to a fully-trusted single wallet on top of market price.
+    kelly_base_edge: float = 0.03
+    # Absolute edge ceiling (prevents overbetting on exceptional wallets).
+    kelly_edge_cap: float = 0.06
+    # Beta-prior strength for winrate shrinkage (α=β=prior → pulls toward 0.5 when n small).
+    kelly_prior_strength: float = 10.0
+    # Hard risk cap per trade as a fraction of equity.
+    max_risk_per_trade: float = 0.05
+    # Effective minimum order size (sub-$5 copies are eaten by slippage + fees).
+    min_order_usdc: float = 5.0
+    # Below this equity level copying is disabled (see Kelly min-balance derivation).
+    min_balance_usdc: float = 100.0
+    # Target concurrent open positions for min-balance floor calculation.
+    n_target_positions: int = 5
+
+    # ── Blueprint 4: tail-risk portfolio controls ─────────────────────────────
+    # Max fraction of equity that may be deployed in open positions simultaneously.
+    max_portfolio_exposure_pct: float = 0.60
+    # Max fraction of equity in positions sharing the same event (correlation cap).
+    max_event_exposure_pct: float = 0.15
+    # Drawdown circuit breaker: pause copying when equity falls this far from HWM.
+    max_drawdown_pct: float = 0.25
+    # How long (seconds) copying stays paused after a drawdown breaker trip.
+    drawdown_cooldown_sec: int = 86400    # 24 h
+    # Daily loss limit as a fraction of start-of-day equity.
+    daily_loss_limit_pct: float = 0.10
+
 
 settings = Settings()  # type: ignore[call-arg]

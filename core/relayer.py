@@ -136,6 +136,15 @@ _CTF_ABI = [
                 {"name": "collectionId", "type": "bytes32"}],
      "name": "getPositionId", "outputs": [{"name": "", "type": "uint256"}],
      "stateMutability": "view", "type": "function"},
+    # Resolution state — Blueprint 1: on-chain settlement source of truth
+    {"inputs": [{"name": "conditionId", "type": "bytes32"}],
+     "name": "payoutDenominator",
+     "outputs": [{"name": "", "type": "uint256"}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "conditionId", "type": "bytes32"}, {"name": "index", "type": "uint256"}],
+     "name": "payoutNumerators",
+     "outputs": [{"name": "", "type": "uint256"}],
+     "stateMutability": "view", "type": "function"},
 ]
 
 # Binary CTF markets can be collateralized by different stables across versions.
@@ -174,6 +183,30 @@ def ctf_token_balance(deposit_wallet: str, token_id: str) -> int:
     """Raw ERC-1155 outcome-token balance held by the deposit wallet."""
     return int(_ctf().functions.balanceOf(
         Web3.to_checksum_address(deposit_wallet), int(token_id)).call())
+
+
+def _cond_bytes(condition_id: str) -> bytes:
+    cond = condition_id if condition_id.startswith("0x") else "0x" + condition_id
+    return Web3.to_bytes(hexstr=cond)
+
+
+def is_condition_resolved(condition_id: str) -> bool:
+    """Return True when the CTF condition has been resolved on-chain (payoutDenominator > 0)."""
+    try:
+        return int(_ctf().functions.payoutDenominator(_cond_bytes(condition_id)).call()) > 0
+    except Exception:
+        log.warning("is_condition_resolved_failed", cond=condition_id[:14])
+        return False
+
+
+def get_payout_numerator(condition_id: str, outcome_index: int) -> int:
+    """Return payoutNumerators[outcome_index]. > 0 means this outcome won."""
+    try:
+        return int(_ctf().functions.payoutNumerators(
+            _cond_bytes(condition_id), int(outcome_index)).call())
+    except Exception:
+        log.warning("get_payout_numerator_failed", cond=condition_id[:14], idx=outcome_index)
+        return 0
 
 
 def redeem_winnings(private_key_enc: str, condition_id: str, neg_risk: bool,
