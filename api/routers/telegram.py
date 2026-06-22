@@ -75,7 +75,8 @@ def _stop_resume_kb(copy_active: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[btn], [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")]])
 
 
-def _settings_kb(copy_active: bool, current_max: float) -> InlineKeyboardMarkup:
+def _settings_kb(copy_active: bool, current_max: float,
+                 sizing_mode: str = "fixed") -> InlineKeyboardMarkup:
     def _label(val: int) -> str:
         mark = " ✓" if abs(current_max - val) < 0.5 else ""
         return f"${val}{mark}"
@@ -85,6 +86,17 @@ def _settings_kb(copy_active: bool, current_max: float) -> InlineKeyboardMarkup:
         if copy_active
         else InlineKeyboardButton("▶️ Возобновить", callback_data="resume")
     )
+
+    is_kelly = sizing_mode == "kelly"
+    fixed_btn = InlineKeyboardButton(
+        "📊 Фиксированный ✓" if not is_kelly else "📊 Фиксированный",
+        callback_data="sizing_fixed",
+    )
+    kelly_btn = InlineKeyboardButton(
+        "🤖 Kelly ✓ (рекомендуется)" if is_kelly else "🤖 Kelly (рекомендуется)",
+        callback_data="sizing_kelly",
+    )
+
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(_label(10),  callback_data="setmax_10"),
@@ -93,6 +105,9 @@ def _settings_kb(copy_active: bool, current_max: float) -> InlineKeyboardMarkup:
             InlineKeyboardButton(_label(100), callback_data="setmax_100"),
         ],
         [InlineKeyboardButton("✏️ Своё значение", callback_data="setmax_custom")],
+        # Sizing mode toggle
+        [fixed_btn, kelly_btn],
+        [InlineKeyboardButton("❓ Что такое Kelly-сайзинг?", callback_data="kelly_info")],
         [toggle_btn],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
     ])
@@ -155,6 +170,8 @@ def _dashboard_text(db_user: dict, first_name: str) -> str:
     copy_active = db_user.get("copy_active")
     copy_icon = "🟢 Работает" if copy_active else "⏸ Пауза"
     max_pos = db_user.get("max_position_usdc") or 25
+    sizing_mode = db_user.get("sizing_mode") or "fixed"
+    sizing_icon = "🤖 Kelly" if sizing_mode == "kelly" else f"📊 Фикс ${max_pos:.0f}"
     checklist = _checklist(db_user)
     mid = (
         f"{checklist}\n\n"
@@ -169,7 +186,7 @@ def _dashboard_text(db_user: dict, first_name: str) -> str:
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"💼 Кошелёк: <code>{addr_short}</code>\n"
         f"🔄 Автокопирование: {copy_icon}\n"
-        f"💵 Макс. позиция: <b>${max_pos:.0f} USDC</b>\n"
+        f"💵 Позиция: <b>{sizing_icon}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{mid}"
         "👇 Управляй через кнопки"
@@ -727,12 +744,28 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def _settings_text(db_user: dict) -> str:
     copy_active = db_user.get("copy_active", False)
     max_pos = db_user.get("max_position_usdc") or 25
+    sizing_mode = db_user.get("sizing_mode") or "fixed"
     copy_status = "▶️ Активно" if copy_active else "⏸ Приостановлено"
+
+    if sizing_mode == "kelly":
+        sizing_line = "📐 Сайзинг: <b>🤖 Kelly (авто-расчёт)</b>\n"
+        size_hint = (
+            f"💵 Потолок позиции: <b>${max_pos:.0f} USDC</b>\n\n"
+            "Kelly рассчитает оптимальный размер автоматически — "
+            "потолок нужен как страховочный лимит 👇"
+        )
+    else:
+        sizing_line = "📐 Сайзинг: <b>📊 Фиксированный</b>\n"
+        size_hint = (
+            f"💵 Макс. позиция: <b>${max_pos:.0f} USDC</b>\n\n"
+            "Выбери максимальный размер одной позиции 👇"
+        )
+
     return (
         f"⚙️ <b>Настройки</b>\n\n"
         f"🔄 Копирование: {copy_status}\n"
-        f"💵 Макс. позиция: <b>${max_pos:.0f} USDC</b>\n\n"
-        "Выбери максимальный размер одной позиции 👇"
+        f"{sizing_line}"
+        f"{size_hint}"
     )
 
 
@@ -746,10 +779,11 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     copy_active = db_user.get("copy_active", False)
     max_pos = float(db_user.get("max_position_usdc") or 25)
+    sizing_mode = db_user.get("sizing_mode") or "fixed"
     await update.message.reply_text(  # type: ignore[union-attr]
         _settings_text(db_user),
         parse_mode="HTML",
-        reply_markup=_settings_kb(copy_active, max_pos),
+        reply_markup=_settings_kb(copy_active, max_pos, sizing_mode),
     )
 
 
@@ -1107,11 +1141,12 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     update_user(tg_user.id, {"max_position_usdc": val})
     db_user = get_user_by_telegram_id(tg_user.id) or {}
     copy_active = db_user.get("copy_active", False)
+    sizing_mode = db_user.get("sizing_mode") or "fixed"
 
     await update.message.reply_text(  # type: ignore[union-attr]
         f"✅ <b>Готово!</b> Макс. позиция: <b>${val:.0f} USDC</b>",
         parse_mode="HTML",
-        reply_markup=_settings_kb(copy_active, val),
+        reply_markup=_settings_kb(copy_active, val, sizing_mode),
     )
 
 
@@ -1384,10 +1419,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         copy_active = db_user.get("copy_active", False)
         max_pos = float(db_user.get("max_position_usdc") or 25)
+        sizing_mode = db_user.get("sizing_mode") or "fixed"
         await query.edit_message_text(
             _settings_text(db_user),
             parse_mode="HTML",
-            reply_markup=_settings_kb(copy_active, max_pos),
+            reply_markup=_settings_kb(copy_active, max_pos, sizing_mode),
         )
         return
 
@@ -1402,10 +1438,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if suffix == "custom":
             context.user_data["awaiting_max_pos"] = True
             await query.answer()
+            sizing_mode = db_user.get("sizing_mode") or "fixed"
+            hint = (
+                "Это потолок для Kelly-сайзинга — реальный ордер может быть меньше."
+                if sizing_mode == "kelly"
+                else "Бот будет входить ровно на эту сумму."
+            )
             await query.edit_message_text(
                 "✏️ <b>Введи сумму в долларах</b>\n\n"
                 "Напиши число в чат, например: <code>75</code>\n\n"
-                "<i>Допустимый диапазон: $5 — $10 000</i>",
+                f"<i>{hint}</i>\n"
+                "<i>Диапазон: $5 — $10 000</i>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("↩️ Назад", callback_data="settings")
@@ -1422,11 +1465,43 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         update_user(tg_user.id, {"max_position_usdc": val})
         db_user = get_user_by_telegram_id(tg_user.id) or db_user
         copy_active = db_user.get("copy_active", False)
+        sizing_mode = db_user.get("sizing_mode") or "fixed"
         await query.answer(f"✅ Позиция: ${val:.0f} USDC")
         await query.edit_message_text(
             _settings_text(db_user),
             parse_mode="HTML",
-            reply_markup=_settings_kb(copy_active, val),
+            reply_markup=_settings_kb(copy_active, val, sizing_mode),
+        )
+        return
+
+    # ── Sizing mode toggle ────────────────────────────────────────────────────
+    if data in ("sizing_fixed", "sizing_kelly"):
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user:
+            await query.answer("Отправь /start", show_alert=True)
+            return
+        new_mode = "kelly" if data == "sizing_kelly" else "fixed"
+        update_user(tg_user.id, {"sizing_mode": new_mode})
+        db_user = get_user_by_telegram_id(tg_user.id) or db_user
+        copy_active = db_user.get("copy_active", False)
+        max_pos = float(db_user.get("max_position_usdc") or 25)
+        label = "🤖 Kelly-сайзинг включён" if new_mode == "kelly" else "📊 Фиксированный сайзинг включён"
+        await query.answer(f"✅ {label}")
+        await query.edit_message_text(
+            _settings_text(db_user),
+            parse_mode="HTML",
+            reply_markup=_settings_kb(copy_active, max_pos, new_mode),
+        )
+        return
+
+    if data == "kelly_info":
+        await query.answer(
+            "🤖 Kelly-сайзинг автоматически рассчитывает оптимальный размер ставки "
+            "на основе статистики кошелька-кита и текущей цены рынка.\n\n"
+            "Формула учитывает «ребро» (edge) трейдера и масштабирует риск: "
+            "на высоких вероятностях ставка меньше, на сильных китах — больше.\n\n"
+            "Максимальный размер ограничен твоим потолком и 5% капитала.",
+            show_alert=True,
         )
         return
 

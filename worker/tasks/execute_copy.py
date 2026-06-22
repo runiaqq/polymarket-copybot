@@ -119,10 +119,12 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         tradeable = 0.0
 
     # ── BP3: Kelly sizing or fixed cap ───────────────────────────────────────
+    # Per-user setting takes priority over the global config default.
     user_max = float(user.get("max_position_usdc") or 25)
     depth_cap = float(signal.get("max_copy_usdc") or signal.get("size_usdc") or 0)
+    user_sizing_mode = user.get("sizing_mode") or settings.sizing_mode
 
-    if settings.sizing_mode == "kelly":
+    if user_sizing_mode == "kelly":
         from core.sizing import kelly_stake
         from core.wallet_score import score_wallet
         try:
@@ -154,12 +156,17 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             size_usdc = min(k_stake, user_max)
             if depth_cap > 0:
                 size_usdc = min(size_usdc, depth_cap)
+            log.info("sizing_kelly", stake=round(k_stake, 2), capped=round(size_usdc, 2),
+                     equity=round(equity, 2), user_id=user.get("id"))
         else:
-            # kelly returned 0 (fixed mode fallback or no edge) — use legacy cap
+            # Kelly returned 0 (no edge detected) — fall back to fixed cap
             size_usdc = min(user_max, depth_cap) if depth_cap > 0 else user_max
+            log.info("sizing_kelly_no_edge_fallback", fixed_cap=round(size_usdc, 2),
+                     user_id=user.get("id"))
     else:
-        # Legacy fixed cap
+        # Fixed cap (user chose fixed or global default)
         size_usdc = min(user_max, depth_cap) if depth_cap > 0 else user_max
+        log.debug("sizing_fixed", cap=round(size_usdc, 2), user_id=user.get("id"))
         try:
             from core.polymarket import get_positions as _gp
             positions = _gp(deposit_wallet)

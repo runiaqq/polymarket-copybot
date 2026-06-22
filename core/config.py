@@ -244,10 +244,9 @@ class Settings(BaseSettings):
     kelly_prior_strength: float = 10.0
     # Hard risk cap per trade as a fraction of equity.
     max_risk_per_trade: float = 0.05
-    # Polymarket platform minimum order — used as the size floor so tiny accounts
-    # still trade. Sub-$1 orders are rejected by the exchange; sub-$5 orders lose
-    # a large fraction to fees/slippage, but we let the user decide.
-    exchange_min_order_usdc: float = 1.0
+    # Polymarket platform minimum order size.
+    # The CLOB rejects orders below $5 USDC notional.
+    exchange_min_order_usdc: float = 5.0
     # SOFT recommendation only — below this we warn but do NOT block.
     # A $3 wallet trades at the $1 platform minimum; it is only skipped when it
     # cannot afford even that minimum (free_pusd < exchange_min_order_usdc).
