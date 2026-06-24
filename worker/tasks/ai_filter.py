@@ -47,8 +47,10 @@ RISK_PROMPT = """\
 
 
 def _call_gpt(signal: dict) -> tuple[int, str, str]:
-    hours = signal.get("hours_to_resolve")
+    from core.polymarket import format_time_left
     price = float(signal.get("price", 0) or 0)
+    # BP5: compute time-left fresh so the AI always sees the correct remaining window.
+    time_left = format_time_left(signal.get("resolution_iso"))
     prompt = RISK_PROMPT.format(
         title=(signal.get("title") or signal.get("market_id", "—"))[:90],
         outcome=signal.get("outcome") or "—",
@@ -56,7 +58,7 @@ def _call_gpt(signal: dict) -> tuple[int, str, str]:
         prob=f"{price*100:.0f}",
         size_usdc=signal.get("size_usdc", 0),
         consensus=int(signal.get("consensus") or 1),
-        hours=f"~{hours:.0f} ч" if hours else "неизвестно",
+        hours=time_left,
     )
     response = openai_client.chat.completions.create(
         model=settings.openai_model,
@@ -115,18 +117,19 @@ def run_ai_analysis(signal: dict, user_ids: list[int]) -> dict:
     if not filtered_users:
         return {"score": score, "reason": reason, "notified": False}
 
-    from core.polymarket import event_url
+    from core.polymarket import event_url, format_time_left
 
     title = (signal.get("title") or signal.get("market_id", "—"))[:70]
     outcome = signal.get("outcome") or "—"
     size = signal.get("size_usdc", 0)
     price = float(signal.get("price", 0) or 0)
-    hours = signal.get("hours_to_resolve")
     url = event_url(signal.get("event_slug"))
 
     risk_icon = "🟢" if score <= 4 else ("🟡" if score <= 6 else "🔴")
     title_html = f"<a href=\"{url}\">{title}</a>" if url else f"<b>{title}</b>"
-    hours_line = f" · ⏳ ~{hours:.0f} ч" if hours else ""
+    # BP5: compute time-left fresh at the moment of broadcast.
+    time_left = format_time_left(signal.get("resolution_iso"))
+    hours_line = f" · ⏳ {time_left}"
     link_line = f"\n🔗 <a href=\"{url}\">Открыть на Polymarket</a>" if url else ""
 
     # Signals mode: this is a signal to act on, not a copied trade.

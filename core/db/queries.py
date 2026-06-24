@@ -447,3 +447,82 @@ def get_daily_realized_pnl(user_id: int) -> float:
         .execute()
     )
     return sum(float(r["realized_pnl"] or 0) for r in (res.data or []))
+
+
+# ── Blueprint 6: position state machine helpers ───────────────────────────────
+
+def get_open_trade_by_token(user_id: int, token_id: str) -> dict | None:
+    """Find the newest confirmed-and-unredeemed copy_trade for a token.
+
+    Used by close_position to obtain the trade_id + size_usdc for P&L booking.
+    """
+    sb = get_supabase()
+    res = (
+        sb.table("copy_trades")
+        .select("id, size_usdc, condition_id, signal_id")
+        .eq("user_id", user_id)
+        .eq("token_id", token_id)
+        .eq("status", "confirmed")
+        .is_("redeemed_at", "null")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
+def mark_trade_closed(trade_id: int, realized_pnl: float,
+                      exit_tx: str | None = None) -> None:
+    """Mark a copy_trade row as closed by a token-sale exit (terminal state).
+
+    Sets status='closed', result='closed', realized_pnl, resolved_at=now,
+    redeemed_at=now.  Setting redeemed_at removes the row from
+    get_outstanding_copy_trades (which filters redeemed_at IS NULL) permanently —
+    independent of any Redis TTL.
+    """
+    sb = get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+    payload: dict = {
+        "status":       "closed",
+        "result":       "closed",
+        "realized_pnl": round(realized_pnl, 4),
+        "resolved_at":  now,
+        "redeemed_at":  now,
+    }
+    if exit_tx:
+        payload["exit_tx"] = exit_tx
+    sb.table("copy_trades").update(payload).eq("id", trade_id).execute()
+
+
+def has_terminal_trade(user_id: int, condition_id: str) -> bool:
+    """Return True when any copy_trade for (user, condition) is in a terminal state.
+
+    Terminal = status='closed' OR redeemed_at IS NOT NULL.
+    Used as defense-in-depth in backfill_legacy_redemptions to prevent re-claiming
+    positions that were already exited via close_position or reconcile_settlements.
+    """
+    sb = get_supabase()
+    # Check status='closed' first (token-sale exit).
+    res = (
+        sb.table("copy_trades")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("condition_id", condition_id)
+        .eq("status", "closed")
+        .limit(1)
+        .execute()
+    )
+    if res.data:
+        return True
+    # Check redeemed_at IS NOT NULL (resolved on-chain).
+    res2 = (
+        sb.table("copy_trades")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("condition_id", condition_id)
+        .not_.is_("redeemed_at", "null")
+        .limit(1)
+        .execute()
+    )
+    return bool(res2.data)

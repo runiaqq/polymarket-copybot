@@ -266,5 +266,18 @@ class Settings(BaseSettings):
     # Daily loss limit as a fraction of start-of-day equity.
     daily_loss_limit_pct: float = 0.10
 
+    # ── Blueprint 5: time-to-resolution display ───────────────────────────────
+    # When True, also render the America/New_York wall-clock deadline in
+    # notification messages (display only; all internal math stays in UTC).
+    show_resolution_in_et: bool = True
+
+    # ── Blueprint 6: dust guard for auto-claim / reconcile ────────────────────
+    # Skip claiming and notifying when the on-chain ERC-1155 balance (in shares,
+    # i.e. raw_balance / 1e6) is below this floor.  Prevents phantom "$0.01 win"
+    # notifications from dust left behind by close_position truncation.
+    claim_dust_min_shares: float = 1.0
+    # Additional notional floor: also skip when shares * resolve_price < this.
+    claim_dust_min_usdc: float = 1.0
+
 
 settings = Settings()  # type: ignore[call-arg]

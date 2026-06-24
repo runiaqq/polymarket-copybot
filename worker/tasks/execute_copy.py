@@ -648,6 +648,7 @@ def _notify(
     from core.polymarket import event_url
 
     async def _send() -> None:
+        from core.polymarket import format_time_left
         bot = Bot(token=settings.telegram_bot_token)
         title = (signal.get("title") or "—")[:60]
         url = event_url(signal.get("event_slug"))
@@ -657,14 +658,15 @@ def _notify(
         prob = f"{price * 100:.0f}%"
         whale_usdc = float(signal.get("size_usdc") or 0)
         fills = int(signal.get("fills") or 0)
-        hours = signal.get("hours_to_resolve")
         consensus = int(signal.get("consensus") or 1)
         whale_line = f"🐳 Профи вошёл на: <b>${whale_usdc:,.0f}</b>" if whale_usdc else "🐳 Сигнал от профи-кошелька"
         if fills > 1:
             whale_line += f" ({fills} сделок)"
         if consensus >= 2:
             whale_line += f"\n🔥 <b>Консенсус: {consensus} профи</b> в этом исходе"
-        hours_line = f" · ⏳ ~{hours:.0f} ч" if hours else ""
+        # BP5: compute time-left fresh at notification time, never from a cached scalar.
+        time_left = format_time_left(signal.get("resolution_iso"))
+        hours_line = f" · ⏳ {time_left}"
         link_line = f"\n🔗 <a href=\"{url}\">Смотреть позицию</a>" if url else ""
 
         if fill_status == "none":

@@ -283,7 +283,17 @@ def close_position(self, user_id: int, token_id: str, reason: str = "manual") ->
             _closing.discard((user_id, token_id))
             return {"skipped": True, "reason": "zero_shares_after_truncation"}
 
-        sell_position(
+        # Blueprint 6: look up the copy_trades row BEFORE selling so we can book
+        # real P&L from the actual sale proceeds (not from a later on-chain resolution).
+        from core.db import get_open_trade_by_token, mark_trade_closed
+        trade_to_close = None
+        try:
+            trade_to_close = get_open_trade_by_token(user_id, token_id)
+        except Exception:
+            log.warning("close_position_trade_lookup_failed", user_id=user_id,
+                        token=token_id[:18])
+
+        sell_result = sell_position(
             private_key_enc=user["wallet_private_key_enc"],
             api_creds=api_creds,
             token_id=token_id,
@@ -294,6 +304,29 @@ def close_position(self, user_id: int, token_id: str, reason: str = "manual") ->
             slippage_pct=settings.exit_slippage_pct,
             deposit_wallet=deposit_wallet,
         )
+
+        # Blueprint 6: write realized P&L and mark the ledger row terminal so
+        # reconcile_settlements never re-claims this position later.
+        if trade_to_close:
+            try:
+                entry_cost = float(trade_to_close.get("size_usdc") or 0)
+                proceeds = shares_to_sell * float(best_bid)
+                realized_pnl = proceeds - entry_cost
+                exit_tx = ""
+                if isinstance(sell_result, dict):
+                    exit_tx = (sell_result.get("orderID")
+                               or sell_result.get("tx")
+                               or sell_result.get("transactionHash") or "")
+                mark_trade_closed(trade_to_close["id"],
+                                  realized_pnl=realized_pnl,
+                                  exit_tx=exit_tx)
+                log.info("trade_closed_booked", user_id=user_id,
+                         trade_id=trade_to_close["id"],
+                         realized_pnl=round(realized_pnl, 4), exit_tx=exit_tx[:18])
+            except Exception:
+                log.warning("close_position_book_pnl_failed", user_id=user_id,
+                            token=token_id[:18])
+
         # Claim the settlement key so the resolution scanner won't double-notify
         # if this exit fills near 0/1.
         if condition_id:
@@ -359,6 +392,56 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
     dw = user.get("deposit_wallet_address")
     if not dw:
         return {"skipped": True, "reason": "not_registered"}
+
+    # Blueprint 6 (1): terminal-state guard — if the trade was already closed by
+    # close_position (status='closed') or previously redeemed, do nothing.
+    if trade_id:
+        try:
+            tr = (sb.table("copy_trades")
+                  .select("status, redeemed_at")
+                  .eq("id", trade_id)
+                  .maybe_single()
+                  .execute())
+            if tr.data:
+                td = tr.data
+                if td.get("status") == "closed" or td.get("redeemed_at"):
+                    log.info("redeem_skip_terminal", user_id=user_id, trade_id=trade_id)
+                    return {"skipped": True, "reason": "terminal_state"}
+        except Exception:
+            log.warning("redeem_terminal_check_failed", user_id=user_id)
+
+    # Blueprint 6 (2): dust guard — skip if on-chain ERC-1155 balance is negligible.
+    # Outcome tokens have 6 decimal places: 1 share = 1_000_000 units.
+    try:
+        from core.relayer import ctf_token_balance
+        raw_bal = ctf_token_balance(dw, token_id)
+        shares_bal = raw_bal / 1_000_000
+        if shares_bal < settings.claim_dust_min_shares:
+            log.info("redeem_skip_dust", user_id=user_id, token=token_id[:18],
+                     shares=round(shares_bal, 6))
+            return {"skipped": True, "reason": "dust_below_min"}
+    except Exception:
+        log.warning("redeem_dust_check_failed", user_id=user_id, token=token_id[:18])
+
+    # Blueprint 6 (3): hydrate title from trade_signals when called from the
+    # on-chain reconciler path (which passes title=None).
+    if not title and trade_id:
+        try:
+            tr = (sb.table("copy_trades")
+                  .select("signal_id")
+                  .eq("id", trade_id)
+                  .maybe_single()
+                  .execute())
+            if tr.data and tr.data.get("signal_id"):
+                sig = (sb.table("trade_signals")
+                       .select("title")
+                       .eq("id", tr.data["signal_id"])
+                       .maybe_single()
+                       .execute())
+                if sig.data:
+                    title = sig.data.get("title") or title
+        except Exception:
+            pass
 
     # Prefer the API's outcomeIndex; fall back to the name (0 = "Yes", 1 = "No").
     if outcome_index is None:
@@ -546,14 +629,39 @@ def reconcile_settlements() -> dict:
                 # mark_trade_settled is called inside _on_redeem_done after tx confirmed.
                 if not notify_once(f"redeem:{uid}:{cond}"):
                     continue  # already dispatched
+
+                # Blueprint 6: terminal guard — if close_position already exited
+                # this trade (status='closed'), skip redemption entirely.
+                from core.db import has_terminal_trade
+                if has_terminal_trade(uid, cond):
+                    log.info("reconcile_skip_terminal", user_id=uid, cond=cond[:14])
+                    continue
+
                 res = sb.table("users").select("*").eq("id", uid).maybe_single().execute()
                 user = res.data if res else None
                 if not user:
                     continue
+
+                # Blueprint 6: dust guard — check on-chain ERC-1155 balance before
+                # dispatching.  Prevents empty "$0.01 win" notifications for dust
+                # left by close_position's 2-dp truncation.
+                dw = user.get("deposit_wallet_address")
+                if dw:
+                    try:
+                        from core.relayer import ctf_token_balance
+                        raw_bal = ctf_token_balance(dw, token_id)
+                        shares_bal = raw_bal / 1_000_000
+                        if shares_bal < settings.claim_dust_min_shares:
+                            log.info("reconcile_skip_dust", user_id=uid, cond=cond[:14],
+                                     shares=round(shares_bal, 6))
+                            continue
+                    except Exception:
+                        log.warning("reconcile_dust_check_failed", user_id=uid)
+
                 redeem_position.delay(
                     uid, token_id, cond, neg_risk,
                     outcome=None,     # resolve_name not needed for on-chain path
-                    title=None,
+                    title=None,       # hydrated inside redeem_position via trade_id
                     event_slug=None,
                     outcome_index=int(outcome_idx),
                     trade_id=trade["id"],
@@ -621,6 +729,28 @@ def backfill_legacy_redemptions() -> dict:
             condition_id = p.get("condition_id")
             if not (token_id and condition_id):
                 continue
+
+            # Blueprint 6: terminal guard — skip positions already exited/redeemed
+            # in our ledger.  backfill uses the Data API (unaware of our ledger),
+            # so this check is mandatory to avoid re-claiming closed positions.
+            from core.db import has_terminal_trade
+            if has_terminal_trade(uid, condition_id):
+                log.info("backfill_skip_terminal", user_id=uid,
+                         cond=condition_id[:14])
+                continue
+
+            # Blueprint 6: dust guard — skip if on-chain balance is negligible.
+            try:
+                from core.relayer import ctf_token_balance
+                raw_bal = ctf_token_balance(dw, token_id)
+                shares_bal = raw_bal / 1_000_000
+                if shares_bal < settings.claim_dust_min_shares:
+                    log.info("backfill_skip_dust", user_id=uid,
+                             cond=condition_id[:14], shares=round(shares_bal, 6))
+                    continue
+            except Exception:
+                log.warning("backfill_dust_check_failed", user_id=uid,
+                            cond=condition_id[:14])
 
             # Data API says redeemable — use existing fast path.
             if p.get("redeemable"):
@@ -694,17 +824,43 @@ def backfill_legacy_redemptions() -> dict:
 
 def _resolve_user_for_notification(sb, uid: int, cond: str,
                                    won: bool, entry_cost: float) -> None:
-    """Load the user record and send a win/loss notification."""
+    """Load the user record and send a win/loss notification.
+
+    Blueprint 6: hydrates title/outcome from trade_signals via the copy_trades
+    ledger so the notification always carries a human-readable market name.
+    """
     try:
         res = sb.table("users").select("telegram_id").eq("id", uid).maybe_single().execute()
         user = res.data if res else None
         if not user:
             return
         tg = user["telegram_id"]
+
+        # Hydrate title from the copy_trades → trade_signals join.
+        title: str | None = None
+        try:
+            tr = (sb.table("copy_trades")
+                  .select("signal_id")
+                  .eq("user_id", uid)
+                  .eq("condition_id", cond)
+                  .order("created_at", desc=True)
+                  .limit(1)
+                  .execute())
+            if tr.data and tr.data[0].get("signal_id"):
+                sig = (sb.table("trade_signals")
+                       .select("title")
+                       .eq("id", tr.data[0]["signal_id"])
+                       .maybe_single()
+                       .execute())
+                if sig.data:
+                    title = sig.data.get("title")
+        except Exception:
+            pass
+
         if won:
-            _emit_win(tg, None, None, entry_cost)
+            _emit_win(tg, title, None, entry_cost)
         else:
-            _emit_loss(tg, None, None, -entry_cost)
+            _emit_loss(tg, title, None, -entry_cost)
     except Exception:
         log.warning("resolve_user_notify_failed", user_id=uid)
 

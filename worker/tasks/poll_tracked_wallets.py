@@ -246,22 +246,24 @@ def poll_tracked_wallets() -> dict:
             consensus = _consensus_count(sb, cond, token, addr)
 
             signal = {
-                "market_id":        cond,
-                "token_id":         token,
-                "title":            meta.get("title") or "",
-                "outcome":          outcome,
-                "side":             "BUY",
-                "price":            round(vwap, 4),
-                "size_usdc":        round(agg_size, 2),
-                "fills":            bkt["fills"],
-                "tick_size":        meta.get("tick_size", "0.01"),
-                "neg_risk":         bool(meta.get("neg_risk", False)),
-                "hours_to_resolve": meta.get("hours_to_resolve"),
-                "event_slug":       meta.get("event_slug"),
-                "source_tx_hash":   f"{addr}:{cond}:{token}",
-                "source_wallet":    addr,
-                "consensus":        consensus,
-                "whale_wallet":     addr,
+                "market_id":      cond,
+                "token_id":       token,
+                "title":          meta.get("title") or "",
+                "outcome":        outcome,
+                "side":           "BUY",
+                "price":          round(vwap, 4),
+                "size_usdc":      round(agg_size, 2),
+                "fills":          bkt["fills"],
+                "tick_size":      meta.get("tick_size", "0.01"),
+                "neg_risk":       bool(meta.get("neg_risk", False)),
+                # BP5: carry the ISO end datetime so notification sites can
+                # recompute "time left" fresh at send time (never a frozen scalar).
+                "resolution_iso": meta.get("resolution_iso"),
+                "event_slug":     meta.get("event_slug"),
+                "source_tx_hash": f"{addr}:{cond}:{token}",
+                "source_wallet":  addr,
+                "consensus":      consensus,
+                "whale_wallet":   addr,
             }
             try:
                 row = insert_trade_signal({

@@ -64,6 +64,98 @@ def _hours_until(end_iso: str | None) -> float | None:
     return (end - datetime.now(timezone.utc)).total_seconds() / 3600
 
 
+def resolution_dt(obj: dict) -> datetime | None:
+    """
+    Select the authoritative resolution datetime from a Gamma market dict.
+
+    Candidate ISO strings (in authority order, most reliable first):
+      1. market endDateIso
+      2. events[0].endDate  — event boundary, correct for grouped/sports markets
+      3. market endDate     — often an understated placeholder; used as fallback
+
+    Parsing rules:
+      - Strings with timezone info → kept as-is.
+      - Naive strings (no tz) → assumed UTC.
+      - Date-only "YYYY-MM-DD" → 23:59:59Z of that day (never midnight, which
+        would understate the deadline by up to a full day).
+
+    Selection: return the LATEST candidate that is still in the future; if none
+    are in the future (market resolving/already resolved), return the latest
+    candidate overall so callers can detect the resolution window.
+
+    Note: gameStartTime is a match START, never a resolution — it must not be
+    used as the deadline.
+    """
+    now = datetime.now(timezone.utc)
+
+    def _parse_candidate(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        stripped = value.strip()
+        # Date-only "YYYY-MM-DD" → treat as end of day so we never understate.
+        if len(stripped) == 10 and stripped.count("-") == 2 and "T" not in stripped:
+            try:
+                y, m, d = (int(x) for x in stripped.split("-"))
+                return datetime(y, m, d, 23, 59, 59, tzinfo=timezone.utc)
+            except Exception:
+                pass
+        return _parse_iso(value)
+
+    events = obj.get("events") or []
+    event_end_iso = (events[0] or {}).get("endDate") if events else None
+
+    raw_candidates = [
+        obj.get("endDateIso"),
+        event_end_iso,
+        obj.get("endDate"),
+    ]
+
+    candidates: list[datetime] = []
+    for val in raw_candidates:
+        dt = _parse_candidate(val)
+        if dt is not None:
+            candidates.append(dt)
+
+    if not candidates:
+        return None
+
+    future = [c for c in candidates if c > now]
+    return max(future) if future else max(candidates)
+
+
+def format_time_left(resolution_iso: str | None,
+                     now: datetime | None = None) -> str:
+    """
+    Human-readable time until resolution, computed fresh at call time.
+
+    This is the canonical display formatter for every notification site;
+    it must NEVER read a cached/frozen scalar — always compute from the ISO string.
+    """
+    from core.config import settings as _s
+
+    dt = _parse_iso(resolution_iso)
+    now = now or datetime.now(timezone.utc)
+    if dt is None:
+        return "время уточняется"
+    delta = (dt - now).total_seconds()
+    if delta <= 0:
+        return "резолв скоро"
+    if delta < 3600:
+        return "<1 ч"
+    hours = delta / 3600
+    if delta < 86400:
+        if _s.show_resolution_in_et:
+            try:
+                from zoneinfo import ZoneInfo
+                et = dt.astimezone(ZoneInfo("America/New_York"))
+                return f"~{hours:.0f} ч (до {et.strftime('%H:%M')} ET)"
+            except Exception:
+                pass
+        return f"~{hours:.0f} ч"
+    d, rem_h = divmod(int(hours), 24)
+    return f"{d}д {rem_h}ч"
+
+
 def _parse_tokens(m: dict) -> list[dict]:
     """Return list of {token_id, outcome} for a market."""
     raw_ids = m.get("clobTokenIds")
@@ -98,9 +190,16 @@ def _build_market_meta(m: dict) -> dict | None:
     if not condition_id:
         return None
 
-    end_iso = m.get("endDateIso") or m.get("endDate")
-    hours_left = _hours_until(end_iso)
-    if hours_left is None or hours_left <= 0:
+    # Blueprint 5: use resolution_dt so the event boundary (events[0].endDate)
+    # takes priority over the per-market endDate, which is often an understated
+    # placeholder for grouped/sports markets.
+    res_dt = resolution_dt(m)
+    if res_dt is None:
+        return None
+
+    now = datetime.now(timezone.utc)
+    hours_left = (res_dt - now).total_seconds() / 3600
+    if hours_left <= 0:
         return None
     if hours_left > settings.market_max_hours_to_resolve:
         return None
@@ -119,11 +218,13 @@ def _build_market_meta(m: dict) -> dict | None:
     events = m.get("events") or []
     event_slug = (events[0].get("slug") if events else None) or m.get("slug")
 
+    res_iso = res_dt.isoformat()
     return {
         "condition_id": condition_id,
         "title": m.get("question", ""),
-        "end_date_iso": end_iso,
-        "hours_to_resolve": round(hours_left, 2),
+        "end_date_iso": res_iso,
+        "resolution_iso": res_iso,          # BP5: carry on the signal for fresh formatting
+        "hours_to_resolve": round(hours_left, 2),  # kept for internal window filter only
         "tick_size": str(m.get("orderPriceMinTickSize") or "0.01"),
         "min_size": float(m.get("orderMinSize") or 5),
         "neg_risk": bool(m.get("negRisk", False)),

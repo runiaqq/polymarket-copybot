@@ -231,6 +231,25 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   circuit breaker (25% drawdown from HWM → 24h pause), daily loss limit (10% of equity → pause
   to 00:00 UTC). `equity_hwm` and `copy_paused_until` stored on `users` (migration 010).
   `get_active_subscribers` honors `copy_paused_until`; `sync_positions` refreshes HWM each cycle.
+- **[BP5] Correct time-to-resolution parsing** (`core/polymarket.py`): `resolution_dt()` selects
+  the authoritative end datetime from market + event fields, prioritising `events[0].endDate`
+  (the event boundary) over the per-market `endDate` which is often an understated placeholder.
+  Date-only strings are treated as 23:59:59Z (end of day, never midnight). `format_time_left()`
+  computes the human-readable countdown fresh at notification send time — never a cached scalar.
+  `resolution_iso` is carried on the signal dict; all notification sites (`execute_copy._notify`,
+  `ai_filter._call_gpt`, `ai_filter.run_ai_analysis`) call `format_time_left` at send time.
+  Migration 012 is not required (signal is an in-memory dict).
+- **[BP6] Position state machine & terminal P&L** (`worker/tasks/manage_positions.py`): `close_position`
+  now books realized P&L from the actual sale proceeds (`shares_sold × best_bid − entry_cost`) and
+  calls `mark_trade_closed` (sets `status='closed'`, `result='closed'`, `redeemed_at=now`), removing
+  the row from `get_outstanding_copy_trades` permanently. Defense-in-depth guards added to
+  `reconcile_settlements` and `backfill_legacy_redemptions`: terminal-state check
+  (`has_terminal_trade`) and on-chain dust check (`ctf_token_balance / 1e6 < claim_dust_min_shares`)
+  block phantom re-claims. `redeem_position` applies the same guards plus hydrates the market
+  title from `trade_signals` when called from the on-chain reconciler path. `_resolve_user_for_notification`
+  hydrates the title from the ledger. New helpers: `get_open_trade_by_token`, `mark_trade_closed`,
+  `has_terminal_trade` in `core/db/queries.py`. Migration 012 (`exit_tx` column +
+  `(user_id, condition_id)` index) applied (see §6.9).
 
 ---
 
@@ -250,8 +269,11 @@ code MUST follow §5 (idempotency, fail-closed, key safety).
 
 ---
 
-> **Blueprints 1–4 have been implemented** (see §3 Working Features for details).
-> Migrations 008–010 are defined below and must be applied manually in the Supabase SQL editor.
+> **Blueprints 1–6 have been implemented** (see §3 Working Features for details).
+> Migrations 008–012 are defined below and must be applied manually in the Supabase SQL editor.
+>
+> All blueprints are now ✅ implemented. Migration 012 (exit_tx + user/condition index)
+> must be applied to the live DB before deploying this code (see §6.9 / §7.4).
 
 ---
 
@@ -691,6 +713,207 @@ are honored by both the fan-out and the pre-trade gate.
 
 ---
 
+### Blueprint 5 — Correct time-to-resolution parsing & display ✅ IMPLEMENTED
+
+**Symptom (live test):** the bot tells the user "до закрытия рынка ~1 ч" while the event
+actually runs until end of the US day (~12 h). The countdown is both **wrong** and **frozen**.
+
+**Root cause — three compounding defects, do NOT "just add hours":**
+
+1. **Wrong source field (dominant cause).** `core/polymarket._build_market_meta` reads
+   `end_iso = m.get("endDateIso") or m.get("endDate")` (`core/polymarket.py:101`). For any market
+   that belongs to an **event** (sports / daily / multi-outcome — i.e. most fast markets), the
+   *per-market* `endDate` is frequently an **understated placeholder** (a nominal cutoff or the
+   game's scheduled time), while the real resolution boundary is the **event** `endDate`
+   ("end of US day"). The event object is already fetched — `events = m.get("events")` — but only
+   `events[0].slug` is kept; **`events[0].endDate` is discarded.** That discarded field is the
+   correct one.
+2. **Frozen value, never recomputed.** `hours_to_resolve` is computed **once** at fast-markets
+   cache-build time (`refresh_fast_markets`, every `fast_markets_refresh_sec=120s`) and copied
+   verbatim into the signal (`worker/tasks/poll_tracked_wallets.py:259` → `meta.get("hours_to_resolve")`).
+   The user notification (`worker/tasks/execute_copy.py:660`) and the AI prompt
+   (`worker/tasks/ai_filter.py:50`) read `signal["hours_to_resolve"]` directly — a stale scalar,
+   never recomputed at send time. `core/detector._hours_fresh` already recomputes correctly **but
+   the live Model-B path never calls it**, and the signal does not even carry the ISO end date, so
+   downstream *cannot* recompute.
+3. **Timezone / date-only edge.** Polymarket ISO strings are UTC (`…Z`); the arithmetic in
+   `_hours_until` is correctly tz-aware, so there is **no EST math bug** — the EST aspect is purely
+   a *display* concern ("end of US day"). The real parsing trap is **date-only** strings
+   (`"2026-06-24"`), which `dateutil` parses to `00:00:00Z` — understating the deadline by up to a
+   full day.
+
+**Design — one authoritative time source, computed fresh, formatted for humans.**
+
+**(A) Single resolution-time resolver (pure, in `core/polymarket.py`).**
+```
+def resolution_dt(obj: dict) -> datetime | None:
+    # obj = a Gamma market dict OR a normalized position dict.
+    # Candidate ISO strings, in AUTHORITY order (most reliable first):
+    #   market endDateIso, event endDate (events[0].endDate), market endDate, position endDate
+    # Parse each → tz-aware UTC:
+    #   - naive (no tz)      → assume UTC
+    #   - date-only "YYYY-MM-DD" → 23:59:59Z of that day (END of day, never 00:00)
+    # Selection rule (this is the fix for the placeholder-endDate bug):
+    #   among all parsed candidates, return the LATEST one that is still in the future;
+    #   if none are in the future, return the latest candidate overall (resolving/closing).
+    # Rationale: Polymarket keeps a market tradeable until the real event concludes, and the
+    # per-market endDate is the field that UNDER-states; taking the latest plausible boundary
+    # (which is the event endDate for grouped markets) matches reality.
+    # gameStartTime is a START, not a resolution — never use it as the deadline.
+```
+
+**(B) Carry the ISO end on the signal, not a frozen scalar.**
+- In `_build_market_meta`: also extract `event_end_iso = (events[0] or {}).get("endDate")` and store
+  `resolution_iso = resolution_dt(m).isoformat()` in the meta (keep `hours_to_resolve` for the
+  internal window filter only — see (D)).
+- In `poll_tracked_wallets` signal dict: replace `"hours_to_resolve": meta.get("hours_to_resolve")`
+  with `"resolution_iso": meta.get("resolution_iso")` (and keep `hours_to_resolve` only if some
+  consumer still needs the coarse number).
+
+**(C) Format fresh at the moment of sending (pure, in `core/polymarket.py`).**
+```
+def format_time_left(resolution_iso: str | None, now: datetime | None = None) -> str:
+    dt = _parse_iso(resolution_iso); now = now or datetime.now(timezone.utc)
+    if dt is None:                    return "время уточняется"
+    delta = (dt - now).total_seconds()
+    if delta <= 0:                    return "резолв скоро"
+    if delta < 3600:                  return "<1 ч"
+    if delta < 86400:                 return f"~{delta/3600:.0f} ч"
+    d, h = divmod(int(delta // 3600), 24)   # d days, h hours
+    return f"{d}д {h}ч"
+```
+- Replace **every** display site that does `f"~{hours:.0f} ч"`:
+  `execute_copy._notify` (`hours_line`) and `ai_filter._call_gpt` (`hours=`) must call
+  `format_time_left(signal.get("resolution_iso"))` evaluated **at send time**, not the frozen field.
+- Optional nicety (recommended for "end of US day" markets): also render the ET wall-clock deadline
+  via `zoneinfo.ZoneInfo("America/New_York")`, e.g. `"до 23:59 ET (через ~12 ч)"`. This is display
+  only; all math stays in UTC.
+
+**(D) Keep `hours_to_resolve` for the coarse window filter only.** The
+`market_min/max_hours_to_resolve` gate in `_build_market_meta` can keep using the freshly computed
+hours from `resolution_dt` — small staleness there is harmless. It must **not** be surfaced to users.
+
+**Files:** `core/polymarket.py` (`resolution_dt`, `format_time_left`, use event endDate in
+`_build_market_meta`, add `resolution_iso` to meta), `worker/tasks/poll_tracked_wallets.py` (carry
+`resolution_iso` on the signal), `worker/tasks/execute_copy.py` (`_notify` formats fresh),
+`worker/tasks/ai_filter.py` (`_call_gpt` formats fresh), `core/detector.py` (route `_hours_fresh`
+through `resolution_dt` so all paths agree). No migration required (signal is an in-memory dict).
+
+**Config (optional):**
+```python
+show_resolution_in_et: bool = True   # also render the America/New_York deadline in notifications
+```
+
+**Acceptance:** for an event that resolves at end of US day, the notification and the AI prompt show
+~12 h (and optionally the ET deadline), not 1 h; the value is correct even minutes after the cache
+was built (recomputed at send time); date-only `endDate` markets are treated as end-of-day, never
+midnight; markets grouped under an event use the event boundary, not the understated per-market one.
+
+---
+
+### Blueprint 6 — Position state machine & P&L on manual / stop close ✅ IMPLEMENTED
+
+**Symptom (live test):** user manually sells a position **in profit**. Hours later the contract
+resolves on-chain and the bot (a) sends an **empty** win notification (no title) crediting **$0.01**
+of dust, then (b) immediately trips the **daily-loss limit** and blocks trading — though there was no
+loss.
+
+**Root cause — the ledger is never closed on a token-sale exit (code-cited):**
+
+1. `manage_positions.close_position` sells the outcome tokens, sets a **TTL-bound** Redis key
+   (`_claim_settled` → `settle:{uid}:{cond}`), and notifies the user — but **never updates the
+   `copy_trades` row**. The row stays `status='confirmed', redeemed_at IS NULL`.
+2. `get_outstanding_copy_trades` (`core/db/queries.py:378`) therefore keeps returning that row.
+   When the condition later resolves on-chain, `reconcile_settlements` acts on it. By then the
+   Redis `settle:`/`redeem:` keys set at close time have **expired** (TTL ≪ hours-to-resolution),
+   so the dedup guard is gone.
+3. If the exited outcome happens to **win**, reconcile dispatches `redeem_position`, which claims the
+   **dust** left behind by `close_position`'s floor-to-2-dp truncation (`manage_positions.py:281`,
+   `math.floor(shares*100)/100`), emits `_emit_win`/"Выигрыш зачислен" with `title=None, outcome=None`
+   (the empty message — symptom **a**), and writes
+   `realized_pnl = credited(≈$0.01) − entry_cost(full size)` ⇒ a large **phantom loss** on a
+   `result='win'` row.
+4. `get_daily_realized_pnl` sums that phantom negative ⇒ BP4 daily-loss breaker trips ⇒ trading
+   paused (symptom **b**). (On the loss branch reconcile would also write `-entry_cost` for an
+   already-exited position — double-counting.)
+
+**Design — the `copy_trades` ledger is the single state machine; a token-sale exit is TERMINAL.**
+
+**(1) Close = write the ledger, atomically, in `close_position`.** On a successful `sell_position`:
+- Compute realized P&L from the **actual sale**, not from any later resolution:
+  ```
+  entry_cost  = copy_trades.size_usdc          # filled cost basis (denormalized at fill)
+  proceeds    = shares_sold * fill_price        # executed sale value (from the sell result)
+  realized_pnl = proceeds - entry_cost          # correct sign immediately (+ on a profitable exit)
+  ```
+- Call a new `mark_trade_closed(trade_id, result='closed', realized_pnl, exit_tx)` that sets
+  `status='closed', result='closed', realized_pnl, resolved_at=now, redeemed_at=now`. Setting
+  `status='closed'` **and** `redeemed_at` removes the row from `get_outstanding_copy_trades` forever
+  (it filters `status='confirmed' AND redeemed_at IS NULL`) — independent of any Redis TTL.
+- This books Realized P&L into the daily stats **once, with the right sign, at close time**, and
+  permanently removes the position from the resolve / auto-claim queue.
+
+**(2) Find the row to close.** `close_position(user_id, token_id, reason)` lacks the trade id. Add
+`get_open_trade_by_token(user_id, token_id) -> dict|None` (status `confirmed`, `redeemed_at IS NULL`,
+matching `token_id`, newest first) to obtain `trade_id` + `size_usdc`. Where `sync_positions`
+dispatches `close_position` it may pass the `trade_id` directly when known.
+
+**(3) Make reconcile / backfill respect ledger state (defense in depth).**
+- `get_outstanding_copy_trades` already excludes `status!='confirmed'`, so step (1) auto-fixes the
+  main path. **Additionally**, in `backfill_legacy_redemptions` (which enumerates Data-API holdings
+  irrespective of the ledger) add a guard: before dispatching a redeem for `(uid, condition_id)`,
+  skip if any `copy_trades` row for that `(user_id, condition_id)` is in a **terminal** state
+  (`status IN ('closed') OR redeemed_at IS NOT NULL`). Helper: `has_terminal_trade(user_id, condition_id) -> bool`.
+
+**(4) Dust + active-trade guard in the claim path (covers legacy rows with NULL ledger fields).**
+Before any redeem **and** before any win/loss notification, in `redeem_position`,
+`reconcile_settlements`, and `backfill_legacy_redemptions`:
+- Read the on-chain ERC-1155 balance `CTF.balanceOf(deposit_wallet, token_id)` (the relayer already
+  reads this for neg-risk amounts — expose a small `get_ctf_balance(dw, token_id) -> int` helper).
+  Convert to shares; if `shares < claim_dust_min_shares` (or notional `shares * resolve_price <
+  claim_dust_min_usdc`), **skip the claim and the notification** and log `skip_dust_claim`. This
+  alone kills the empty "$0.01 win" message, even for pre-existing rows.
+- Require the trade to still be active: if a matching `copy_trades` row exists and is **terminal**,
+  skip (the user already exited — do not claim, do not notify).
+
+**(5) Never notify with a missing title.** `_emit_win`/`_emit_loss` must not fire with
+`title=None`. On the on-chain-only path, hydrate the title from the trade's `signal_id`
+(join `trade_signals.title`) or from the Data API position; if still unknown **and** the balance is
+dust, suppress entirely (per step 4). A real, non-dust win must always carry a human title.
+
+**(6) Leave genuine holds untouched.** For positions actually held to resolution,
+`realized_pnl = credited − entry_cost` stays correct **because** `credited` is the full redemption,
+not dust — the dust + terminal guards guarantee that formula never runs on an exited position.
+
+**Files:** `worker/tasks/manage_positions.py` (`close_position` books P&L + `mark_trade_closed`;
+`reconcile_settlements`/`backfill_legacy_redemptions`/`redeem_position` get dust + terminal-state +
+title guards), `core/db/queries.py` (`get_open_trade_by_token`, `mark_trade_closed`,
+`has_terminal_trade`), `core/relayer.py` (`get_ctf_balance` helper if not already exposed),
+`core/config.py` (knobs), `migrations/011_position_state.sql`.
+
+**Migration 011 (idempotent):**
+```sql
+-- 'result' is free-text; documented values now: win | loss | closed | null
+alter table copy_trades add column if not exists exit_tx text;
+create index if not exists idx_copy_trades_user_condition
+  on copy_trades (user_id, condition_id);
+```
+
+**Config:**
+```python
+claim_dust_min_shares: float = 1.0   # ignore outcome-token balances below this at claim time
+claim_dust_min_usdc:   float = 1.0   # …or notional floor (≈ exchange minimum) at resolve price
+```
+
+**Acceptance:** a manual (or hard-stop) close in profit immediately books `result='closed'` with a
+correct **positive** realized P&L and disappears from the outstanding queue; the later on-chain
+resolution produces **no** claim and **no** notification (dust + terminal guards); the daily-loss
+breaker is **not** tripped; genuine holds still redeem fully and send exactly one titled win/loss
+message; no empty or `$0.01` notifications ever occur; behavior is restart-safe because state lives in
+the DB ledger, not in Redis TTLs.
+
+---
+
 ### Other known gaps (lower priority)
 
 - **No automated tests / CI.** The new `core/sizing.py` and `core/risk.py` are pure functions — add
@@ -865,7 +1088,10 @@ Base (`models.py`) + migrations 001/006/007:
 
 > Idempotency uses `(user_id, signal_id)` + status (see §5.2). **Blueprint 1 (§4) adds settlement
 > columns** (`condition_id, token_id, outcome_index, neg_risk, entry_price, shares, result,
-> realized_pnl, resolved_at, redeemed_at, redeem_tx`) via migration 008 — **not yet applied**.
+> realized_pnl, resolved_at, redeemed_at, redeem_tx`) via migration 008. **Blueprint 6 (§4)** makes
+> a token-sale exit terminal: `status='closed'`, `result='closed'`, P&L booked from the actual sale,
+> plus `exit_tx` via migration 012 (apply before next deploy). `status='closed' OR redeemed_at IS NOT NULL`
+> ⇒ the row is permanently excluded from settlement/auto-claim.
 
 ### 6.5 `donor_wallets` — legacy donor-copy (Model A, dormant) — `models.py`
 
@@ -901,12 +1127,15 @@ super-admin (`ADMIN_TELEGRAM_ID` from env) is always authorized regardless of th
 - **008** — `copy_trades` settlement ledger (Blueprint 1) → `migrations/008_settlement_ledger.sql`
 - **009** — `tracked_wallets.avg_trade_usdc` (Blueprint 2) → `migrations/009_tracked_avg_size.sql`
 - **010** — `users.equity_hwm`, `users.copy_paused_until` (Blueprint 4) → `migrations/010_risk_controls.sql`
+- **011** — `users.sizing_mode` (per-user Kelly/fixed toggle) → `migrations/011_user_sizing_mode.sql`
+- **012** 🔴 — `copy_trades.exit_tx` + `(user_id, condition_id)` index (Blueprint 6) →
+  `migrations/012_position_state.sql` (also documents `copy_trades.result='closed'` for token-sale exits)
 
 ### 6.10 Migration order
 
 `001` whale strategy → `002` access codes → `003` username → `004` admins → `005` deposit wallets →
 `006` wallet score → `007` tracked wallets → `008` settlement ledger → `009` tracked avg size →
-`010` risk controls.
+`010` risk controls → `011` user sizing mode → `012` position state (exit_tx + user/condition index).
 
 ---
 
@@ -969,7 +1198,7 @@ columns that don't exist yet.
 2. Copy-paste the contents of each new `migrations/00X_*.sql` file and click **Run**.
 3. Apply in order: `008` → `009` → `010` → …
 
-**Migrations applied as of the last deploy (2026-06-22):** 001–010.
+**Migrations applied as of the last deploy (2026-06-22):** 001–010. Apply 011 and 012 before the next deploy.
 
 ### 7.5 Useful diagnostic commands
 
