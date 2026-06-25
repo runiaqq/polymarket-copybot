@@ -9,6 +9,9 @@ Integrations in this file:
   BP3 — fractional Kelly sizing (sizing_mode="kelly"); "fixed" keeps legacy behavior.
   BP4 — tail-risk gates (exposure cap, event cap, drawdown, daily loss) evaluated
          before place_order; pauses stored on users table.
+  BP7 — Gates 1 & 2 now clamp instead of hard-block on small balances.
+         concentration warn ("concentration_over_60") appended to the trade notification.
+         Soft-limit "$100" warning is mode-aware: shown only in kelly mode.
 """
 
 import asyncio
@@ -180,19 +183,22 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         equity = tradeable + open_value
         score = None
 
-    # ── BP3.1: soft balance warning — warn but never hard-block ─────────────
-    # A $3 wallet trades at the $1 platform minimum; we only skip when the wallet
+    # ── BP3.1 / BP7: soft balance warning — warn but never hard-block ────────
+    # A $5 wallet trades at the platform minimum; we only skip when the wallet
     # genuinely cannot afford even that minimum order.
+    # BP7: the "$100 recommended" warning is shown only in kelly mode — in fixed
+    # mode the user chose their own size, so we stay silent about balance.
     exchange_min = settings.exchange_min_order_usdc
     if equity < settings.recommended_min_balance_usdc:
-        from core.cache import notify_once as _no
-        if _no(f"trading_min:{user_id}", ttl=settings.lowbal_alert_throttle_sec):
-            _notify_trading_at_minimum(
-                user["telegram_id"], tradeable, settings.recommended_min_balance_usdc,
-            )
-        log.info("equity_below_recommended", user_id=user_id,
-                 equity=round(equity, 2),
-                 recommended=settings.recommended_min_balance_usdc)
+        if user_sizing_mode == "kelly":
+            from core.cache import notify_once as _no
+            if _no(f"trading_min:{user_id}", ttl=settings.lowbal_alert_throttle_sec):
+                _notify_trading_at_minimum(
+                    user["telegram_id"], tradeable, settings.recommended_min_balance_usdc,
+                )
+        log.debug("equity_below_recommended", user_id=user_id,
+                  equity=round(equity, 2),
+                  recommended=settings.recommended_min_balance_usdc)
 
     # Floor size up to the exchange minimum so Kelly's tiny fractions still execute.
     size_usdc = max(size_usdc, exchange_min)
@@ -301,7 +307,10 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
                   size=round(size_usdc, 4), exchange_min=exchange_min)
         return {"skipped": True, "reason": "depth_below_min_order"}
 
-    # ── BP4: tail-risk gates ─────────────────────────────────────────────────
+    # ── BP4 / BP7: tail-risk gates ───────────────────────────────────────────
+    # BP7: Gates 1 & 2 now clamp instead of hard-block on small balances.
+    # decision.max_stake is applied below; decision.warn is forwarded to _notify.
+    concentration_warn: str | None = None
     try:
         from core.risk import check_risk_gates
         from core.db import get_user_equity_hwm, get_daily_realized_pnl
@@ -337,6 +346,17 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             log.info("skip_risk_gate", user_id=user_id,
                      gate=gate, reason=decision.reason[:80])
             return {"skipped": True, "reason": f"risk_gate:{gate}"}
+
+        # BP7: apply clamped stake when Gates 1/2 reduced it (e.g. partial headroom).
+        if decision.max_stake is not None:
+            clamped = max(min(decision.max_stake, tradeable), exchange_min)
+            log.info("risk_gate_clamp_applied", user_id=user_id,
+                     original=round(size_usdc, 2), clamped=round(clamped, 2),
+                     gate=decision.gate)
+            size_usdc = clamped
+
+        # Carry the concentration warning forward to the trade notification.
+        concentration_warn = decision.warn
     except Exception:
         log.warning("risk_gate_check_failed", user_id=user_id)
 
@@ -458,7 +478,8 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
                  fill=fill_status, filled=round(filled, 2),
                  shares=shares_filled, cond=(cond or "")[:14])
         _notify(user["telegram_id"], signal, order_id, size_usdc, filled,
-                fill_status, remaining, score_val, verdict, reason)
+                fill_status, remaining, score_val, verdict, reason,
+                concentration_warn=concentration_warn)
 
         return {"order_id": order_id, "user_id": user_id,
                 "fill": fill_status, "filled": filled}
@@ -641,8 +662,13 @@ def _notify(
     ai_score: int | None = None,
     ai_verdict: str | None = None,
     ai_reason: str | None = None,
+    concentration_warn: str | None = None,
 ) -> None:
-    """One combined message: trade result + AI analysis + balance remaining."""
+    """One combined message: trade result + AI analysis + balance remaining.
+
+    concentration_warn: when "concentration_over_60" (BP7), append a risk note
+    about position concentration directly into this message (no separate alert).
+    """
     from telegram import Bot
     from core.config import settings
     from core.polymarket import event_url
@@ -694,6 +720,11 @@ def _notify(
                     f"💬 {ai_reason}"
                 )
 
+            # BP7: inline concentration note — appended here, no separate message.
+            concentration_line = ""
+            if concentration_warn == "concentration_over_60":
+                concentration_line = "\n⚠️ Позиция заняла >60% капитала — риск концентрации"
+
             msg = (
                 f"{head}\n\n"
                 f"📌 {title_html}\n"
@@ -702,6 +733,7 @@ def _notify(
                 + "━━━━━━━━━━━━━━━━━\n"
                 f"💵 Бот вложил: <b>${invested:.2f}{partial_note}</b>\n"
                 f"💼 Остаток: <b>${remaining:.2f} pUSD</b>"
+                f"{concentration_line}"
                 f"{ai_block}"
                 f"{link_line}"
             )

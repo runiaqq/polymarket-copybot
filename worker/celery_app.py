@@ -46,6 +46,9 @@ celery_app.conf.update(
     enable_utc=True,
     task_acks_late=True,
     worker_prefetch_multiplier=1,   # fair dispatch — important for trade tasks
+    # BP7 hygiene: expire task result keys after 1 h to prevent the
+    # celery-task-meta-* key explosion observed in prod (7800+ keys).
+    result_expires=3600,
     task_routes={
         "worker.tasks.execute_copy_trade": {"queue": "trades"},
         "worker.tasks.close_position": {"queue": "trades"},

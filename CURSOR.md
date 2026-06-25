@@ -250,6 +250,18 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   hydrates the title from the ledger. New helpers: `get_open_trade_by_token`, `mark_trade_closed`,
   `has_terminal_trade` in `core/db/queries.py`. Migration 012 (`exit_tx` column +
   `(user_id, condition_id)` index) applied (see §6.9).
+- **[BP7] Small-balance silent-skip fix: exposure-cap clamping + sizing-mode-aware messaging**
+  (`core/risk.py`, `worker/tasks/execute_copy.py`, `worker/celery_app.py`): Eliminated the prod
+  silent-skip where BP4's Gate 1 (`exposure_cap`) hard-blocked every trade for sub-$100 balances.
+  Gates 1 & 2 (`RiskDecision`) now carry `max_stake` and `warn` fields and clamp instead of blocking:
+  if headroom ≥ exchange_min → clamp stake to headroom; if headroom < exchange_min and
+  equity < recommended → enter at the platform minimum (`exchange_min_order_usdc`) with
+  `warn="concentration_over_60"`; if equity ≥ $100 → still block (funded but fully deployed).
+  The concentration warning is appended inline to the existing trade success notification — no
+  separate spam message. Soft-limit "$100" warning (`_notify_trading_at_minimum`) is now
+  mode-aware: fires only in `kelly` mode (rationale holds for Kelly; in `fixed` mode the user
+  set their own size → stay silent). `result_expires=3600` added to Celery to prevent
+  `celery-task-meta-*` key explosion in Redis. No new migration required.
 
 ---
 
@@ -271,9 +283,12 @@ code MUST follow §5 (idempotency, fail-closed, key safety).
 
 > **Blueprints 1–6 have been implemented** (see §3 Working Features for details).
 > Migrations 008–012 are defined below and must be applied manually in the Supabase SQL editor.
+> Migration 012 (exit_tx + user/condition index) must be applied to the live DB before deploying
+> this code (see §6.9 / §7.4).
 >
-> All blueprints are now ✅ implemented. Migration 012 (exit_tx + user/condition index)
-> must be applied to the live DB before deploying this code (see §6.9 / §7.4).
+> ✅ **Blueprint 7 is IMPLEMENTED** — fixes the prod silent-skip where Blueprint 4's
+> exposure cap hard-blocked every trade on small balances. Gates 1 & 2 now clamp.
+> No new migration required.
 
 ---
 
@@ -911,6 +926,87 @@ resolution produces **no** claim and **no** notification (dust + terminal guards
 breaker is **not** tripped; genuine holds still redeem fully and send exactly one titled win/loss
 message; no empty or `$0.01` notifications ever occur; behavior is restart-safe because state lives in
 the DB ledger, not in Redis TTLs.
+
+---
+
+### Blueprint 7 — Small-balance silent-skip RCA: exposure-cap → warn-only + sizing-mode-aware messaging ✅ IMPLEMENTED
+
+**Symptom (prod, silent failure).** A small-balance user receives the "торгуем на минимальном объёме"
+soft-limit alert, and then the bot **opens no positions at all** — no new trades, no error in the
+worker logs, no user-facing failure. The bot looks alive but never trades.
+
+**Root cause (from prod worker logs, user_id=2).** This is **not** an Ethers/decimals, relayer, CLOB,
+or event-loop problem (all ruled out by logs: no `place_order_failed`, no web3/signature tracebacks,
+worker heartbeat + periodic tasks healthy). The trade dies on **Blueprint 4's Gate 1 (exposure_cap)**,
+which **hard-skips** instead of clamping:
+```
+[info] equity_below_recommended       equity=14.21 recommended=100.0 user_id=2     # the soft-limit alert
+[info] skip_risk_gate  gate=exposure_cap
+       reason='Открытые позиции (5.00$) + ставка (8.00$) превышают 60% капитала.'  # every signal dies here
+```
+Math: `equity≈$14.21`, open `$5.00`, fixed stake `$8.00`, cap `0.60 × 14.21 = $8.53`. Since
+`5.00 + 8.00 = 13.00 > 8.53` every BUY is blocked. **At low equity the $5 platform minimum order and
+the 60% exposure cap are mathematically incompatible**: after the first position there is almost no
+headroom left for a new one. The skip is logged at `info` and the `skip_risk_gate` user alert is
+throttled to once/hour (`notify_once(..., ttl=3600)`), so after the first soft-limit message the user
+sees only silence. (Secondary, **not** a bug: many signals also legitimately hit
+`skip_price_out_of_range` because tracked whales buy favorites priced > `max_entry_price=0.95`.)
+
+**Product decision (agreed).** Below the recommended balance, **never block** on the exposure cap —
+trade what fits, and if even the minimum order can't fit under the cap, **place it anyway and warn**
+that the bot entered with >60% of balance. `$100` stays a recommendation, shown **conditionally on the
+sizing mode**.
+
+**Fix (sub-blueprints):**
+
+1. **Capacity gates clamp, never silent-block (core RCA fix).** In `core/risk.py`, Gates 1
+   (exposure_cap) and 2 (event_cap) stop returning a hard `allowed=False`. Extend `RiskDecision` with
+   `max_stake: float | None` and `warn: str | None`. Compute `headroom = cap − already_deployed`:
+   - `headroom ≥ stake` → allow, no message.
+   - `exchange_min ≤ headroom < stake` → **clamp** `max_stake = headroom` (enter smaller, under cap, no
+     warning).
+   - `headroom < exchange_min ($5)`:
+     - equity **< `recommended_min_balance_usdc` ($100)** → **enter at the $5 minimum, cap ignored**,
+       set `warn="concentration_over_60"`.
+     - equity **≥ $100** → throttled honest message + skip (rare: funded but ~fully deployed account;
+       never silent).
+   - **Gates 3 & 4 (drawdown, daily_loss) are unchanged** — loss-breakers must still pause.
+   In `execute_copy_trade`, apply `decision.max_stake` (re-floor to `exchange_min`, re-clamp to
+   `tradeable`) and forward `decision.warn` to the trade notification.
+
+2. **Sizing-mode-aware messaging.** In `worker/tasks/execute_copy.py`:
+   - Soft-limit "$100" warning (`_notify_trading_at_minimum` + `equity_below_recommended`) fires
+     **only in `kelly` mode** (Kelly without capital yields tiny stakes — rationale holds). In `fixed`
+     mode the user chose their own size → **stay silent about balance** during trading.
+   - The **concentration warning** (`warn="concentration_over_60"`) is appended as a line to the
+     existing success notification `_notify` (not a separate spam message) and shows in **both** modes
+     (it's a risk note, not a balance nag): e.g. "⚠️ Позиция заняла >60% капитала — риск концентрации".
+   - Drop `equity_below_recommended` to `log.debug`.
+
+3. **Onboarding one-time recommendation.** At wallet registration/setup, send **once** (idempotent via
+   a `users` flag or `notify_once`): recommend choosing **Kelly** and topping up to **≥ $100**, with a
+   one-line rationale. Never blocks.
+
+4. **Centralize the "$100 recommended + why" copy** in one place, reused by onboarding, the Kelly
+   low-balance warning, and the `/wallet` + sizing-settings screens, so wording stays consistent.
+
+5. **(Hygiene, optional, unrelated to the RCA)** Celery result backend bloat observed in prod
+   (`celery-task-meta-*`, 7800+ keys in Redis). Add `result_expires` (e.g. 3600s) in
+   `worker/celery_app.py`.
+
+**Files:** `core/risk.py` (Gate 1/2 clamp + `RiskDecision.max_stake/warn`), `worker/tasks/execute_copy.py`
+(apply clamp; mode-gate soft-limit alert; append concentration warning to `_notify`), onboarding handler
+(`core/clob.register_deposit_wallet` / Telegram setup flow — locate at implementation), shared messaging
+copy module, optional `worker/celery_app.py` (`result_expires`).
+
+**Config:** no new keys required; behavior keyed off existing `recommended_min_balance_usdc` (100),
+`exchange_min_order_usdc` (5.0), `max_portfolio_exposure_pct` (0.60), `sizing_mode` ("fixed").
+
+**Acceptance:** a ~$14 wallet with an open $5 position **still copies** (enters at the $5 minimum) and
+receives a single "entered >60% of capital" concentration note instead of silence; in `fixed` mode no
+per-trade balance warnings are sent; in `kelly` mode the "recommend ≥ $100" warning is shown (throttled);
+funded accounts (≥ $100) keep the real exposure cap via clamping and are never silently skipped; no
+`skip_risk_gate gate=exposure_cap` ever results in a silent no-trade for sub-$100 balances.
 
 ---
 
