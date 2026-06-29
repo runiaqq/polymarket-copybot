@@ -174,16 +174,20 @@ def sync_positions() -> dict:
                            event_slug=c.get("event_slug"))
             actions += 1
 
-        # ── BP4: update HWM + check circuit breakers ──────────────────────────
+        # ── BP4/BP8: update HWM + check circuit breakers (cost-basis equity) ────
         try:
             from core.polygon import get_balances as _gb
+            from core.risk import total_equity
+            from core.db import get_open_trades_cost
             free_pusd = _gb(wallet).get("pusd", 0.0) if wallet else 0.0
-            open_val = sum(
-                float(p.get("current_value") or 0)
-                for p in (positions or []) if p.get("shares", 0) > 0
+            ledger_cost = get_open_trades_cost(uid)
+            equity = total_equity(
+                free_pusd,
+                positions or [],
+                ledger_cost,
+                mode=settings.drawdown_equity_mode,
             )
-            equity = free_pusd + open_val
-            _update_hwm_and_check_breakers(user, equity)
+            _update_hwm_and_check_breakers(user, equity, free_pusd, positions or [])
         except Exception:
             log.warning("hwm_update_failed", user_id=uid)
 
@@ -867,28 +871,63 @@ def _resolve_user_for_notification(sb, uid: int, cond: str,
 
 # ── Blueprint 4: HWM + circuit-breaker update in sync_positions ──────────────
 
-def _update_hwm_and_check_breakers(user: dict, equity: float) -> None:
-    """
-    Called once per sync cycle per user.  Updates the equity HWM and evaluates
-    drawdown / daily-loss circuit breakers.  Sets copy_paused_until when tripped.
+def _notify_with_markup(telegram_id: int, text: str, reply_markup=None) -> None:
+    """Send a Telegram message, optionally with an InlineKeyboardMarkup."""
+    from telegram import Bot
+    from core.config import settings as s
+
+    async def _send() -> None:
+        bot = Bot(token=s.telegram_bot_token)
+        await bot.send_message(
+            chat_id=telegram_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+
+    try:
+        asyncio.run(_send())
+    except Exception:
+        log.exception("notify_with_markup_failed", telegram_id=telegram_id)
+
+
+def _update_hwm_and_check_breakers(
+    user: dict,
+    equity: float,
+    free_pusd: float = 0.0,
+    positions: list | None = None,
+) -> None:
+    """BP4/BP8 — Compare-and-set state machine for the drawdown / daily-loss breakers.
+
+    Key BP8 changes vs legacy:
+    - Notification sent ONLY on state TRANSITION (active → paused_*), never on repeat.
+    - Auto-resume transition (paused_* → active after cooldown) also notifies once.
+    - Inline "Снять блокировку" button attached to the pause message.
+    - Re-evaluating while already paused does nothing (no re-pause, no re-notify).
     """
     from core.db import (
-        get_daily_realized_pnl, get_user_equity_hwm,
-        pause_user_copying, resume_user_copying, update_user_equity_hwm,
+        get_daily_realized_pnl, get_risk_state, get_user_equity_hwm,
+        pause_user_copying, resume_user_copying, set_risk_state,
+        update_user_equity_hwm,
     )
     from core.cache import notify_once as _no
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
     uid = user["id"]
     tg = user["telegram_id"]
 
     try:
-        hwm = max(get_user_equity_hwm(uid), equity)
-        if equity > get_user_equity_hwm(uid):
+        current_state = get_risk_state(uid)
+
+        # ── Update HWM when equity is at a new peak ───────────────────────────
+        stored_hwm = get_user_equity_hwm(uid)
+        hwm = max(stored_hwm, equity)
+        if equity > stored_hwm:
             update_user_equity_hwm(uid, equity)
 
-        # Auto-resume an expired pause.
+        # ── Auto-resume: transition paused_* → active when cooldown elapsed ──
         paused_until = user.get("copy_paused_until")
-        if paused_until:
+        if paused_until and current_state in ("paused_drawdown", "paused_daily_loss"):
             try:
                 from dateutil.parser import parse as _parse_dt
                 pu = _parse_dt(paused_until)
@@ -896,33 +935,49 @@ def _update_hwm_and_check_breakers(user: dict, equity: float) -> None:
                     pu = pu.replace(tzinfo=timezone.utc)
                 if pu <= datetime.now(timezone.utc):
                     resume_user_copying(uid)
-                    log.info("copy_pause_expired", user_id=uid)
-                    return  # paused was active but now cleared — no breach checks
+                    set_risk_state(uid, "active")
+                    if _no(f"resume_alert:{uid}", ttl=3600):
+                        _notify(tg,
+                            "▶️ <b>Копирование возобновлено</b>\n\n"
+                            "Период охлаждения истёк. Бот снова следит за китами."
+                        )
+                    log.info("copy_pause_expired_auto_resume", user_id=uid)
+                    return
             except Exception:
                 pass
+
+        # ── If already paused — do nothing (no re-pause, no re-notify) ────────
+        if current_state in ("paused_drawdown", "paused_daily_loss"):
+            return
 
         if equity <= 0:
             return
 
-        # Drawdown circuit breaker.
+        # ── Drawdown circuit breaker ──────────────────────────────────────────
         drawdown = (hwm - equity) / hwm if hwm > 0 else 0.0
         if drawdown >= settings.max_drawdown_pct:
             pause_until = (
                 datetime.now(timezone.utc) + timedelta(seconds=settings.drawdown_cooldown_sec)
             ).isoformat()
             pause_user_copying(uid, pause_until)
-            if _no(f"drawdown_alert:{uid}", ttl=settings.drawdown_cooldown_sec):
-                _notify(tg,
-                    f"🛑 <b>Просадка {drawdown*100:.1f}%</b>\n\n"
-                    f"Капитал упал до <b>${equity:.2f}</b> от пика <b>${hwm:.2f}</b>.\n"
-                    f"Копирование приостановлено на 24 ч для защиты депозита.\n"
-                    f"Бот возобновится автоматически."
-                )
+            set_risk_state(uid, "paused_drawdown")
+            # Notify exactly once on the active → paused_drawdown transition.
+            unblock_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔓 Снять блокировку", callback_data="unlock_drawdown")
+            ]])
+            _notify_with_markup(
+                tg,
+                f"🛑 <b>Просадка {drawdown*100:.1f}%</b>\n\n"
+                f"Капитал: <b>${equity:.2f}</b> от пика <b>${hwm:.2f}</b>.\n"
+                f"Копирование приостановлено на 24 ч для защиты депозита.\n\n"
+                f"Бот возобновится автоматически через 24 ч, или нажми кнопку ниже.",
+                reply_markup=unblock_kb,
+            )
             log.info("drawdown_breaker_tripped", user_id=uid,
                      drawdown=round(drawdown, 4), equity=round(equity, 2))
             return
 
-        # Daily loss limit.
+        # ── Daily loss limit ──────────────────────────────────────────────────
         daily_pnl = get_daily_realized_pnl(uid)
         if daily_pnl <= -(settings.daily_loss_limit_pct * equity):
             next_utc_day = (
@@ -931,13 +986,19 @@ def _update_hwm_and_check_breakers(user: dict, equity: float) -> None:
                 ) + timedelta(days=1)
             ).isoformat()
             pause_user_copying(uid, next_utc_day)
-            if _no(f"daily_loss_alert:{uid}", ttl=86400):
-                _notify(tg,
-                    f"📉 <b>Дневной лимит убытков</b>\n\n"
-                    f"Убыток сегодня: <b>${abs(daily_pnl):.2f}</b> "
-                    f"(>{settings.daily_loss_limit_pct*100:.0f}% капитала).\n"
-                    f"Копирование остановлено до 00:00 UTC."
-                )
+            set_risk_state(uid, "paused_daily_loss")
+            unblock_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔓 Снять блокировку", callback_data="unlock_drawdown")
+            ]])
+            _notify_with_markup(
+                tg,
+                f"📉 <b>Дневной лимит убытков</b>\n\n"
+                f"Убыток сегодня: <b>${abs(daily_pnl):.2f}</b> "
+                f"(>{settings.daily_loss_limit_pct*100:.0f}% капитала).\n"
+                f"Копирование остановлено до 00:00 UTC.\n\n"
+                f"Можешь снять блокировку вручную, приняв риск на себя.",
+                reply_markup=unblock_kb,
+            )
             log.info("daily_loss_limit_tripped", user_id=uid,
                      daily_pnl=round(daily_pnl, 2), equity=round(equity, 2))
     except Exception:

@@ -272,8 +272,11 @@ Treat every formula and contract call as authoritative; do not substitute your o
 code MUST follow §5 (idempotency, fail-closed, key safety).
 
 **Conventions used below**
-- `equity(user)` = pUSD in the deposit wallet **+** sum of current value of open positions
-  (`get_balances(dw).pusd + Σ position.current_value`). Use **free pUSD only** where a cash balance is
+- `equity(user)` = pUSD in the deposit wallet **+** value of open positions. For **display/info**, value
+  positions at mark (`get_balances(dw).pusd + Σ position.current_value`). For the **drawdown breaker, HWM,
+  and exposure gates**, value open positions at **cost basis** (filled entry cost), not at the depressed
+  mark — see **Blueprint 8** (`drawdown_equity_mode="cost_basis"`). Marking open, un-resolved positions to
+  the live bid fabricated a phantom drawdown in live tests. Use **free pUSD only** where a cash balance is
   required (placing a new order). Never count unredeemed/illiquid tokens as free cash.
 - `p` = entry price of a YES/NO share (0–1). `q` = estimated true win probability.
 - All new tunables live in `core/config.py`; all new columns in a new `migrations/00X_*.sql` + a helper
@@ -289,6 +292,14 @@ code MUST follow §5 (idempotency, fail-closed, key safety).
 > ✅ **Blueprint 7 is IMPLEMENTED** — fixes the prod silent-skip where Blueprint 4's
 > exposure cap hard-blocked every trade on small balances. Gates 1 & 2 now clamp.
 > No new migration required.
+>
+> ✅ **Blueprint 8 is IMPLEMENTED** — fixes the live-test
+> **phantom drawdown** (cost-basis equity replaces mark-to-market on open positions),
+> the **block-alert spam** (compare-and-set state machine, notify only on transition),
+> the **mode-asymmetric per-trade risk cap** (unified cap applies in both fixed and Kelly),
+> and adds a **manual "🔓 Снять блокировку" inline button** with consent audit trail.
+> **Migration 013 applied** (`risk_state`, `risk_override_at`, `risk_override_count`,
+> `realized_baseline` columns on `users`).
 
 ---
 
@@ -1010,6 +1021,296 @@ funded accounts (≥ $100) keep the real exposure cap via clamping and are never
 
 ---
 
+### Blueprint 8 — Equity accounting RCA: phantom drawdown, unified per-trade risk cap, manual override ✅ IMPLEMENTED
+
+**Symptoms (live test, real funds):**
+1. **Phantom drawdown + auto-block.** The bot enters a trade for almost the whole
+   balance. The funds lock into an open (un-resolved) Polymarket position. The bot
+   *immediately* records equity falling from **$18.07 → $12.95** and pauses copying
+   on **"Просадка 28.3%"**, even though nothing actually lost — the position is just
+   open and un-resolved.
+2. **Block-alert spam.** After the pause, the user keeps receiving repeated
+   "копирование приостановлено" notifications over time.
+3. **(Problem 2)** A fully-lost trade in `fixed` mode wipes the entire accumulated
+   profit; the stop-loss behaves inconsistently between `fixed` and `kelly`.
+4. **(Problem 3)** There is no way for the user to lift a drawdown pause early.
+
+**Root cause — three independent defects (code-cited). Do NOT "just lower the
+drawdown threshold" — that hides the bug and weakens real protection.**
+
+**✅ Confirmed by production worker logs (`drawdown_breaker_tripped`, 2026-06-26 → 29):**
+```
+2026-06-28 20:23:38  drawdown_breaker_tripped  drawdown=0.2834  equity=12.95  user_id=1
+2026-06-29 20:27:40  drawdown_breaker_tripped  drawdown=0.2834  equity=12.95  user_id=1   ← identical, ~24h later
+2026-06-27 20:19:42  drawdown_breaker_tripped  drawdown=0.6292  equity=6.70   user_id=1
+2026-06-29 00:03:37  drawdown_breaker_tripped  drawdown=0.6046  equity=8.45   user_id=2
+```
+Two independent confirmations, both predicted above:
+1. **Phantom & frozen (RCA-1).** `equity=12.95, drawdown=0.2834` is the exact reported
+   symptom, and it recurs **with byte-identical values 24 h apart** (06-28 20:23 →
+   06-29 20:27). Equity is *stuck* because the position is held and un-resolved — the
+   breaker is reacting to a frozen mark-to-market markdown, not to any realized loss.
+   The deeper trips (62.9% / 60.5%) are the same effect compounded across several open
+   lots (incl. a cheap longshot: `filled=4.85 shares=28.5` ⇒ entry ≈ 0.17, marked even
+   lower). All `copy_trade_ok` lines show clean `fill=full` — **nothing actually lost.**
+2. **Re-pause spam loop (RCA-2).** The 24 h gap = `drawdown_cooldown_sec` (86 400 s): the
+   pause expires → `sync_positions` auto-resumes → the very next cycle re-evaluates the
+   **same frozen markdown** → re-trips → re-notifies. This is the user-visible
+   "повторно шлёт уведомления" spam, and it will repeat every 24 h forever until the
+   underlying market resolves. Cost-basis equity (RCA-1 fix) breaks the loop at the
+   source; the transition-only state machine (RCA-2 fix) stops the re-notify.
+
+#### RCA-1 — Equity is marked-to-market on the open position's depressed price
+
+`equity = free_pusd + Σ current_value`, computed identically in three places:
+- `worker/tasks/execute_copy.py:142-149` and `:176-183` (pre-trade gate),
+- `worker/tasks/manage_positions.py:181-186` (`sync_positions` HWM update),
+- `core/risk.py:72-74` (`open_exposure` inside the gate).
+
+`current_value = shares × curPrice` (`core/polymarket.py:440`), where `curPrice` is
+Polymarket's **live mark** (bid/mid side). The instant a BUY fills, the position is
+re-priced at this mark, which for a freshly-bought fast-resolving favorite sits
+**below entry** (spread + thin-book mark). So the act of opening a trade converts
+cash into a position whose *marked* value is lower than what we just paid:
+
+```
+before:  free=$18.07, open=$0          → equity=$18.07   → HWM=$18.07
+buy ~$15 into one position
+after:   free≈$3.05,  current_value≈$9.90 (marked at curPrice, not entry)
+         → equity=$12.95               → drawdown=(18.07-12.95)/18.07 = 28.3%
+```
+
+28.3% > `max_drawdown_pct` (0.25) ⇒ the breaker trips on a position that has **not
+resolved and has not lost anything**. The HWM was captured on all-cash equity, then
+compared against marked-down equity one cycle later. **Mark-to-market noise on open,
+un-resolved positions is being treated as realized drawdown.** This is the phantom.
+
+**Fix — drawdown/HWM must run on a REALIZED (cost-basis) equity definition.**
+Opening a position is **capital-neutral**: cash becomes cost basis of equal value.
+Define a single authoritative function (pure, in `core/risk.py`):
+
+```
+def total_equity(free_pusd, open_positions, ledger_cost_by_token, cfg) -> float:
+    # cost_basis per open position, in AUTHORITY order:
+    #   1) copy_trades.size_usdc for the matching open trade (true filled cost)   ← preferred
+    #   2) shares * avg_price    (Data-API cost basis fallback)
+    #   3) current_value         (last-resort mark, only if no cost basis known)
+    open_cost = Σ cost_basis(p)  for p in open_positions if p.shares > 0
+    return free_pusd + open_cost
+```
+
+- The **drawdown circuit breaker, HWM, exposure cap, and event cap** all switch to
+  this cost-basis equity (`drawdown_equity_mode="cost_basis"`, default). With it,
+  the buy above gives `equity = 3.05 + 15.00 = 18.05 ≈ HWM` → **drawdown ≈ 0%**, no
+  false trip. A breaker only fires when a position **actually resolves/closes at a
+  loss** — and that realized loss is already booked on the `copy_trades` ledger
+  (`realized_pnl`, BP1/BP6) and flows through `get_daily_realized_pnl`.
+- Mark-to-market (`current_value`/`cur_price`) stays for **display only** (P&L
+  screens, position lists) — never for the breaker.
+- `drawdown_equity_mode="mark"` preserves the legacy behaviour for instant rollback.
+
+> **Why cost-basis, not mark:** binary Polymarket positions are held to resolution
+> (§2.5). Their interim mark is economically meaningless (illiquid, wide spread) and
+> mean-reverts to $1 or $0 at resolve. Drawdown protection must react to **realized**
+> capital destruction, not to transient bid marks on positions we intend to hold.
+
+#### RCA-2 — Broken pause state machine → duplicate / repeated block alerts
+
+- **Two notifiers, two throttle keys.** The drawdown pause is announced from
+  *both* `manage_positions._update_hwm_and_check_breakers` (`:914`,
+  `notify_once("drawdown_alert:{uid}", ttl=86400)`) *and*
+  `execute_copy_trade` (`:331`, `notify_once("risk_gate:{uid}:drawdown", ttl=3600)`).
+  Different keys ⇒ the user gets **two** alerts per event, and the 1 h key lets the
+  execute path **re-alert every hour** while paused.
+- **Re-pause every cycle.** `sync_positions` runs every 120 s; while equity stays
+  below the HWM threshold it calls `pause_user_copying` again each pass, pushing
+  `copy_paused_until` forward — so a *persistent* (phantom) markdown can keep the
+  account paused indefinitely and re-evaluate forever. There is no explicit state,
+  only an inferred timestamp.
+
+**Fix — one explicit state machine, notify once on transition.** Add a
+`users.risk_state` column and make the *transition* (not the evaluation) the event:
+
+```
+states: active → paused_drawdown → active
+        active → paused_daily_loss → active
+        paused_* → override_active → active   (manual unblock, RCA-3)
+
+transition rules (evaluated only in sync_positions / the single breaker owner):
+  active        & drawdown ≥ max_drawdown_pct  → set paused_drawdown,
+                                                 set copy_paused_until,
+                                                 send ONE notification (with unblock button)
+  paused_*      & cooldown elapsed             → set active (auto-resume), notify once
+  paused_*      & still tripped                → DO NOTHING (no re-pause, no re-notify)
+```
+
+- **Single owner of the notification.** Only `sync_positions` sends the pause alert
+  (on the `active → paused_*` edge). `execute_copy_trade` becomes a pure *enforcer*:
+  it still honors `copy_paused_until` and skips the trade, but **never sends the
+  pause notification** (drop the `_notify_risk_pause` call for the `drawdown`/
+  `daily_loss` gates; keep it only for genuinely new info if any). This removes the
+  second path entirely.
+- **Idempotent transition guard.** The notification fires only when
+  `risk_state` actually changes value (compare-and-set), so repeated evaluations
+  while already `paused_drawdown` send nothing — independent of any Redis TTL.
+- Keep a Redis `notify_once` as a belt-and-suspenders cross-process guard, but the
+  DB `risk_state` edge is the source of truth.
+
+#### Problem 2 — Unified Risk-per-Trade Cap (mode-agnostic stop-loss)
+
+**Root cause:** `max_risk_per_trade` (0.05 of equity) is enforced **only inside
+`kelly_stake`** (`core/sizing.py:94`). The `fixed` branch
+(`execute_copy.py:169-172`) sizes `min(user_max, depth_cap)` with **no** per-trade
+equity ceiling. A user with `max_position_usdc=$25` on a `$30` balance bets ~83% of
+equity; one fully-lost binary trade (worst case = the entire stake) erases the whole
+account / all accumulated profit.
+
+**Fix — hoist the cap out of Kelly into one place that runs in BOTH modes.** After
+sizing (Kelly *or* fixed) and before the BP4/BP7 gates, in `execute_copy_trade`:
+
+```
+# Unified per-trade risk cap — applies regardless of sizing_mode.
+if cfg.enforce_risk_per_trade_cap:
+    hard_cap = cfg.max_risk_per_trade * equity        # e.g. 0.05 × equity
+    size_usdc = min(size_usdc, hard_cap)
+
+# Profit-protection (trailing): never let one trade's worst-case loss (= full stake
+# for a binary outcome) give back more than a fraction of accumulated realized profit.
+profit_above_baseline = max(0.0, equity_hwm - realized_baseline)   # see note
+if cfg.max_trade_loss_vs_profit_pct > 0 and profit_above_baseline > 0:
+    size_usdc = min(size_usdc, cfg.max_trade_loss_vs_profit_pct * profit_above_baseline
+                               + cfg.max_risk_per_trade * realized_baseline)
+
+# Then the existing BP7 small-balance semantics still apply:
+size_usdc = max(size_usdc, exchange_min)   # floor (small accounts still trade)
+size_usdc = min(size_usdc, tradeable)      # never spend more than free pUSD
+```
+
+- This makes the stop-loss **structural**: the maximum loss of any single trade is
+  bounded by `max_risk_per_trade × equity` (5%), so ~20 consecutive worst-case losses
+  would be needed to halve the account — and the drawdown breaker (now correct, per
+  RCA-1) stops it long before. One fixed trade can no longer "сжечь весь профит".
+- `kelly_stake` keeps its internal `max_risk_per_trade` clamp (harmless — the hoisted
+  cap is identical), but the cap is **no longer mode-dependent**.
+- The exchange-minimum floor (BP3.1/BP7) still wins for tiny accounts: a sub-$100
+  wallet may exceed 5% on a single $5 order — that is the intended, warned override
+  (`concentration_over_60`), not a regression.
+
+> **`realized_baseline`** = the equity recorded when the user last reset their risk
+> baseline (registration, top-up, or manual override). Stored alongside the HWM.
+> If unset, treat `realized_baseline = current equity` (no profit to protect yet).
+
+#### Problem 3 — Manual override: "Снять блокировку" inline button
+
+**Design — a one-tap consented reset of the drawdown baseline.**
+
+1. **Button on the pause message.** The single pause notification (RCA-2) attaches:
+   ```
+   InlineKeyboardMarkup([[InlineKeyboardButton(
+       "🔓 Снять блокировку", callback_data="unlock_drawdown")]])
+   ```
+   (Sent via `manage_positions._notify`; add an optional `reply_markup` arg, or send
+   the keyboard through the bot directly. The user bot's `callback_handler`
+   (`api/routers/telegram.py:1155`) is the dispatcher — add an `unlock_drawdown` branch.)
+
+2. **Handler logic (`callback_data == "unlock_drawdown"`):**
+   ```
+   db_user = get_user_by_telegram_id(tg.id);  require ownership
+   if db_user.risk_state not in ("paused_drawdown", "paused_daily_loss"):
+       answer("Блокировка уже снята"); return
+   equity = total_equity(...)                 # current cost-basis equity
+   reset_risk_baseline(uid, equity)           # equity_hwm = equity  → drawdown resets to 0
+   record_risk_override(uid)                  # risk_override_at=now, risk_override_count += 1
+   resume_user_copying(uid)                   # copy_paused_until = NULL
+   set_risk_state(uid, "active")              # NOT 'override_active' permanently — back to normal guard
+   clear Redis keys: drawdown_alert:{uid}, risk_gate:{uid}:drawdown  # so future REAL DD can alert again
+   edit message → "✅ Блокировка снята. Ты берёшь риск на себя. Точка отсчёта просадки сброшена."
+   ```
+
+3. **Consent / liability record.** `risk_override_at` (timestamptz) +
+   `risk_override_count` (int) on `users` are the audit trail that the user accepted
+   responsibility. Log `risk_override_manual` at `info` (user_id, old_hwm, new_hwm).
+   Resetting the HWM to current equity makes the **current** equity the new peak, so
+   the breaker measures drawdown *from here forward* — exactly "сбросить точку отсчёта".
+
+4. **State after override:** `risk_state='active'`, `copy_paused_until=NULL`, HWM reset.
+   The normal breaker is fully armed again from the new baseline (a *further* real
+   drop still protects them). We do **not** disable the breaker — we only reset its
+   reference point, per the user's consent.
+
+**State machine (combined):**
+```
+            drawdown ≥ 25% (cost-basis)              cooldown elapsed
+  active ──────────────────────────────▶ paused_drawdown ───────────────▶ active
+    ▲                                         │
+    │            tap "🔓 Снять блокировку"     │
+    └─────────────────────────────────────────┘   (reset HWM = equity, record consent)
+```
+
+**Files:**
+- `core/risk.py` — `total_equity()` (pure, cost-basis); breaker reads cost-basis equity;
+  Gates 1–4 use cost-basis `open_exposure`.
+- `worker/tasks/manage_positions.py` — `_update_hwm_and_check_breakers` rewritten as a
+  compare-and-set state machine (notify once on edge, no re-pause, auto-resume on edge);
+  `_notify` gains an optional `reply_markup` for the unblock button; `sync_positions`
+  computes cost-basis equity (pass ledger cost via `get_open_trades_cost(uid)`).
+- `worker/tasks/execute_copy.py` — apply the **unified per-trade risk cap** in both
+  modes after sizing; compute equity cost-basis; **stop** sending the drawdown/daily-loss
+  pause notification (enforce-only).
+- `core/sizing.py` — unchanged math; the cap is now also enforced by the caller.
+- `api/routers/telegram.py` — `unlock_drawdown` branch in `callback_handler`.
+- `core/db/queries.py` — `set_risk_state`, `get_risk_state`, `reset_risk_baseline`,
+  `record_risk_override`, `get_open_trades_cost(user_id) -> {token_id: size_usdc}`,
+  `get_realized_baseline(user_id)`; `get_active_subscribers` already honors
+  `copy_paused_until` (keep).
+- `core/config.py` — new knobs (below).
+- `migrations/013_risk_state_override.sql`.
+
+**Migration 013 (idempotent):**
+```sql
+-- Blueprint 8: risk state machine + manual drawdown override + realized baseline.
+alter table users add column if not exists risk_state text default 'active';
+  -- active | paused_drawdown | paused_daily_loss
+alter table users add column if not exists risk_override_at timestamptz;
+alter table users add column if not exists risk_override_count int default 0;
+alter table users add column if not exists realized_baseline double precision;
+  -- equity snapshot used for profit-protection; reset on top-up / manual override
+```
+
+**Config (`core/config.py`):**
+```python
+# ── Blueprint 8: equity accounting + unified per-trade risk cap ───────────────
+# Equity definition used by the drawdown breaker / HWM / exposure gates.
+# "cost_basis" = open positions valued at filled entry cost (no phantom drawdown).
+# "mark"       = legacy mark-to-market on curPrice (rollback only).
+drawdown_equity_mode: str = "cost_basis"
+# Apply max_risk_per_trade × equity as a hard ceiling in BOTH fixed and kelly modes.
+enforce_risk_per_trade_cap: bool = True
+# Profit-protection: a single trade's worst-case loss may not give back more than
+# this fraction of accumulated realized profit above the baseline (0 disables).
+max_trade_loss_vs_profit_pct: float = 0.50
+```
+(`max_risk_per_trade=0.05`, `max_drawdown_pct=0.25`, `drawdown_cooldown_sec=86400`
+are reused unchanged.)
+
+**Acceptance:**
+- Opening a position no longer moves cost-basis equity ⇒ **no phantom drawdown**; the
+  $18.07→$12.95 mark-to-market dip does **not** trip the breaker. The breaker fires
+  only on **realized** losses (resolution/close), and the $18.07→$12.95 figure now
+  shows only as an informational unrealized mark on the P&L screen.
+- A drawdown pause produces **exactly one** notification (on the `active→paused_drawdown`
+  edge), carries an unblock button, and is **not** repeated on subsequent sync cycles
+  or by the execute path; it auto-resumes once after cooldown.
+- In **both** `fixed` and `kelly` modes a single trade risks ≤ `max_risk_per_trade`
+  (5%) of equity (modulo the warned sub-$100 exchange-minimum override); one lost trade
+  can no longer wipe accumulated profit.
+- Tapping "🔓 Снять блокировку" resets the HWM to current equity, records consent
+  (`risk_override_at`, `risk_override_count`), clears the pause, returns `risk_state`
+  to `active`, and re-arms the breaker from the new baseline; the action is logged and
+  the message updates in place. Behaviour is restart-safe (state in the DB, not Redis).
+
+---
+
 ### Other known gaps (lower priority)
 
 - **No automated tests / CI.** The new `core/sizing.py` and `core/risk.py` are pure functions — add
@@ -1129,6 +1430,12 @@ Migrations are applied **manually** in the Supabase SQL editor, in order, and ar
 | `copy_active` | bool | custodial copy enabled (checked only when `auto_copy_enabled`) |
 | `max_position_usdc` | float | per-position cap (default 25.0) — current fixed-sizing input |
 | `balance_usdc` | double precision | cached balance for the deposit monitor — migration 001 |
+| `equity_hwm` | double precision | per-user equity high-water mark (Blueprint 4) — migration 010 |
+| `copy_paused_until` | timestamptz | risk-pause expiry; fan-out + pre-trade gate honor it — migration 010 |
+| `sizing_mode` | text | per-user `fixed`/`kelly` override (Blueprint 3) — migration 011 |
+| `risk_state` | text | `active`/`paused_drawdown`/`paused_daily_loss` state machine (Blueprint 8) — migration 013 |
+| `risk_override_at` / `risk_override_count` | timestamptz / int | manual-unblock consent audit trail (Blueprint 8) — migration 013 |
+| `realized_baseline` | double precision | equity baseline for profit-protection cap (Blueprint 8) — migration 013 |
 | `created_at` | timestamptz | |
 
 > `models.py` lists `privy_user_id` (legacy/unused) and a `SubTier` enum (`basic/pro/whale`) that the
@@ -1226,12 +1533,16 @@ super-admin (`ADMIN_TELEGRAM_ID` from env) is always authorized regardless of th
 - **011** — `users.sizing_mode` (per-user Kelly/fixed toggle) → `migrations/011_user_sizing_mode.sql`
 - **012** 🔴 — `copy_trades.exit_tx` + `(user_id, condition_id)` index (Blueprint 6) →
   `migrations/012_position_state.sql` (also documents `copy_trades.result='closed'` for token-sale exits)
+- **013** ✅ — `users.risk_state` + `risk_override_at` + `risk_override_count` +
+  `realized_baseline` (Blueprint 8) → `migrations/013_risk_state_override.sql`
+  (**applied** — deploy with Blueprint 8 code)
 
 ### 6.10 Migration order
 
 `001` whale strategy → `002` access codes → `003` username → `004` admins → `005` deposit wallets →
 `006` wallet score → `007` tracked wallets → `008` settlement ledger → `009` tracked avg size →
-`010` risk controls → `011` user sizing mode → `012` position state (exit_tx + user/condition index).
+`010` risk controls → `011` user sizing mode → `012` position state (exit_tx + user/condition index) →
+`013` risk state + manual override (Blueprint 8).
 
 ---
 

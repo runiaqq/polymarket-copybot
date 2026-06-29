@@ -1550,3 +1550,75 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             ]]),
         )
         return
+
+    # ── BP8: manual drawdown unblock ─────────────────────────────────────────
+    if data == "unlock_drawdown":
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user:
+            await query.answer("Пользователь не найден.", show_alert=True)
+            return
+
+        uid = db_user["id"]
+        risk_state = db_user.get("risk_state") or "active"
+
+        if risk_state not in ("paused_drawdown", "paused_daily_loss"):
+            await query.answer("Блокировка уже снята.", show_alert=True)
+            return
+
+        # Compute current cost-basis equity to use as the new HWM.
+        try:
+            from core.polygon import get_balances as _gb
+            from core.polymarket import get_positions as _gp
+            from core.risk import total_equity
+            from core.db import (
+                get_open_trades_cost, get_realized_baseline,
+                record_risk_override, reset_risk_baseline,
+                resume_user_copying, set_risk_state,
+            )
+            from core.config import settings
+            from core.cache import get_redis
+
+            dw = db_user.get("deposit_wallet_address")
+            free_pusd = _gb(dw).get("pusd", 0.0) if dw else 0.0
+            positions = _gp(dw) if dw else []
+            ledger_cost = get_open_trades_cost(uid)
+            new_equity = total_equity(
+                free_pusd, positions, ledger_cost, mode=settings.drawdown_equity_mode
+            )
+
+            old_hwm = db_user.get("equity_hwm") or 0.0
+
+            reset_risk_baseline(uid, new_equity)
+            record_risk_override(uid)
+            resume_user_copying(uid)
+            set_risk_state(uid, "active")
+
+            # Clear Redis notify keys so a future real drawdown can alert again.
+            try:
+                from core.cache import _client as _redis_client
+                r = _redis_client()
+                r.delete(f"once:drawdown_alert:{uid}")
+                r.delete(f"once:risk_gate:{uid}:drawdown")
+                r.delete(f"once:resume_alert:{uid}")
+            except Exception:
+                pass
+
+            import structlog as _sl
+            _sl.get_logger(__name__).info(
+                "risk_override_manual",
+                user_id=uid,
+                old_hwm=round(float(old_hwm), 2),
+                new_hwm=round(new_equity, 2),
+            )
+
+            await query.edit_message_text(
+                "✅ <b>Блокировка снята. Ты берёшь риск на себя.</b>\n\n"
+                f"Точка отсчёта просадки сброшена на <b>${new_equity:.2f}</b>.\n"
+                "Копирование возобновлено. Риск-защита снова активна от этого уровня.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            import structlog as _sl
+            _sl.get_logger(__name__).exception("unlock_drawdown_failed", user_id=db_user["id"])
+            await query.answer("Ошибка при снятии блокировки. Попробуй позже.", show_alert=True)
+        return

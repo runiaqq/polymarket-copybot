@@ -495,6 +495,79 @@ def mark_trade_closed(trade_id: int, realized_pnl: float,
     sb.table("copy_trades").update(payload).eq("id", trade_id).execute()
 
 
+# ── Blueprint 8: risk state machine + manual override helpers ────────────────
+
+def get_risk_state(user_id: int) -> str:
+    """Return the current risk_state for a user (default 'active')."""
+    sb = get_supabase()
+    res = sb.table("users").select("risk_state").eq("id", user_id).maybe_single().execute()
+    return str((res.data or {}).get("risk_state") or "active")
+
+
+def set_risk_state(user_id: int, state: str) -> None:
+    """Set risk_state column. Valid values: active | paused_drawdown | paused_daily_loss."""
+    sb = get_supabase()
+    sb.table("users").update({"risk_state": state}).eq("id", user_id).execute()
+
+
+def reset_risk_baseline(user_id: int, equity: float) -> None:
+    """Reset both equity_hwm and realized_baseline to the current equity value.
+
+    Called on manual override — current equity becomes the new drawdown reference.
+    """
+    sb = get_supabase()
+    sb.table("users").update({
+        "equity_hwm":        round(equity, 4),
+        "realized_baseline": round(equity, 4),
+    }).eq("id", user_id).execute()
+
+
+def record_risk_override(user_id: int) -> None:
+    """Increment risk_override_count and stamp risk_override_at (consent audit trail)."""
+    sb = get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+    # Fetch current count first (Supabase JS SDK doesn't support atomic increment).
+    res = sb.table("users").select("risk_override_count").eq("id", user_id).maybe_single().execute()
+    current = int((res.data or {}).get("risk_override_count") or 0)
+    sb.table("users").update({
+        "risk_override_at":    now,
+        "risk_override_count": current + 1,
+    }).eq("id", user_id).execute()
+
+
+def get_open_trades_cost(user_id: int) -> dict:
+    """Return {token_id: size_usdc} for all open (confirmed, unredeemed) copy_trades.
+
+    Used by total_equity() in cost-basis mode to price open positions at entry cost
+    rather than the depressed live mark.
+    """
+    sb = get_supabase()
+    res = (
+        sb.table("copy_trades")
+        .select("token_id, size_usdc")
+        .eq("user_id", user_id)
+        .in_("status", ["confirmed", "executing"])
+        .is_("redeemed_at", "null")
+        .execute()
+    )
+    result: dict = {}
+    for row in (res.data or []):
+        tid = row.get("token_id")
+        cost = float(row.get("size_usdc") or 0)
+        if tid and cost > 0:
+            # If multiple rows for the same token (e.g. partial fills), sum them.
+            result[tid] = result.get(tid, 0.0) + cost
+    return result
+
+
+def get_realized_baseline(user_id: int) -> float | None:
+    """Return the realized_baseline stored for a user (None if not yet set)."""
+    sb = get_supabase()
+    res = sb.table("users").select("realized_baseline").eq("id", user_id).maybe_single().execute()
+    val = (res.data or {}).get("realized_baseline")
+    return float(val) if val is not None else None
+
+
 def has_terminal_trade(user_id: int, condition_id: str) -> bool:
     """Return True when any copy_trade for (user, condition) is in a terminal state.
 

@@ -18,6 +18,11 @@ Blueprint 7 — Gates 1 & 2 clamp instead of hard-block on small balances:
   - headroom < exchange_min AND equity < recommended → enter at exchange_min, warn=concentration_over_60.
   - headroom < exchange_min AND equity ≥ recommended → block with notification (funded but fully deployed).
   Gates 3 & 4 (loss-breakers) are unchanged — they must still pause copying.
+
+Blueprint 8 — total_equity() centralises the equity definition for the drawdown
+  breaker, HWM, and exposure gates.  In "cost_basis" mode (default) open positions
+  are valued at their entry cost so that the act of opening a trade is capital-neutral
+  and does not fabricate phantom drawdown.
 """
 
 from dataclasses import dataclass
@@ -25,6 +30,50 @@ from dataclasses import dataclass
 import structlog
 
 log = structlog.get_logger(__name__)
+
+
+def total_equity(
+    free_pusd: float,
+    open_positions: list[dict],
+    ledger_cost_by_token: dict[str, float],
+    mode: str = "cost_basis",
+) -> float:
+    """Authoritative equity for drawdown breaker, HWM, and exposure gates.
+
+    Parameters
+    ----------
+    free_pusd            Liquid pUSD on the deposit wallet.
+    open_positions       Live positions list from ``core.polymarket.get_positions``.
+    ledger_cost_by_token {token_id: size_usdc} from ``get_open_trades_cost`` (may be empty).
+    mode                 "cost_basis" (default) or "mark" (legacy rollback).
+
+    Returns
+    -------
+    float  Equity value suitable for drawdown / HWM calculations.
+    """
+    if mode == "mark":
+        open_val = sum(
+            float(p.get("current_value") or 0)
+            for p in open_positions if p.get("shares", 0) > 0
+        )
+        return free_pusd + open_val
+
+    # cost_basis: price each open position at its entry cost in priority order:
+    #   1) copy_trades.size_usdc for the matching open trade (true filled cost)
+    #   2) shares × avg_price  (Data-API cost-basis fallback)
+    #   3) current_value       (last-resort mark, only when no cost basis known)
+    open_cost = 0.0
+    for p in open_positions:
+        if p.get("shares", 0) <= 0:
+            continue
+        token_id = p.get("token_id") or ""
+        if token_id and token_id in ledger_cost_by_token:
+            open_cost += ledger_cost_by_token[token_id]
+        elif p.get("shares") and p.get("avg_price"):
+            open_cost += float(p["shares"]) * float(p["avg_price"])
+        else:
+            open_cost += float(p.get("current_value") or 0)
+    return free_pusd + open_cost
 
 
 @dataclass
@@ -47,19 +96,21 @@ def check_risk_gates(
     equity_hwm: float,
     daily_pnl: float,
     cfg,
+    ledger_cost_by_token: dict[str, float] | None = None,
 ) -> RiskDecision:
     """
     Evaluate all four tail-risk gates before placing a BUY order.
 
     Parameters
     ----------
-    signal          Signal dict (needs ``event_slug`` or ``market_id`` for gate 2).
-    stake           Proposed USDC stake (after Kelly / depth caps).
-    open_positions  Live positions list from ``core.polymarket.get_positions``.
-    equity          Current user equity (free pUSD + open-position value).
-    equity_hwm      Per-user high-water mark from the DB.
-    daily_pnl       Sum of realized_pnl for the trailing 24 h (from DB).
-    cfg             ``core.config.settings``.
+    signal               Signal dict (needs ``event_slug`` or ``market_id`` for gate 2).
+    stake                Proposed USDC stake (after Kelly / depth caps).
+    open_positions       Live positions list from ``core.polymarket.get_positions``.
+    equity               Current user equity (cost-basis or mark, pre-computed by caller).
+    equity_hwm           Per-user high-water mark from the DB.
+    daily_pnl            Sum of realized_pnl for the trailing 24 h (from DB).
+    cfg                  ``core.config.settings``.
+    ledger_cost_by_token {token_id: size_usdc} for open trades (BP8 cost-basis exposure).
 
     Returns
     -------
@@ -68,9 +119,20 @@ def check_risk_gates(
     if equity <= 0 or stake <= 0:
         return RiskDecision(allowed=True)
 
+    cost_map = ledger_cost_by_token or {}
+
     # ── Gate 1: aggregate exposure cap ───────────────────────────────────────
-    open_exposure = sum(float(p.get("size") or p.get("current_value") or 0)
-                        for p in open_positions if p.get("shares", 0) > 0)
+    # BP8: use cost-basis value for open exposure so partially-marked-down positions
+    # don't inflate or deflate the headroom calculation.
+    def _position_cost(p: dict) -> float:
+        tid = p.get("token_id") or ""
+        if tid and tid in cost_map:
+            return cost_map[tid]
+        if p.get("shares") and p.get("avg_price"):
+            return float(p["shares"]) * float(p["avg_price"])
+        return float(p.get("current_value") or p.get("size") or 0)
+
+    open_exposure = sum(_position_cost(p) for p in open_positions if p.get("shares", 0) > 0)
     exposure_headroom = cfg.max_portfolio_exposure_pct * equity - open_exposure
     if (open_exposure + stake) > cfg.max_portfolio_exposure_pct * equity:
         exchange_min = cfg.exchange_min_order_usdc
@@ -112,9 +174,8 @@ def check_risk_gates(
     # ── Gate 2: per-event correlation cap ────────────────────────────────────
     event_slug = signal.get("event_slug") or signal.get("market_id") or ""
     if event_slug:
-        # Sum exposure of open positions that share the same event.
         event_exposure = sum(
-            float(p.get("size") or p.get("current_value") or 0)
+            _position_cost(p)
             for p in open_positions
             if p.get("shares", 0) > 0 and (
                 p.get("event_slug") == event_slug or p.get("market_id") == event_slug

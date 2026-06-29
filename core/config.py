@@ -279,5 +279,18 @@ class Settings(BaseSettings):
     # Additional notional floor: also skip when shares * resolve_price < this.
     claim_dust_min_usdc: float = 1.0
 
+    # ── Blueprint 8: equity accounting + unified per-trade risk cap ────────────
+    # Equity definition used by the drawdown breaker / HWM / exposure gates.
+    # "cost_basis" = open positions valued at filled entry cost (no phantom drawdown).
+    # "mark"       = legacy mark-to-market on curPrice (rollback only).
+    drawdown_equity_mode: str = "cost_basis"
+    # Apply max_risk_per_trade × equity as a hard ceiling in BOTH fixed and kelly modes.
+    # Ensures the worst-case loss of any single binary trade ≤ 5% of equity.
+    enforce_risk_per_trade_cap: bool = True
+    # Profit-protection trailing cap: cap a single trade's stake so worst-case loss
+    # ≤ this fraction of accumulated realized profit above realized_baseline.
+    # 0.0 = disabled.  0.25 = no single trade can give back >25% of profit cushion.
+    max_trade_loss_vs_profit_pct: float = 0.25
+
 
 settings = Settings()  # type: ignore[call-arg]

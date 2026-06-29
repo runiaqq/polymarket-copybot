@@ -127,6 +127,28 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     depth_cap = float(signal.get("max_copy_usdc") or signal.get("size_usdc") or 0)
     user_sizing_mode = user.get("sizing_mode") or settings.sizing_mode
 
+    # BP8: load cost-basis ledger for both modes (cost-basis equity, no phantom drawdown).
+    try:
+        from core.polymarket import get_positions as _gp
+        positions = _gp(deposit_wallet)
+    except Exception:
+        positions = []
+    try:
+        from core.db import get_open_trades_cost
+        from core.risk import total_equity
+        ledger_cost = get_open_trades_cost(user_id)
+        equity = total_equity(
+            tradeable,
+            positions,
+            ledger_cost,
+            mode=settings.drawdown_equity_mode,
+        )
+    except Exception:
+        ledger_cost = {}
+        equity = tradeable + sum(
+            float(p.get("current_value") or 0) for p in positions if p.get("shares", 0) > 0
+        )
+
     if user_sizing_mode == "kelly":
         from core.sizing import kelly_stake
         from core.wallet_score import score_wallet
@@ -134,19 +156,6 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             score = score_wallet(signal.get("source_wallet") or signal.get("whale_wallet") or "")
         except Exception:
             score = None
-        # Equity = free pUSD + open-position value (positions loaded below for
-        # risk gates anyway; use free_pusd as a conservative lower bound here).
-        try:
-            from core.polymarket import get_positions as _gp
-            positions = _gp(deposit_wallet)
-            open_value = sum(
-                float(p.get("current_value") or 0)
-                for p in positions if p.get("shares", 0) > 0
-            )
-        except Exception:
-            positions = []
-            open_value = 0.0
-        equity = tradeable + open_value
         k_stake = kelly_stake(
             p=float(signal.get("price") or 0),
             score=score,
@@ -170,18 +179,40 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         # Fixed cap (user chose fixed or global default)
         size_usdc = min(user_max, depth_cap) if depth_cap > 0 else user_max
         log.debug("sizing_fixed", cap=round(size_usdc, 2), user_id=user.get("id"))
-        try:
-            from core.polymarket import get_positions as _gp
-            positions = _gp(deposit_wallet)
-            open_value = sum(
-                float(p.get("current_value") or 0)
-                for p in positions if p.get("shares", 0) > 0
-            )
-        except Exception:
-            positions = []
-            open_value = 0.0
-        equity = tradeable + open_value
         score = None
+
+    # ── BP8: unified per-trade risk cap (applies in BOTH fixed and kelly modes) ─
+    # Worst-case loss of a binary trade = full stake. Cap it so a single loss
+    # cannot exceed max_risk_per_trade × equity regardless of sizing mode.
+    if settings.enforce_risk_per_trade_cap and equity > 0:
+        hard_cap = settings.max_risk_per_trade * equity
+        if size_usdc > hard_cap:
+            log.info("unified_risk_cap_applied", user_id=user_id,
+                     original=round(size_usdc, 2), capped=round(hard_cap, 2),
+                     equity=round(equity, 2))
+            size_usdc = hard_cap
+
+    # BP8: profit-protection trailing cap — don't give back >max_trade_loss_vs_profit_pct
+    # of accumulated realized profit above the baseline in a single trade.
+    if settings.max_trade_loss_vs_profit_pct > 0 and equity > 0:
+        try:
+            from core.db import get_realized_baseline
+            baseline = get_realized_baseline(user_id)
+            if baseline is None:
+                baseline = equity  # first ever trade — no profit cushion yet
+            profit_above_baseline = max(0.0, equity - baseline)
+            if profit_above_baseline > 0:
+                profit_cap = (
+                    settings.max_trade_loss_vs_profit_pct * profit_above_baseline
+                    + settings.max_risk_per_trade * baseline
+                )
+                if size_usdc > profit_cap:
+                    log.info("profit_protection_cap_applied", user_id=user_id,
+                             original=round(size_usdc, 2), capped=round(profit_cap, 2),
+                             profit_cushion=round(profit_above_baseline, 2))
+                    size_usdc = profit_cap
+        except Exception:
+            log.warning("profit_protection_cap_failed", user_id=user_id)
 
     # ── BP3.1 / BP7: soft balance warning — warn but never hard-block ────────
     # A $5 wallet trades at the platform minimum; we only skip when the wallet
@@ -307,8 +338,10 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
                   size=round(size_usdc, 4), exchange_min=exchange_min)
         return {"skipped": True, "reason": "depth_below_min_order"}
 
-    # ── BP4 / BP7: tail-risk gates ───────────────────────────────────────────
+    # ── BP4 / BP7 / BP8: tail-risk gates ─────────────────────────────────────
     # BP7: Gates 1 & 2 now clamp instead of hard-block on small balances.
+    # BP8: execute_copy is now an ENFORCER only — it honors the pause but never
+    #      sends the pause notification (that is solely manage_positions' job).
     # decision.max_stake is applied below; decision.warn is forwarded to _notify.
     concentration_warn: str | None = None
     try:
@@ -324,25 +357,11 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             equity_hwm=hwm,
             daily_pnl=daily_pnl,
             cfg=settings,
+            ledger_cost_by_token=ledger_cost,
         )
         if not decision.allowed:
-            from core.cache import notify_once
             gate = decision.gate
-            if notify_once(f"risk_gate:{user_id}:{gate}", ttl=3600):
-                _notify_risk_pause(user["telegram_id"], decision.reason)
-
-            # Drawdown breaker: record pause in DB so fan-out excludes next signals.
-            if gate == "drawdown":
-                from datetime import timedelta
-                from core.db import pause_user_copying
-                from core.db import update_user_equity_hwm
-                pause_until = (
-                    datetime.now(timezone.utc) + timedelta(seconds=settings.drawdown_cooldown_sec)
-                ).isoformat()
-                pause_user_copying(user_id, pause_until)
-                update_user_equity_hwm(user_id, max(hwm, equity))
-                log.info("drawdown_pause_set", user_id=user_id, until=pause_until)
-
+            # BP8: no notification here — manage_positions owns the pause alert.
             log.info("skip_risk_gate", user_id=user_id,
                      gate=gate, reason=decision.reason[:80])
             return {"skipped": True, "reason": f"risk_gate:{gate}"}
