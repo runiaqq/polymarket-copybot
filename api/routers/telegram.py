@@ -30,8 +30,24 @@ log = structlog.get_logger(__name__)
 
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
-def _main_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def _is_risk_paused(db_user: dict) -> bool:
+    """Return True when the user's copying is currently paused by a risk breaker."""
+    from datetime import datetime, timezone
+    paused_until = db_user.get("copy_paused_until")
+    if not paused_until:
+        return False
+    try:
+        from dateutil.parser import parse as _p
+        pu = _p(paused_until)
+        if pu.tzinfo is None:
+            pu = pu.replace(tzinfo=timezone.utc)
+        return pu > datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+
+def _main_kb(is_paused: bool = False) -> InlineKeyboardMarkup:
+    rows = [
         [
             InlineKeyboardButton("💼 Кошелёк",  callback_data="wallet"),
             InlineKeyboardButton("📊 Позиции",  callback_data="positions"),
@@ -41,7 +57,12 @@ def _main_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
         ],
         [InlineKeyboardButton("❓ Помощь", callback_data="help")],
-    ])
+    ]
+    if is_paused:
+        rows.insert(0, [InlineKeyboardButton(
+            "🔓 Снять блокировку риск-менеджера", callback_data="unlock_drawdown"
+        )])
+    return InlineKeyboardMarkup(rows)
 
 
 def _signals_kb() -> InlineKeyboardMarkup:
@@ -168,7 +189,15 @@ def _dashboard_text(db_user: dict, first_name: str) -> str:
     addr = db_user.get("wallet_address", "—")
     addr_short = f"{addr[:6]}…{addr[-4:]}" if addr != "—" else "—"
     copy_active = db_user.get("copy_active")
-    copy_icon = "🟢 Работает" if copy_active else "⏸ Пауза"
+    is_paused = _is_risk_paused(db_user)
+    if is_paused:
+        risk_state = db_user.get("risk_state") or "paused_drawdown"
+        pause_reason = "просадка" if risk_state == "paused_drawdown" else "дневной лимит"
+        copy_icon = f"🛑 Заблокировано ({pause_reason})"
+    elif copy_active:
+        copy_icon = "🟢 Работает"
+    else:
+        copy_icon = "⏸ Пауза"
     max_pos = db_user.get("max_position_usdc") or 25
     sizing_mode = db_user.get("sizing_mode") or "fixed"
     sizing_icon = "🤖 Kelly" if sizing_mode == "kelly" else f"📊 Фикс ${max_pos:.0f}"
@@ -177,6 +206,10 @@ def _dashboard_text(db_user: dict, first_name: str) -> str:
         f"{checklist}\n\n"
         if checklist
         else "✅ <b>Всё настроено</b> — бот отслеживает китов и копирует сделки.\n\n"
+    )
+    paused_banner = (
+        "\n🔓 <b>Нажми «Снять блокировку» чтобы возобновить досрочно.</b>\n"
+        if is_paused else ""
     )
     return (
         f"👋 <b>Привет, {first_name}!</b>\n\n"
@@ -189,6 +222,7 @@ def _dashboard_text(db_user: dict, first_name: str) -> str:
         f"💵 Позиция: <b>{sizing_icon}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{mid}"
+        f"{paused_banner}"
         "👇 Управляй через кнопки"
     )
 
@@ -456,7 +490,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(  # type: ignore[union-attr]
             _dashboard_text(db_user, tg_user.first_name),
             parse_mode="HTML",
-            reply_markup=_main_kb(),
+            reply_markup=_main_kb(is_paused=_is_risk_paused(db_user)),
         )
 
 
@@ -1176,7 +1210,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await query.edit_message_text(
                     _dashboard_text(db_user, tg_user.first_name),
                     parse_mode="HTML",
-                    reply_markup=_main_kb(),
+                    reply_markup=_main_kb(is_paused=_is_risk_paused(db_user)),
                 )
         return
 
