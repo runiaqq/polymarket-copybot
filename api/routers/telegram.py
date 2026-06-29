@@ -1575,8 +1575,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 record_risk_override, reset_risk_baseline,
                 resume_user_copying, set_risk_state,
             )
-            from core.config import settings
-            from core.cache import get_redis
+            from core.cache import _client as _redis_client
+            # settings is already imported at module level — no local re-import
 
             dw = db_user.get("deposit_wallet_address")
             free_pusd = _gb(dw).get("pusd", 0.0) if dw else 0.0
@@ -1595,7 +1595,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
             # Clear Redis notify keys so a future real drawdown can alert again.
             try:
-                from core.cache import _client as _redis_client
                 r = _redis_client()
                 r.delete(f"once:drawdown_alert:{uid}")
                 r.delete(f"once:risk_gate:{uid}:drawdown")
