@@ -93,6 +93,7 @@ HELP_ADMIN = (
     "🛠 <b>Админ-панель — команды</b>\n\n"
     "<b>Подписки</b>\n"
     "/grant <code>&lt;@ник|id&gt; [дней]</code> — выдать/продлить подписку\n"
+    "/sub <code>&lt;@ник|id&gt; [дней]</code> — то же самое (алиас /grant)\n"
     "/newcode <code>[дней]</code> — создать код-ссылку для клиента\n"
     "/subs — список активных подписчиков\n"
     "/user <code>&lt;@ник|id&gt;</code> — детали пользователя\n"
@@ -142,6 +143,7 @@ def build_admin_application() -> Application | None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("grant", cmd_grant))
+    app.add_handler(CommandHandler("sub", cmd_grant))
     app.add_handler(CommandHandler("newcode", cmd_newcode))
     app.add_handler(CommandHandler("subs", cmd_subs))
     app.add_handler(CommandHandler("user", cmd_user))
@@ -205,6 +207,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Grant or extend a subscription.
+
+    Usage: /grant <@ник|id> [дней]   or   /sub <@ник|id> [дней]
+    Extends an active subscription or reactivates an expired one.
+    """
     tg = update.effective_user
     if not tg or not is_admin(tg.id):
         await _deny(update)
@@ -213,6 +220,7 @@ async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not args:
         await update.message.reply_text(  # type: ignore[union-attr]
             "Использование: <code>/grant &lt;@ник|id&gt; [дней]</code>\n"
+            "Пример: <code>/grant @ivan 30</code> · <code>/sub username 14</code>\n\n"
             "Продлевает активную подписку и реактивирует истёкшую.", parse_mode="HTML"
         )
         return
@@ -222,20 +230,29 @@ async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         days = 30
     tid, urow = _resolve(args[0])
     if tid is None:
+        raw = args[0]
+        display = raw if raw.startswith("@") else f"@{raw}"
         await update.message.reply_text(  # type: ignore[union-attr]
-            f"❌ Пользователь {args[0]} не найден. Он должен запустить основной бот (/start), "
-            "либо укажи числовой Telegram ID.", parse_mode="HTML"
+            f"❌ Пользователь <b>{display}</b> не найден в базе.\n\n"
+            "Он должен запустить основной бот (/start), чтобы ник сохранился. "
+            "Либо укажи числовой Telegram ID.", parse_mode="HTML"
         )
         return
     try:
         user = set_subscription(tid, days)
         exp = (user.get("sub_expires_at") or "")[:10]
-        label = f"@{urow.get('username')}" if (urow and urow.get("username")) else str(tid)
+        label = f"@{urow.get('username')}" if (urow and urow.get("username")) else f"id{tid}"
         await update.message.reply_text(  # type: ignore[union-attr]
-            f"✅ Подписка продлена на <b>{days}</b> дн.\nПользователь: {label}\nДо: <b>{exp}</b>",
+            f"✅ Подписка для <b>{label}</b> продлена на <b>{days}</b> дней.\n"
+            f"Новая дата окончания: <b>{exp}</b>",
             parse_mode="HTML",
         )
-        await _notify_user(tid, f"✅ <b>Подписка продлена!</b>\nДействует до: <b>{exp}</b>")
+        await _notify_user(
+            tid,
+            f"🎉 <b>Администратор выдал вам подписку на {days} дней!</b>\n\n"
+            f"Действует до: <b>{exp}</b>\n\n"
+            "Бот готов к работе.",
+        )
     except Exception as exc:
         await update.message.reply_text(f"❌ Ошибка: <code>{str(exc)[:200]}</code>", parse_mode="HTML")  # type: ignore[union-attr]
 

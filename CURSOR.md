@@ -147,8 +147,10 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
 
 - Single tier: `users.sub_tier = "active"` with `users.sub_expires_at`. Anyone non-`free` and
   unexpired is "active". `get_active_subscribers()` is the gate for copying.
-- Activation: admin `/grant` (by id/username) → `set_subscription(days)`, or one-time
-  **access codes** (`access_codes`, redeemed via deep-link). Expiry reminders run every 6h.
+- Activation: admin `/grant` or `/sub` (by `@username` or numeric id) → `set_subscription(days)`,
+  or one-time **access codes** (`access_codes`, redeemed via deep-link). Expiry reminders run every 6h.
+- Auth guard on admin commands: `is_admin(telegram_id)` — covers `settings.admin_telegram_id` (super-admin)
+  plus any row in `admins` table (multi-admin, invited via one-time codes).
 - Two Telegram bots: **user bot** (`api/routers/telegram.py`) and an optional **admin bot**
   (`api/routers/admin_bot.py`, separate token) for subscriptions + whitelist management.
 - There is also a Bearer-auth REST admin API (`api/routers/admin.py`).
@@ -1754,7 +1756,7 @@ columns that don't exist yet.
 2. Copy-paste the contents of each new `migrations/00X_*.sql` file and click **Run**.
 3. Apply in order: `008` → `009` → `010` → …
 
-**Migrations applied as of the last deploy (2026-06-22):** 001–010. Apply 011 and 012 before the next deploy.
+**Migrations applied as of the last deploy (2026-06-22):** 001–010. Apply 011, 012, 013 before the next deploy.
 
 ### 7.5 Useful diagnostic commands
 

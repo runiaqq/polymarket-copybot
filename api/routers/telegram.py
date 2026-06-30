@@ -19,6 +19,7 @@ from core.db import (
     get_subscription_status,
     get_user_by_telegram_id,
     get_user_by_username,
+    is_admin,
     redeem_access_code,
     set_subscription,
     update_user,
@@ -432,6 +433,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("wrap",      cmd_wrap))
     app.add_handler(CommandHandler("subscription", cmd_subscription))
     app.add_handler(CommandHandler("grant",     cmd_grant))
+    app.add_handler(CommandHandler("sub",       cmd_grant))
     app.add_handler(CommandHandler("newcode",   cmd_newcode))
     app.add_handler(CommandHandler("codes",     cmd_codes))
     app.add_handler(CallbackQueryHandler(callback_handler))
@@ -951,16 +953,21 @@ async def cmd_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin: grant/extend a subscription by @username or telegram_id.
-    /grant <@username|telegram_id> [days]. Works whether active (extends) or expired (reactivates)."""
+
+    Usage: /grant <@username | telegram_id> [days]
+           /sub   <@username | telegram_id> [days]
+    Extends an active subscription or reactivates an expired one.
+    Protected: accessible only to admins (super-admin env var + admins DB table).
+    """
     tg_user = update.effective_user
-    if not tg_user or tg_user.id != settings.admin_telegram_id:
+    if not tg_user or not is_admin(tg_user.id):
         return
     args = context.args or []
     if len(args) < 1:
         await update.message.reply_text(  # type: ignore[union-attr]
-            "Использование: <code>/grant &lt;@username | telegram_id&gt; [days]</code>\n"
-            "days: число дней (по умолчанию 30).\n"
-            "Команда и продлевает активную подписку, и реактивирует истёкшую.",
+            "Использование: <code>/grant &lt;@username | telegram_id&gt; [дней]</code>\n"
+            "Пример: <code>/grant @ivan 30</code> · <code>/sub username 14</code>\n\n"
+            "Продлевает активную подписку и реактивирует истёкшую.",
             parse_mode="HTML",
         )
         return
@@ -971,18 +978,18 @@ async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except ValueError:
         days = 30
 
-    # Resolve target: numeric id or @username.
-    target = None
+    # Resolve: bare numeric id (no leading @) → lookup by telegram_id; else by username.
     if ident.lstrip("@").isdigit() and not ident.startswith("@"):
         target_id = int(ident)
         target = get_user_by_telegram_id(target_id) or {"telegram_id": target_id}
     else:
         target = get_user_by_username(ident)
         if not target:
+            display = ident if ident.startswith("@") else f"@{ident}"
             await update.message.reply_text(  # type: ignore[union-attr]
-                f"❌ Пользователь <b>{ident}</b> не найден.\n"
-                "Он должен сначала запустить бота (/start), чтобы ник сохранился. "
-                "Либо выдай по числовому Telegram ID.",
+                f"❌ Пользователь <b>{display}</b> не найден в базе.\n\n"
+                "Он должен сначала запустить основной бот (/start), чтобы ник сохранился. "
+                "Либо укажи числовой Telegram ID.",
                 parse_mode="HTML",
             )
             return
@@ -991,21 +998,19 @@ async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         user = set_subscription(target_id, days)
         exp = (user.get("sub_expires_at") or "")[:10]
-        uname = f"@{target.get('username')}" if target.get("username") else f"<code>{target_id}</code>"
+        uname = f"@{target.get('username')}" if target.get("username") else f"id{target_id}"
         await update.message.reply_text(  # type: ignore[union-attr]
-            f"✅ Подписка продлена на <b>{days}</b> дн.\n"
-            f"Пользователь: {uname}\n"
-            f"Действует до: <b>{exp}</b>",
+            f"✅ Подписка для <b>{uname}</b> продлена на <b>{days}</b> дней.\n"
+            f"Новая дата окончания: <b>{exp}</b>",
             parse_mode="HTML",
         )
-        # Let the user know their subscription was extended.
         try:
             await context.bot.send_message(
                 chat_id=target_id,
                 text=(
-                    f"✅ <b>Подписка продлена!</b>\n\n"
+                    f"🎉 <b>Администратор выдал вам подписку на {days} дней!</b>\n\n"
                     f"Действует до: <b>{exp}</b>\n\n"
-                    f"Спасибо! Бот продолжает копировать сделки."
+                    "Бот готов к работе."
                 ),
                 parse_mode="HTML",
             )
@@ -1018,9 +1023,9 @@ async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_newcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin: create a one-time access code and return its deep link. /newcode [tier] [days]"""
+    """Admin: create a one-time access code and return its deep link. /newcode [days]"""
     tg_user = update.effective_user
-    if not tg_user or tg_user.id != settings.admin_telegram_id:
+    if not tg_user or not is_admin(tg_user.id):
         return
     args = context.args or []
     try:
@@ -1042,7 +1047,7 @@ async def cmd_newcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_codes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin: list recent access codes and their status."""
     tg_user = update.effective_user
-    if not tg_user or tg_user.id != settings.admin_telegram_id:
+    if not tg_user or not is_admin(tg_user.id):
         return
     from core.db import get_supabase
     sb = get_supabase()
