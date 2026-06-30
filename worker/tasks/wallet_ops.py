@@ -5,6 +5,7 @@ These send on-chain transactions, so they run off the request path.
 """
 
 import asyncio
+import time
 
 import structlog
 
@@ -123,6 +124,9 @@ def withdraw_funds(user_id: int, to_address: str, amount_usdc: float) -> dict:
                 pull = min(amount_usdc, dw_pusd)
                 if pull > 0:
                     relayer.transfer_from_deposit_wallet(key, addr, int(round(pull * 1_000_000)))
+                    # Brief pause so the relayer tx propagates to the RPC node
+                    # before we read EOA balances for the conversion step.
+                    time.sleep(4)
                     log.info("withdraw_dw_pull_ok", user_id=user_id, pulled=pull)
             except Exception as pull_exc:
                 # Fail loud — don't silently proceed if the pull failed
@@ -153,19 +157,36 @@ def withdraw_funds(user_id: int, to_address: str, amount_usdc: float) -> dict:
                         f"swap USDC.e → USDC не удался: {swap_exc}"
                     ) from swap_exc
 
-        # ── Step 3: send native USDC + wait for on-chain receipt ────────────────
+        # ── Step 3: re-read actual native USDC and send min(requested, actual) ──
+        # The USDC.e→USDC swap introduces slippage (up to SWAP_SLIPPAGE=1%).
+        # Reading the exact on-chain balance avoids a 1-wei precision rejection
+        # in transfer_usdc when swap output is e.g. $10.999_999 for a $11 request.
+        b_final = get_balances(addr)
+        native_avail = b_final.get("usdc", 0.0)
+        log.info("withdraw_native_balance", user_id=user_id,
+                 native_avail=native_avail, requested=amount_usdc)
+
+        if native_avail < amount_usdc * 0.97:
+            # More than 3% off — conversion failed or slippage is extreme.
+            raise RuntimeError(
+                f"конвертация не завершена: нативный USDC доступно ${native_avail:.4f}, "
+                f"ожидалось ≥${amount_usdc * 0.97:.2f} — попробуй позже."
+            )
+
+        # Transfer the ACTUAL available amount (handles swap slippage gracefully)
+        send_amount = min(amount_usdc, native_avail)
         tx_hash = transfer_usdc(
             private_key_enc=key,
             wallet_address=addr,
             to_address=to_address,
-            amount_usdc=amount_usdc,
+            amount_usdc=send_amount,
             use_bridged=False,
         )
-        log.info("withdraw_ok", user_id=user_id, amount=amount_usdc, tx=tx_hash[:12])
+        log.info("withdraw_ok", user_id=user_id, amount=send_amount, tx=tx_hash[:12])
         _notify(
             tg_id,
             f"✅ <b>Вывод успешно завершён!</b>\n\n"
-            f"💵 <b>${amount_usdc:.2f} USDC</b>\n"
+            f"💵 <b>${send_amount:.2f} USDC</b>\n"
             f"📬 На: <code>{to_address}</code>\n\n"
             f'🔗 <a href="https://polygonscan.com/tx/{tx_hash}">Polygonscan</a>',
         )
