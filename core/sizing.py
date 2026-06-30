@@ -9,7 +9,10 @@ Design rationale (from CURSOR.md §4 Blueprint 3):
   track record, shrunk with a Beta prior to kill small-sample noise.
 - Full Kelly overbets with an estimated edge; we use quarter-Kelly (kelly_lambda)
   and let hard caps dominate.
-- ``sizing_mode="fixed"`` reproduces legacy behaviour so rollback is instant.
+
+Blueprint 13.1: mode selection is the CALLER's responsibility.  ``kelly_stake``
+is pure math — it never checks ``cfg.sizing_mode``.  Return 0.0 means "no edge;
+do not bet".  The caller must skip the trade, not fall back to a fixed cap.
 """
 
 import structlog
@@ -47,11 +50,9 @@ def kelly_stake(
     -------
     float  Recommended stake in USDC, already clamped by max_risk_per_trade and
            bounded to [0, free_pusd].  Caller must still apply depth / user caps.
-           Returns 0.0 when sizing_mode='fixed' (caller uses legacy flat cap).
+           Returns 0.0 when there is no measurable edge (q_hat <= p) — the caller
+           must skip the trade entirely; 0.0 never means "fall back to fixed cap".
     """
-    if cfg.sizing_mode != "kelly":
-        return 0.0  # caller falls back to legacy flat cap
-
     if equity <= 0 or free_pusd <= 0:
         return 0.0
 

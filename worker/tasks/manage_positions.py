@@ -138,6 +138,9 @@ def sync_positions() -> dict:
             #   >= delta_drop_stop_pct (30%) from entry.  tp_sl_min_hours guard is
             #   intentionally NOT applied — it caused the 2026-06-30 incident.
             # Exception 2 — hard_stop floor: residual absolute safety net at 0.07.
+            #
+            # BP13.3 invariant: this stop fires on entry_price vs best_bid only.
+            # Do NOT branch on users.sizing_mode here — the stop is sizing-agnostic.
 
             hours = _hours_left(p.get("end_date"))
 

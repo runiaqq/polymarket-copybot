@@ -3,15 +3,17 @@ Fast-path Celery task: copy a donor trade to a subscriber's wallet.
 Uses Polymarket CLOB v2 for real order placement.
 
 Integrations in this file:
-  BP1 — denormalize condition_id / token_id / outcome_index / neg_risk /
-         entry_price / shares onto copy_trades row for on-chain reconciliation.
-  BP2 — throttle _notify_low_balance to ≤1 alert per lowbal_alert_throttle_sec.
-  BP3 — fractional Kelly sizing (sizing_mode="kelly"); "fixed" keeps legacy behavior.
-  BP4 — tail-risk gates (exposure cap, event cap, drawdown, daily loss) evaluated
-         before place_order; pauses stored on users table.
-  BP7 — Gates 1 & 2 now clamp instead of hard-block on small balances.
-         concentration warn ("concentration_over_60") appended to the trade notification.
-         Soft-limit "$100" warning is mode-aware: shown only in kelly mode.
+  BP1  — denormalize condition_id / token_id / outcome_index / neg_risk /
+          entry_price / shares onto copy_trades row for on-chain reconciliation.
+  BP2  — throttle _notify_low_balance to ≤1 alert per lowbal_alert_throttle_sec.
+  BP3  — fractional Kelly sizing (sizing_mode="kelly"); "fixed" keeps legacy behavior.
+  BP4  — tail-risk gates (exposure cap, event cap, drawdown, daily loss) evaluated
+          before place_order; pauses stored on users table.
+  BP7  — Gates 1 & 2 now clamp instead of hard-block on small balances.
+          concentration warn ("concentration_over_60") appended to the trade notification.
+          Soft-limit "$100" warning is mode-aware: shown only in kelly mode.
+  BP13 — Correct sizing-mode hierarchy (User DB > global ENV); zero-edge Kelly skip
+          (risk_gate:zero_edge); per-user daily-trade cap (risk_gate:max_daily_trades).
 """
 
 import asyncio
@@ -113,6 +115,23 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         except Exception:
             pass
 
+    # ── BP13.2: per-user daily trade cap (fail-fast, before any I/O) ────────
+    # Checked here — before balance reads, position loads, and order-book RPCs —
+    # so a blocked user costs almost nothing.  Fails open on DB errors (never
+    # blocks a trade due to a count failure).
+    max_daily = user.get("max_daily_trades")
+    if max_daily is not None:
+        try:
+            from core.db import get_daily_trade_count
+            used = get_daily_trade_count(user_id)
+            if used >= int(max_daily):
+                log.info("skip_max_daily_trades", user_id=user_id,
+                         used=used, limit=int(max_daily))
+                _notify_daily_limit(user["telegram_id"], used, int(max_daily))
+                return {"skipped": True, "reason": "risk_gate:max_daily_trades"}
+        except Exception:
+            log.warning("daily_trade_count_failed", user_id=user_id)
+
     # ── Check collateral ─────────────────────────────────────────────────────
     try:
         from core.polygon import get_balances, fund_deposit_wallet
@@ -121,11 +140,14 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         log.warning("balance_check_failed", user_id=user_id)
         tradeable = 0.0
 
-    # ── BP3: Kelly sizing or fixed cap ───────────────────────────────────────
-    # Per-user setting takes priority over the global config default.
-    user_max = float(user.get("max_position_usdc") or 25)
+    # ── BP13.1 / BP3: sizing mode — User DB setting beats global ENV ─────────
+    # Authoritative priority: users.sizing_mode (DB) > settings.sizing_mode (ENV).
+    # Global ENV is only a default for users who never explicitly chose a mode.
+    user_mode = user.get("sizing_mode")
+    effective_mode = user_mode if user_mode in ("fixed", "kelly") else settings.sizing_mode
+
+    user_max  = float(user.get("max_position_usdc") or 25)
     depth_cap = float(signal.get("max_copy_usdc") or signal.get("size_usdc") or 0)
-    user_sizing_mode = user.get("sizing_mode") or settings.sizing_mode
 
     # BP8: load cost-basis ledger for both modes (cost-basis equity, no phantom drawdown).
     try:
@@ -149,7 +171,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             float(p.get("current_value") or 0) for p in positions if p.get("shares", 0) > 0
         )
 
-    if user_sizing_mode == "kelly":
+    if effective_mode == "kelly":
         from core.sizing import kelly_stake
         from core.wallet_score import score_wallet
         try:
@@ -164,22 +186,24 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             free_pusd=tradeable,
             cfg=settings,
         )
-        if k_stake > 0:
-            size_usdc = min(k_stake, user_max)
-            if depth_cap > 0:
-                size_usdc = min(size_usdc, depth_cap)
-            log.info("sizing_kelly", stake=round(k_stake, 2), capped=round(size_usdc, 2),
-                     equity=round(equity, 2), user_id=user.get("id"))
-        else:
-            # Kelly returned 0 (no edge detected) — fall back to fixed cap
-            size_usdc = min(user_max, depth_cap) if depth_cap > 0 else user_max
-            log.info("sizing_kelly_no_edge_fallback", fixed_cap=round(size_usdc, 2),
-                     user_id=user.get("id"))
+        size_usdc = min(k_stake, user_max)
+        if depth_cap > 0:
+            size_usdc = min(size_usdc, depth_cap)
+        # BP13.1b: zero-edge or sub-minimum stake → skip entirely; never fall back to fixed.
+        # The exchange_min floor below must NOT resurrect a sub-minimum Kelly stake.
+        # NOTE: the floor at line ~235 only runs if we pass this guard.
+        if k_stake <= 0 or size_usdc < settings.exchange_min_order_usdc:
+            log.info("skip_zero_edge", user_id=user_id,
+                     k_stake=round(k_stake, 4), capped=round(size_usdc, 4),
+                     exchange_min=settings.exchange_min_order_usdc)
+            return {"skipped": True, "reason": "risk_gate:zero_edge"}
+        log.info("sizing_kelly", stake=round(k_stake, 2), capped=round(size_usdc, 2),
+                 equity=round(equity, 2), user_id=user_id)
     else:
-        # Fixed cap (user chose fixed or global default)
+        # Fixed cap: user chose fixed, or no explicit per-user choice and global default is fixed.
         size_usdc = min(user_max, depth_cap) if depth_cap > 0 else user_max
-        log.debug("sizing_fixed", cap=round(size_usdc, 2), user_id=user.get("id"))
         score = None
+        log.debug("sizing_fixed", cap=round(size_usdc, 2), user_id=user_id)
 
     # ── BP8: unified per-trade risk cap (applies in BOTH fixed and kelly modes) ─
     # Worst-case loss of a binary trade = full stake. Cap it so a single loss
@@ -221,7 +245,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     # mode the user chose their own size, so we stay silent about balance.
     exchange_min = settings.exchange_min_order_usdc
     if equity < settings.recommended_min_balance_usdc:
-        if user_sizing_mode == "kelly":
+        if effective_mode == "kelly":
             from core.cache import notify_once as _no
             if _no(f"trading_min:{user_id}", ttl=settings.lowbal_alert_throttle_sec):
                 _notify_trading_at_minimum(
@@ -577,6 +601,35 @@ def _notify_consensus(telegram_id: int, signal: dict, consensus: int) -> None:
         asyncio.run(_send())
     except Exception:
         log.exception("notify_consensus_failed", telegram_id=telegram_id)
+
+
+def _notify_daily_limit(telegram_id: int, used: int, limit: int) -> None:
+    """BP13.2: one throttled nudge per user when the daily trade cap is hit."""
+    from telegram import Bot
+    from core.config import settings
+    from core.cache import notify_once
+
+    if not notify_once(f"daily_limit:{telegram_id}", ttl=settings.lowbal_alert_throttle_sec):
+        return
+
+    async def _send() -> None:
+        bot = Bot(token=settings.telegram_bot_token)
+        await bot.send_message(
+            chat_id=telegram_id,
+            text=(
+                f"🔁 <b>Дневной лимит сделок исчерпан</b>\n\n"
+                f"Ты установил лимит <b>{limit} сделок/день</b> — "
+                f"сегодня уже вошли в <b>{used}</b>.\n\n"
+                "Новые сигналы пропускаются до 00:00 UTC.\n"
+                "Изменить лимит: ⚙️ Настройки."
+            ),
+            parse_mode="HTML",
+        )
+
+    try:
+        asyncio.run(_send())
+    except Exception:
+        log.exception("notify_daily_limit_failed", telegram_id=telegram_id)
 
 
 def _notify_not_registered(telegram_id: int) -> None:

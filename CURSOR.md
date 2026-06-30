@@ -1811,6 +1811,354 @@ pm2 logs nexa-worker --lines 300 --nostream | grep -iE "withdraw_failed|withdraw
 
 ---
 
+### Blueprint 13 — Sizing-mode hierarchy fix, zero-edge skip, max-daily-trades limit & stop-loss invariant 🟡 FINAL DESIGN / READY TO IMPLEMENT
+
+> **Audit context (2026-06-30, Lead Quant):** three risk-management defects/gaps found during the
+> Kelly audit. 13.1 fixes a settings-priority bug that silently disables per-user Kelly and a
+> dangerous "no-edge → trade anyway" fallback. 13.2 adds a user-controllable daily trade cap.
+> 13.3 records the (already-correct) stop-loss invariant so it is never regressed by sizing work.
+> **No code in this pass — design only.** Code snippets below are the implementation contract.
+
+#### Diagnosis recap (confirmed by code inspection — do NOT re-diagnose)
+
+**Bug 13.1a — global ENV silently overrides per-user Kelly.** `execute_copy_trade` resolves the
+effective mode correctly (`user_sizing_mode = user.get("sizing_mode") or settings.sizing_mode`,
+`execute_copy.py:128`) and branches on it (`:152 if user_sizing_mode == "kelly":`). **But**
+`kelly_stake` itself re-checks the *global* config and bails:
+
+```52:53:core/sizing.py
+    if cfg.sizing_mode != "kelly":
+        return 0.0  # caller falls back to legacy flat cap
+```
+
+Global default is `sizing_mode: str = "fixed"` (`config.py:249`). So a user who enables Kelly in
+Telegram enters the `kelly` branch, calls `kelly_stake`, gets `0.0` (because *global* mode is
+`fixed`), and is dropped into the no-edge fallback → **fixed sizing**. The per-user choice is
+silently ignored unless `SIZING_MODE=kelly` is also set in the environment. This is a coupling bug:
+mode selection is the **caller's** job; `kelly_stake` must be **pure math**.
+
+**Bug 13.1b — "no edge" falls through to a fixed-size trade.** When Kelly legitimately returns `0`
+(`q_hat <= p`, i.e. no measurable edge over the market price), the bot does **not** skip — it trades
+the flat cap anyway:
+
+```173:177:worker/tasks/execute_copy.py
+        else:
+            # Kelly returned 0 (no edge detected) — fall back to fixed cap
+            size_usdc = min(user_max, depth_cap) if depth_cap > 0 else user_max
+            log.info("sizing_kelly_no_edge_fallback", fixed_cap=round(size_usdc, 2),
+                     user_id=user.get("id"))
+```
+
+This defeats the entire point of Kelly: a user who chose Kelly is telling us "only bet when there is
+an edge". Trading the flat $25 on a zero-edge signal is the opposite of that contract. The same is
+true when Kelly returns a positive but **sub-$5** stake: the downstream `size_usdc = max(size_usdc,
+exchange_min)` floor (`execute_copy.py:235`) silently inflates a $0.80 Kelly stake back up to the
+$5 platform minimum — again overriding the math.
+
+**Gap 13.2 — no per-user daily trade cap.** On a high-activity whale day a user can be copied into
+dozens of positions; there is no way to say "max N entries/day". `max_open_positions`
+(`config.py`) caps *concurrent* positions globally, not *daily entries* per user.
+
+**Invariant 13.3 — stop-loss is already sizing-agnostic; lock it in.** The Delta-Drop stop
+(Blueprint 10) lives in `sync_positions` (`manage_positions.py`) and triggers purely on
+`entry_price` vs live `best_bid`. It never reads `sizing_mode`. `entry_price` is persisted on every
+`copy_trades` row for both modes (BP1, `execute_copy.py:431`). So Kelly vs Fixed cannot change stop
+behaviour today — but nothing *documents* or *tests* that, so a future sizing change could regress
+it. This blueprint records the invariant + a guard test.
+
+---
+
+#### Blueprint 13.1 — Correct sizing-mode hierarchy + zero-edge skip
+
+**Priority rule (authoritative):** `users.sizing_mode` (DB) **>** `settings.sizing_mode` (global ENV).
+The global value is only a **default for users who never chose**. An explicit per-user choice always
+wins. Encoded as: `effective_mode = user.sizing_mode if user.sizing_mode in {"fixed","kelly"} else settings.sizing_mode`.
+
+**Behaviour matrix (the contract):**
+
+| `effective_mode` | Kelly math result | Action |
+|---|---|---|
+| `kelly` | stake ≥ `exchange_min` (after user/depth caps) | **trade** the Kelly stake |
+| `kelly` | `0` (no edge, `q_hat ≤ p`) | **SKIP** → `risk_gate:zero_edge` |
+| `kelly` | `> 0` but `< exchange_min` | **SKIP** → `risk_gate:zero_edge` (do **not** floor up to $5) |
+| `fixed` | n/a (Kelly never called) | trade the flat `min(user_max, depth_cap)` cap |
+
+Fixed sizing is used **only** when the user explicitly chose `fixed`. There is no "Kelly fell back to
+fixed" path anymore.
+
+**Step 1 — make `kelly_stake` pure math (`core/sizing.py`).** Delete the global-mode early return
+(lines 52–53). Mode selection no longer belongs here. Keep the genuine "no input" guards
+(`equity <= 0`, `free_pusd <= 0`, `p` out of `(0,1)`) and the no-edge guard (`q_hat <= p → 0.0`).
+Update the docstring: `kelly_stake` now returns the recommended stake assuming the caller has
+already decided to size with Kelly; `0.0` means **"no edge — do not bet"**, not "use fixed".
+
+**Step 2 — rewrite the sizing block (`execute_copy.py:124–182`).**
+
+```python
+# ── BP13.1: resolve effective sizing mode (User DB > global ENV) ──────────
+user_mode = user.get("sizing_mode")
+effective_mode = user_mode if user_mode in ("fixed", "kelly") else settings.sizing_mode
+
+user_max  = float(user.get("max_position_usdc") or 25)
+depth_cap = float(signal.get("max_copy_usdc") or signal.get("size_usdc") or 0)
+
+if effective_mode == "kelly":
+    from core.sizing import kelly_stake
+    from core.wallet_score import score_wallet
+    try:
+        score = score_wallet(signal.get("source_wallet") or signal.get("whale_wallet") or "")
+    except Exception:
+        score = None
+    k_stake = kelly_stake(
+        p=float(signal.get("price") or 0), score=score,
+        consensus=int(signal.get("consensus") or 1),
+        equity=equity, free_pusd=tradeable, cfg=settings,
+    )
+    size_usdc = min(k_stake, user_max)
+    if depth_cap > 0:
+        size_usdc = min(size_usdc, depth_cap)
+    # BP13.1b: no edge OR sub-minimum Kelly stake → SKIP, never floor up, never fall back to fixed.
+    if k_stake <= 0 or size_usdc < settings.exchange_min_order_usdc:
+        log.info("skip_zero_edge", user_id=user_id, k_stake=round(k_stake, 4),
+                 capped=round(size_usdc, 4), exchange_min=settings.exchange_min_order_usdc)
+        return {"skipped": True, "reason": "risk_gate:zero_edge"}
+    log.info("sizing_kelly", stake=round(k_stake, 2), capped=round(size_usdc, 2),
+             equity=round(equity, 2), user_id=user_id)
+else:
+    size_usdc = min(user_max, depth_cap) if depth_cap > 0 else user_max
+    score = None
+    log.debug("sizing_fixed", cap=round(size_usdc, 2), user_id=user_id)
+```
+
+**Step 3 — protect the exchange-min floor from resurrecting a skipped Kelly stake.** The existing
+`size_usdc = max(size_usdc, exchange_min)` (`:235`, `:261`, `:334`) is correct for **fixed** mode (a
+small fixed cap should still execute at $5). It is only dangerous on the Kelly path, and Step 2
+already `return`s before reaching it when the Kelly stake is sub-minimum. **No change to the floor
+lines** — the early `return` is the guard. (Document this dependency in a comment so the floor is not
+later moved above the Kelly skip.)
+
+**Step 4 — `zero_edge` is a silent skip, not a notification.** Mirror the existing
+`risk_gate:{gate}` skips (`:362-367`): log + return, **no Telegram message** (a "no edge" non-event
+must not spam the user). It surfaces only in logs / metrics.
+
+**Acceptance criteria (13.1):**
+- `kelly_stake` unit tests no longer depend on `cfg.sizing_mode`; add a case asserting a positive
+  stake is returned with `cfg.sizing_mode="fixed"` (proves decoupling).
+- Integration: user `sizing_mode='kelly'`, `SIZING_MODE=fixed` in env, edge present → trade is
+  **Kelly-sized** (regression test for 13.1a).
+- Integration: user `sizing_mode='kelly'`, signal with `q_hat ≤ p` → `{"skipped": True,
+  "reason": "risk_gate:zero_edge"}`, **no order placed, no fixed fallback** (13.1b).
+- Integration: user `sizing_mode='kelly'`, Kelly stake `$0.80` (< $5) → skipped `zero_edge`, **not**
+  floored to $5.
+- Integration: user `sizing_mode='fixed'` → unchanged flat-cap behaviour, no Kelly call.
+
+---
+
+#### Blueprint 13.2 — Per-user "Max daily trades" limit
+
+**13.2.1 — Database (migration `014_max_daily_trades.sql`).** New nullable column; `NULL` = unlimited
+(preserves current behaviour for every existing user).
+
+```sql
+-- Blueprint 13.2: per-user daily trade cap. NULL = unlimited (default, legacy behaviour).
+-- Counted against copy_trades rows CREATED in the current UTC day that actually entered the
+-- market (status <> 'failed'). Apply in Supabase SQL editor. Idempotent.
+alter table users add column if not exists max_daily_trades int;
+```
+
+Add to §6.9 pending-migrations list as **014** and to the §6.10 migration order. Update
+`core/db/models.py` `User` reference (add `max_daily_trades: Mapped[int | None]`). No global config
+knob is required; optionally add `default_max_daily_trades: int | None = None` to `Settings` if a
+fleet-wide default is ever wanted (default `None` = off).
+
+**13.2.2 — DB helper (`core/db/queries.py`).** Mirror `get_daily_realized_pnl` but key on
+`created_at` and the **UTC calendar day** (not a trailing 24 h window — the user's mental model is
+"per day", resets at 00:00 UTC).
+
+```python
+def get_daily_trade_count(user_id: int) -> int:
+    """Number of copy_trades this user ENTERED since 00:00 UTC today.
+
+    Counts rows that reached order placement (status != 'failed'). copy_trades rows are only
+    inserted once the bot commits to placing an order (execute_copy.py), so skipped signals
+    never consume a slot. 'failed' rows (order never landed) are excluded.
+    """
+    sb = get_supabase()
+    since = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    res = (
+        sb.table("copy_trades")
+        .select("id", count="exact")
+        .eq("user_id", user_id)
+        .neq("status", "failed")
+        .gte("created_at", since)
+        .execute()
+    )
+    return int(res.count or 0)
+```
+
+**13.2.3 — Risk gate (fail-fast, before sizing & RPCs).** This cap must reject **before** the
+expensive balance/positions/order-book reads, so it is **not** folded into `check_risk_gates`
+(which runs late, post-book). Instead add an early guard in `execute_copy_trade`, immediately after
+the `copy_paused_until` check (`:114`) and before the balance check (`:117`):
+
+```python
+# ── BP13.2: per-user daily trade cap (fail-fast, UTC day) ─────────────────
+max_daily = user.get("max_daily_trades")
+if max_daily is not None:
+    try:
+        from core.db import get_daily_trade_count
+        used = get_daily_trade_count(user_id)
+        if used >= int(max_daily):
+            log.info("skip_max_daily_trades", user_id=user_id, used=used, limit=int(max_daily))
+            _notify_daily_limit(user["telegram_id"], used, int(max_daily))  # throttled, see below
+            return {"skipped": True, "reason": "risk_gate:max_daily_trades"}
+    except Exception:
+        log.warning("daily_trade_count_failed", user_id=user_id)  # fail-open: never block on a count error
+```
+
+- **Counting semantics:** the slot is consumed when a `copy_trades` row is inserted
+  (`execute_copy.py:420`), i.e. the moment we commit to placing. The check reads the count *before*
+  this trade is inserted, so `used >= max_daily` is the correct "already at limit" test.
+- **Known race (accepted, documented):** two signals fanned out concurrently can both observe
+  `used = max-1` and both proceed, overshooting by one. This is a soft risk cap, not a financial
+  invariant; an atomic counter is out of scope. Note it in the code comment.
+- **Reset:** purely time-based — the next 00:00 UTC the `since` boundary moves and the count resets.
+  No cron, no stored counter to clear.
+- **Notification:** `_notify_daily_limit` is **throttled** via `core.cache.notify_once`
+  (key `daily_limit:{telegram_id}`, ttl ≈ `lowbal_alert_throttle_sec`) so a busy day produces at
+  most one "daily limit reached" nudge, mirroring `_notify_low_balance` (BP2).
+
+**13.2.4 — Telegram UI state machine (`api/routers/telegram.py`).** Mirror the existing
+`max_position_usdc` template+custom pattern (`_settings_kb` + `setmax_*` + `awaiting_max_pos`).
+
+*Keyboard (`_settings_kb`)* — add a `max_daily_trades` parameter and a new template row with a ✓ on
+the active value:
+
+```python
+def _settings_kb(copy_active, current_max, sizing_mode="fixed", max_daily=None):
+    def _daily_label(n):
+        mark = " ✓" if max_daily == n else ""
+        return f"{n}/день{mark}"
+    off_label = "♾ Без лимита" + (" ✓" if max_daily is None else "")
+    ...
+    # new rows (placed after the position-size rows, before the sizing toggle):
+    [InlineKeyboardButton(_daily_label(1),  callback_data="setdaily_1"),
+     InlineKeyboardButton(_daily_label(5),  callback_data="setdaily_5"),
+     InlineKeyboardButton(_daily_label(10), callback_data="setdaily_10")],
+    [InlineKeyboardButton("✏️ Свой лимит", callback_data="setdaily_custom"),
+     InlineKeyboardButton(off_label,        callback_data="setdaily_off")],
+```
+
+Every existing `_settings_kb(...)` call site (`:854`, `:1237`, `:1519`, `:1566`, `:1586`) must pass
+`max_daily=db_user.get("max_daily_trades")`.
+
+*Callback handler* — add a `data.startswith("setdaily_")` branch alongside `setmax_` (`:1523`):
+
+```python
+if data.startswith("setdaily_"):
+    suffix = data[len("setdaily_"):]
+    if suffix == "off":
+        update_user(tg_user.id, {"max_daily_trades": None})
+        ... re-render settings with confirmation "♾ Лимит снят" ...
+        return
+    if suffix == "custom":
+        context.user_data["awaiting_daily_limit"] = True
+        context.user_data["awaiting_max_pos"] = False   # mutually exclusive FSM flags
+        ... prompt: "Введи число сделок в день (1–100), 0 = без лимита" ...
+        return
+    val = int(suffix)                                    # 1 | 5 | 10
+    update_user(tg_user.id, {"max_daily_trades": val})
+    ... re-render settings, answer "✅ Лимит: N/день" ...
+    return
+```
+
+*Custom text input* — add a block in the message handler mirroring `awaiting_max_pos`
+(`:1206-1238`). **Guard mutual exclusion:** the handler checks `awaiting_daily_limit` and
+`awaiting_max_pos` as separate branches; setting one flag clears the other (shown above) so a typed
+number is never ambiguous.
+
+```python
+if context.user_data.get("awaiting_daily_limit"):
+    context.user_data["awaiting_daily_limit"] = False
+    clean = text.strip().replace(",", "")
+    try:
+        n = int(float(clean))
+    except ValueError:
+        ... reply "⚠️ Введи целое число, напр. 5" ...; return
+    if n <= 0:
+        update_user(tg_user.id, {"max_daily_trades": None})   # 0 / negative = unlimited
+        ... reply "♾ Лимит снят — без ограничения по сделкам в день" ...
+    elif n > 100:
+        ... reply "⚠️ Максимум 100 сделок в день"; return
+    else:
+        update_user(tg_user.id, {"max_daily_trades": n})
+        ... reply f"✅ Лимит: {n} сделок в день (UTC)" ...
+    ... re-render settings keyboard with new max_daily ...
+    return
+```
+
+*FSM summary:* `idle → [tap ✏️ Свой лимит] → awaiting_daily_limit → [valid int] → idle (saved)`;
+template buttons (`setdaily_1/5/10/off`) write immediately with no intermediate state. `awaiting_*`
+flags are mutually exclusive — entering either clears the other.
+
+*Display* — surface the limit in `_settings_text` and the dashboard (`_dashboard_text:204`):
+`f"🔁 Лимит/день: {max_daily}" if max_daily else "🔁 Лимит/день: ♾"`.
+
+**Acceptance criteria (13.2):**
+- Migration applies idempotently; existing users read `NULL` → unlimited (no behaviour change).
+- `get_daily_trade_count` counts only today-UTC, non-`failed` rows; excludes yesterday and `failed`.
+- With `max_daily_trades=1` and one entered trade today, the next signal returns
+  `{"skipped": True, "reason": "risk_gate:max_daily_trades"}` and places **no** order; the check
+  runs **before** any balance/book RPC (assert via call order / logs).
+- After 00:00 UTC rollover the count resets and trading resumes with no manual action.
+- Telegram: tapping `5/день` persists `max_daily_trades=5` and shows ✓; `✏️ Свой лимит` → typing
+  `7` persists 7; `0` or `♾ Без лимита` clears to `NULL`; daily-limit nudge is throttled to ≤1.
+
+---
+
+#### Blueprint 13.3 — Stop-loss consistency invariant
+
+**Invariant (must hold for all future sizing work):** the unified **Delta-Drop stop-loss**
+(Blueprint 10) applies to **every** open position with `shares > 0`, evaluated solely on
+`entry_price` vs the live CLOB `best_bid` at the **price-tracking layer** (`sync_positions` in
+`worker/tasks/manage_positions.py`). The stop is **completely independent of how the entry size was
+computed** — Kelly or Fixed. Position size affects only the *dollar* magnitude of a stopped loss
+(`loss_$ = size · X`, see BP10), never *whether* or *when* the stop fires.
+
+**Why it already holds (do not "fix"):**
+- `sync_positions` reads `entry` from the position `avg_price` (fallback: ledger `entry_price` via
+  `get_open_trade_by_token`) and `best_bid` from the live book. It **never reads `sizing_mode`**.
+- `entry_price` is persisted on **every** `copy_trades` row at insert time (BP1,
+  `execute_copy.py:431`) regardless of sizing mode, so the stop has its reference price in both modes.
+- The trigger `(1 - best_bid/entry) >= delta_drop_stop_pct` contains no size/mode term.
+
+**Guardrails to add so it stays true:**
+- **Test (pure):** extend BP10's `delta_drop_hit(entry, best_bid, X)` unit suite with an explicit
+  comment/case asserting the function signature takes **no size and no mode** argument — the type
+  system enforces sizing-independence.
+- **Test (integration):** open two positions at the **same `entry_price`**, one created in Kelly
+  mode and one in Fixed mode; push a synthetic book with `best_bid ≤ entry·(1-X)`; assert **both**
+  fire `position_closed reason=delta_drop_stop`. Sizing mode must not appear in the assertion path.
+- **Doc lock:** a one-line comment at the Delta-Drop trigger in `manage_positions.py`:
+  `# BP13.3 invariant: stop is sizing-mode-agnostic — do NOT branch on users.sizing_mode here.`
+- **Coupling caution:** BP13.1 makes Kelly able to **skip** entry (`zero_edge`) and BP13.2 can cap
+  daily entries — both reduce *how many* positions exist, but once a position is open it is governed
+  by the **same** stop. No stop-loss code reads the daily-cap or sizing fields.
+
+---
+
+#### Cross-cutting notes
+- **Config defaults unchanged:** global `sizing_mode` stays `"fixed"` (conservative). The 13.1 fix
+  means a per-user `kelly` choice now actually takes effect without touching the env.
+- **Rollback:** 13.1 is behaviour-preserving for `fixed` users; to revert, restore the
+  `kelly_stake` global-mode early return. 13.2 is fully gated by `max_daily_trades IS NULL` (off by
+  default), so shipping the migration alone changes nothing until a user sets a limit.
+- **Skip-reason taxonomy:** two new `reason` values join the existing `risk_gate:*` family —
+  `risk_gate:zero_edge` (13.1) and `risk_gate:max_daily_trades` (13.2) — so dashboards/log greps
+  already filtering `risk_gate:` pick them up for free.
+
+---
+
 ## 5. Coding Guidelines (STRICT — safety first)
 
 These rules are non-negotiable. Money and private keys are at stake.
@@ -2021,13 +2369,15 @@ super-admin (`ADMIN_TELEGRAM_ID` from env) is always authorized regardless of th
 - **013** ✅ — `users.risk_state` + `risk_override_at` + `risk_override_count` +
   `realized_baseline` (Blueprint 8) → `migrations/013_risk_state_override.sql`
   (**applied** — deploy with Blueprint 8 code)
+- **014** 🟡 — `users.max_daily_trades` (Blueprint 13.2; `NULL` = unlimited) →
+  `migrations/014_max_daily_trades.sql` (design in §4 Blueprint 13 — apply with Blueprint 13 code)
 
 ### 6.10 Migration order
 
 `001` whale strategy → `002` access codes → `003` username → `004` admins → `005` deposit wallets →
 `006` wallet score → `007` tracked wallets → `008` settlement ledger → `009` tracked avg size →
 `010` risk controls → `011` user sizing mode → `012` position state (exit_tx + user/condition index) →
-`013` risk state + manual override (Blueprint 8).
+`013` risk state + manual override (Blueprint 8) → `014` max daily trades (Blueprint 13.2).
 
 ---
 

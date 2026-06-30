@@ -432,6 +432,32 @@ def resume_user_copying(user_id: int) -> None:
     sb.table("users").update({"copy_paused_until": None}).eq("id", user_id).execute()
 
 
+def get_daily_trade_count(user_id: int) -> int:
+    """Number of copy_trades this user entered since 00:00 UTC today.
+
+    Counts rows that reached order placement (status != 'failed').  Rows are only
+    inserted in execute_copy_trade once we commit to placing an order, so skipped
+    signals never consume a slot.
+
+    Known race (accepted, soft cap): two concurrent signals can both read count=N-1
+    and both proceed, overshooting by one.  This is a risk knob, not a financial
+    invariant; an atomic counter is out of scope.
+    """
+    sb = get_supabase()
+    since = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+    res = (
+        sb.table("copy_trades")
+        .select("id", count="exact")
+        .eq("user_id", user_id)
+        .neq("status", "failed")
+        .gte("created_at", since)
+        .execute()
+    )
+    return int(res.count or 0)
+
+
 def get_daily_realized_pnl(user_id: int) -> float:
     """Sum of realized_pnl for trades settled in the trailing 24 h."""
     sb = get_supabase()

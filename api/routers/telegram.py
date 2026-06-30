@@ -97,11 +97,19 @@ def _stop_resume_kb(copy_active: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[btn], [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")]])
 
 
-def _settings_kb(copy_active: bool, current_max: float,
-                 sizing_mode: str = "fixed") -> InlineKeyboardMarkup:
+def _settings_kb(
+    copy_active: bool,
+    current_max: float,
+    sizing_mode: str = "fixed",
+    max_daily: int | None = None,
+) -> InlineKeyboardMarkup:
     def _label(val: int) -> str:
         mark = " ✓" if abs(current_max - val) < 0.5 else ""
         return f"${val}{mark}"
+
+    def _daily_label(n: int) -> str:
+        mark = " ✓" if max_daily == n else ""
+        return f"{n}/день{mark}"
 
     toggle_btn = (
         InlineKeyboardButton("⏸ Приостановить", callback_data="stop")
@@ -119,6 +127,8 @@ def _settings_kb(copy_active: bool, current_max: float,
         callback_data="sizing_kelly",
     )
 
+    off_label = "♾ Без лимита" + (" ✓" if max_daily is None else "")
+
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(_label(10),  callback_data="setmax_10"),
@@ -130,6 +140,16 @@ def _settings_kb(copy_active: bool, current_max: float,
         # Sizing mode toggle
         [fixed_btn, kelly_btn],
         [InlineKeyboardButton("❓ Что такое Kelly-сайзинг?", callback_data="kelly_info")],
+        # BP13.2: daily trade limit
+        [
+            InlineKeyboardButton(_daily_label(1),  callback_data="setdaily_1"),
+            InlineKeyboardButton(_daily_label(5),  callback_data="setdaily_5"),
+            InlineKeyboardButton(_daily_label(10), callback_data="setdaily_10"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Свой лимит/день", callback_data="setdaily_custom"),
+            InlineKeyboardButton(off_label,         callback_data="setdaily_off"),
+        ],
         [toggle_btn],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
     ])
@@ -201,7 +221,9 @@ def _dashboard_text(db_user: dict, first_name: str) -> str:
         copy_icon = "⏸ Пауза"
     max_pos = db_user.get("max_position_usdc") or 25
     sizing_mode = db_user.get("sizing_mode") or "fixed"
+    max_daily = db_user.get("max_daily_trades")
     sizing_icon = "🤖 Kelly" if sizing_mode == "kelly" else f"📊 Фикс ${max_pos:.0f}"
+    daily_icon = f"{max_daily}/день" if max_daily is not None else "♾"
     checklist = _checklist(db_user)
     mid = (
         f"{checklist}\n\n"
@@ -221,6 +243,7 @@ def _dashboard_text(db_user: dict, first_name: str) -> str:
         f"💼 Кошелёк: <code>{addr_short}</code>\n"
         f"🔄 Автокопирование: {copy_icon}\n"
         f"💵 Позиция: <b>{sizing_icon}</b>\n"
+        f"🔁 Лимит/день: <b>{daily_icon}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{mid}"
         f"{paused_banner}"
@@ -813,6 +836,7 @@ def _settings_text(db_user: dict) -> str:
     copy_active = db_user.get("copy_active", False)
     max_pos = db_user.get("max_position_usdc") or 25
     sizing_mode = db_user.get("sizing_mode") or "fixed"
+    max_daily = db_user.get("max_daily_trades")
     copy_status = "▶️ Активно" if copy_active else "⏸ Приостановлено"
 
     if sizing_mode == "kelly":
@@ -829,10 +853,17 @@ def _settings_text(db_user: dict) -> str:
             "Выбери максимальный размер одной позиции 👇"
         )
 
+    daily_line = (
+        f"🔁 Лимит/день: <b>{max_daily} сделок</b>\n"
+        if max_daily is not None
+        else "🔁 Лимит/день: <b>♾ без ограничений</b>\n"
+    )
+
     return (
         f"⚙️ <b>Настройки</b>\n\n"
         f"🔄 Копирование: {copy_status}\n"
         f"{sizing_line}"
+        f"{daily_line}"
         f"{size_hint}"
     )
 
@@ -851,7 +882,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(  # type: ignore[union-attr]
         _settings_text(db_user),
         parse_mode="HTML",
-        reply_markup=_settings_kb(copy_active, max_pos, sizing_mode),
+        reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, db_user.get("max_daily_trades")),
     )
 
 
@@ -1203,6 +1234,45 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
+    # ── BP13.2: custom daily trade limit ──────────────────────────────────────
+    if context.user_data.get("awaiting_daily_limit"):
+        context.user_data["awaiting_daily_limit"] = False
+        clean = text.strip().replace(",", "")
+        try:
+            n = int(float(clean))
+        except ValueError:
+            await update.message.reply_text(  # type: ignore[union-attr]
+                "⚠️ Введи целое число, например: <code>5</code>",
+                parse_mode="HTML",
+            )
+            return
+        db_user = get_user_by_telegram_id(tg_user.id) or {}
+        copy_active = db_user.get("copy_active", False)
+        max_pos = float(db_user.get("max_position_usdc") or 25)
+        sizing_mode = db_user.get("sizing_mode") or "fixed"
+        if n <= 0:
+            update_user(tg_user.id, {"max_daily_trades": None})
+            db_user = get_user_by_telegram_id(tg_user.id) or db_user
+            await update.message.reply_text(  # type: ignore[union-attr]
+                "♾ <b>Лимит снят</b> — сделок без ограничений в день.",
+                parse_mode="HTML",
+                reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, None),
+            )
+        elif n > 100:
+            await update.message.reply_text(  # type: ignore[union-attr]
+                "⚠️ Максимум — <b>100 сделок в день</b>.",
+                parse_mode="HTML",
+            )
+        else:
+            update_user(tg_user.id, {"max_daily_trades": n})
+            db_user = get_user_by_telegram_id(tg_user.id) or db_user
+            await update.message.reply_text(  # type: ignore[union-attr]
+                f"✅ <b>Лимит установлен: {n} сделок/день (UTC)</b>",
+                parse_mode="HTML",
+                reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, n),
+            )
+        return
+
     # ── Custom position size ───────────────────────────────────────────────────
     if not context.user_data.get("awaiting_max_pos"):
         return
@@ -1234,7 +1304,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(  # type: ignore[union-attr]
         f"✅ <b>Готово!</b> Макс. позиция: <b>${val:.0f} USDC</b>",
         parse_mode="HTML",
-        reply_markup=_settings_kb(copy_active, val, sizing_mode),
+        reply_markup=_settings_kb(copy_active, val, sizing_mode, db_user.get("max_daily_trades")),
     )
 
 
@@ -1516,7 +1586,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(
             _settings_text(db_user),
             parse_mode="HTML",
-            reply_markup=_settings_kb(copy_active, max_pos, sizing_mode),
+            reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, db_user.get("max_daily_trades")),
         )
         return
 
@@ -1563,7 +1633,65 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(
             _settings_text(db_user),
             parse_mode="HTML",
-            reply_markup=_settings_kb(copy_active, val, sizing_mode),
+            reply_markup=_settings_kb(copy_active, val, sizing_mode, db_user.get("max_daily_trades")),
+        )
+        return
+
+    # ── BP13.2: daily trade limit ─────────────────────────────────────────────
+    if data.startswith("setdaily_"):
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user:
+            await query.answer("Отправь /start", show_alert=True)
+            return
+
+        suffix = data[len("setdaily_"):]
+
+        if suffix == "off":
+            update_user(tg_user.id, {"max_daily_trades": None})
+            db_user = get_user_by_telegram_id(tg_user.id) or db_user
+            copy_active = db_user.get("copy_active", False)
+            max_pos = float(db_user.get("max_position_usdc") or 25)
+            sizing_mode = db_user.get("sizing_mode") or "fixed"
+            await query.answer("♾ Лимит снят — сделок без ограничений")
+            await query.edit_message_text(
+                _settings_text(db_user),
+                parse_mode="HTML",
+                reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, None),
+            )
+            return
+
+        if suffix == "custom":
+            context.user_data["awaiting_daily_limit"] = True
+            context.user_data["awaiting_max_pos"] = False  # mutually exclusive
+            await query.answer()
+            await query.edit_message_text(
+                "✏️ <b>Введи лимит сделок в день</b>\n\n"
+                "Напиши число в чат, например: <code>3</code>\n\n"
+                "<i>0 или пустое — снять ограничение (♾)</i>\n"
+                "<i>Диапазон: 1 — 100</i>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("↩️ Назад", callback_data="settings")
+                ]]),
+            )
+            return
+
+        try:
+            n = int(suffix)
+        except ValueError:
+            await query.answer("Ошибка", show_alert=True)
+            return
+
+        update_user(tg_user.id, {"max_daily_trades": n})
+        db_user = get_user_by_telegram_id(tg_user.id) or db_user
+        copy_active = db_user.get("copy_active", False)
+        max_pos = float(db_user.get("max_position_usdc") or 25)
+        sizing_mode = db_user.get("sizing_mode") or "fixed"
+        await query.answer(f"✅ Лимит: {n} сделок/день")
+        await query.edit_message_text(
+            _settings_text(db_user),
+            parse_mode="HTML",
+            reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, n),
         )
         return
 
@@ -1583,7 +1711,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(
             _settings_text(db_user),
             parse_mode="HTML",
-            reply_markup=_settings_kb(copy_active, max_pos, new_mode),
+            reply_markup=_settings_kb(copy_active, max_pos, new_mode, db_user.get("max_daily_trades")),
         )
         return
 
