@@ -1834,7 +1834,7 @@ pm2 logs nexa-worker --lines 300 --nostream | grep -iE "withdraw_failed|withdraw
 
 ---
 
-### Blueprint 13 — Sizing-mode hierarchy fix, zero-edge skip, max-daily-trades limit & stop-loss invariant 🟡 FINAL DESIGN / READY TO IMPLEMENT
+### Blueprint 13 — Sizing-mode hierarchy fix, zero-edge skip, max-daily-trades limit & stop-loss invariant ✅ IMPLEMENTED
 
 > **Audit context (2026-06-30, Lead Quant):** three risk-management defects/gaps found during the
 > Kelly audit. 13.1 fixes a settings-priority bug that silently disables per-user Kelly and a
@@ -2182,6 +2182,216 @@ computed** — Kelly or Fixed. Position size affects only the *dollar* magnitude
 
 ---
 
+### Blueprint 14 — Kelly edge-degeneracy fix + AI-analysis pipeline redesign ✅ IMPLEMENTED
+
+> **Audit context (2026-06-30, Lead Quant):** two production problems on Nexa AI. 14.A — Kelly
+> sizing looks fixed (~$6.2 every executed trade) and only ever fires on expensive favorites.
+> 14.B — the LLM risk analysis is internally inconsistent (emoji/verdict/score disagree) and
+> content-free.
+>
+> **Implemented 2026-06-30:** 14.A shipped as `core/sizing._damp_edge()` +
+> `kelly_edge_damping_gamma` config knob, **default 0.0 (OFF — legacy undamped formula,
+> behaviour unchanged on deploy)**. Stress-testing the fix before shipping the default ON
+> revealed a severe side effect: at `gamma=1.0` (full damping), the *maximum possible* stake
+> (best wallet quality, max consensus, edge at the 0.06 cap) is `kelly_lambda · kelly_edge_cap ·
+> equity` — independent of price. At current prod equity (~$124) that ceiling is **$1.86**,
+> below `exchange_min_order_usdc` ($5) — meaning full damping makes Kelly skip **every** signal
+> until equity exceeds ≈$333 (`5 / (kelly_lambda · kelly_edge_cap)`), or `kelly_base_edge` /
+> `kelly_edge_cap` are raised to compensate. Per §5.6 (strategy/money-moving changes need a
+> conservative default), this is shipped **off by default** — operators must explicitly set
+> `KELLY_EDGE_DAMPING_GAMMA` after either growing equity past the threshold or raising the edge
+> caps, and validate on the `kelly_stake` logs that real trades still clear the minimum before
+> enabling fleet-wide. 14.B shipped as `core/risk_label.py` (single source of truth for
+> emoji/verdict, shared by `ai_filter._broadcast` and `execute_copy._notify`) + strict
+> `json_schema` structured output in `worker/tasks/ai_filter.py`
+> (`risk_score`/`signal_type`/`thesis`/`caution`) + migration 015 (`trade_signals.ai_signal_type`).
+> 14.B is live unconditionally (no flag) — it only changes how the existing AI message is
+> composed, not how money moves.
+
+---
+
+#### Part A — Kelly edge degeneracy (the real cause of "fixed-looking" sizing)
+
+**Diagnosis (confirmed from 30+ prod `kelly_stake` log lines, 2026-06-30 15:36–20:13):**
+
+The user hypothesis ("risk gates inflate a $1 Kelly stake up to the $5 minimum") is **DISPROVEN** —
+BP13 works: sub-$5 Kelly stakes log `skip_zero_edge` and are skipped, `sizing_kelly_no_edge_fallback`
+count is 0. The true defect is deeper.
+
+**Empirical fact:** `q_hat − p ≡ 0.0214` for *every* signal, across all prices observed
+(0.126, 0.37, 0.39, 0.513, 0.67, 0.79, 0.82, 0.83, 0.905, 0.91, 0.938, 0.94, 0.95). The estimated
+edge is a **flat constant**, independent of market or price.
+
+**Mechanism.** With a constant edge `E = 0.0214`, the Kelly fraction collapses to a pure function of
+price: `f_kelly = E / (1 − p)`, then `f_final = min(λ·f_kelly, max_risk_per_trade)`. With
+`λ=0.25`, `max_risk_per_trade=0.05`, equity ≈ $124:
+
+| Price band | `f_final` | stake | Outcome |
+|---|---|---|---|
+| `p < 0.867` | < 0.0403 | < $5 | **skip** (`skip_zero_edge`) — every cheaper signal |
+| `0.867 ≤ p < 0.893` | 0.0403–0.05 | $5–$6.2 | rare (logs: `capped=5.1`, `5.2`) |
+| `p ≥ 0.893` | **clamped to 0.05** | ≈ 5%·equity ≈ **$6.2** | every executed trade |
+
+So the bot **only trades expensive favorites (p ≳ 0.89), and every one clamps to the 5% hard cap** —
+hence the near-identical $6.18–$6.33 sizes. Quarter-Kelly (`λ`) is dead weight: on every *executed*
+trade the 5% cap binds, not Kelly.
+
+**Root cause.** `edge_hat = kelly_base_edge · quality · consensus_mult` (`core/sizing.py:74-75`)
+encodes only *wallet trust*, never *market mispricing*, and is a **flat additive bump** on top of the
+price the whale paid. Two compounding failures:
+1. **Additive edge explodes at high p.** A flat +0.0214 added to 0.95 yields a tiny *relative* edge
+   but `f_kelly = E/(1−p)` blows up as `p→1`, so Kelly always maxes out on favorites — the exact
+   "penny-collecting, high tail-risk" trades. This is adverse selection baked into the math.
+2. **`quality` is currently pinned constant** (single dominant whitelisted wallet and/or unscored
+   default `quality=0.5`), so edge does not differentiate signals at all.
+
+**Step 0 — confirm the `quality`/`consensus` decomposition (one command, before coding).** `kelly_edge`
+is logged at DEBUG; raise the worker to `--loglevel=debug` briefly and capture:
+```bash
+docker compose logs --since 10m worker | grep "kelly_edge"   # edge_hat, quality, consensus
+```
+Confirm whether `quality` is constant (single-wallet/unscored) or genuinely flat from scoring.
+
+**Step 1 — make edge price-aware (kill the high-p explosion).** The additive model is the core flaw.
+Scale the edge so the Kelly fraction does **not** diverge as `p→1` — a 2pp edge on a 0.95 favorite
+must be worth far less risk-adjusted stake than 2pp on a 0.55 coin-flip. Concretely, damp `edge_hat`
+by a concave factor of `(1−p)` (design target; tune the exponent on the `position_mark`/`kelly_edge`
+dataset):
+```
+edge_hat_eff = edge_hat · (1 − p)^γ      # γ ∈ [0.5, 1.0]; γ=1 fully cancels the 1/(1−p) blow-up
+f_kelly      = edge_hat_eff / (1 − p)
+```
+With `γ=1` this makes `f_kelly = edge_hat` (flat in p) → favorites no longer auto-max the cap, and
+mid-price signals with real edge can clear the minimum. This directly counters the penny-collecting
+adverse selection surfaced above.
+
+**Step 2 — make `quality` actually vary.** Ensure `signal["source_wallet"]` is reliably populated
+(via `wallet_score.resolve_buyer`) so `score_wallet` returns a real per-wallet `resolved_count > 0`;
+otherwise every signal falls to the `quality=0.5` default and edge can never differentiate. Add a
+`kelly_edge` log assertion / metric on the share of signals scored vs. defaulted.
+
+**Step 3 — stop the 5% cap from being the de-facto sizer.** Once Steps 1–2 let `f_final` land below
+`max_risk_per_trade` on most trades, λ (quarter-Kelly) governs sizing again and stakes genuinely
+vary. The 5% cap returns to being a *safety ceiling*, not the primary knob. Keep `max_risk_per_trade`
+as-is; verify post-fix that executed trades are **not** all pinned at `f_final = 0.05`.
+
+**Acceptance criteria (14.A):**
+- Post-fix `kelly_stake` logs show `q_hat − p` **varying** across signals (no longer a constant).
+- Executed trades show a **spread** of `f_final` values (not all `0.05`); stakes are not all ≈5%·equity.
+- The bot enters at least some non-favorite (p < 0.89) signals when a real edge exists.
+- Pure unit test for the new `edge_hat_eff`/`f_kelly` helper: assert `f_kelly` is non-increasing-then-
+  bounded in p (no divergence at p→1), and 0 when `q_hat ≤ p`.
+
+> **Note:** 14.A is a *strategy* change (moves money differently) → gate behind a config flag with a
+> conservative default and validate on the `kelly_edge` dataset before enabling fleet-wide, per §5.6.
+
+---
+
+#### Part B — AI-analysis pipeline redesign
+
+**Diagnosis (confirmed from code, `worker/tasks/ai_filter.py`).** The LLM returns **both** a free-text
+`verdict` *and* a `score`, independently:
+```43:44:worker/tasks/ai_filter.py
+{{"score": <целое 1-10, 1=низкий риск>, "verdict": "<Сильный сигнал|Умеренный|Рискованно>",
+```
+while the bot derives the emoji from `score`:
+```128:128:worker/tasks/ai_filter.py
+    risk_icon = "🟢" if score <= 4 else ("🟡" if score <= 6 else "🔴")
+```
+→ `score=3` (bot → 🟢) + hallucinated `verdict="Рискованно"` ⇒ **"🟢 Рискованно · риск 3/10"**. Three
+sources of truth (emoji, verdict, number) are unsynchronised. The `reason` text also just restates the
+probability/time — no analytical value.
+
+**Principle: `risk_score` is the single source of truth.** The LLM returns *only* a number + analysis.
+The emoji **and** the verdict label are **derived deterministically by the bot** from `risk_score`.
+The LLM never emits emoji or verdict.
+
+**B.1 — Structured Outputs (strict JSON schema).** Replace `response_format={"type":"json_object"}`
+with a strict `json_schema` so the model cannot return extra/contradictory fields:
+```json
+{
+  "name": "trade_analysis",
+  "strict": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["risk_score", "signal_type", "thesis", "caution"],
+    "properties": {
+      "risk_score":  { "type": "integer", "minimum": 1, "maximum": 10 },
+      "signal_type": { "type": "string",
+        "enum": ["penny_collecting","value_bet","momentum","longshot_size","consensus_stack","coin_flip"] },
+      "thesis":  { "type": "string", "maxLength": 180 },
+      "caution": { "type": "string", "maxLength": 120 }
+    }
+  }
+}
+```
+- `risk_score` — the only driver of colour/verdict.
+- `signal_type` — machine tag of the trade's structure (analytics + future filters).
+- `thesis` — the core insight; `caution` — the main risk. No emoji, no number-restating.
+
+**B.2 — Deterministic mapping (bot, single helper `risk_label(score)`).** Used by *both*
+`ai_filter._broadcast` and `execute_copy._notify` so the two paths render identically:
+```
+1–2  → 🟢  "Сильный сетап"
+3–4  → 🟢  "Уверенный сигнал"
+5–6  → 🟡  "Умеренный риск"
+7–8  → 🟠  "Высокий риск"
+9–10 → 🔴  "Опасная зона"
+```
+Emoji, label and number now come from one integer → they cannot disagree. (Replaces the inline
+`risk_icon` ternary at `ai_filter.py:128` and the equivalent in `execute_copy._notify`.)
+
+**B.3 — New system prompt (draft).** Forbid number-restating; force hedge-fund-analyst reasoning:
+```
+Ты — старший аналитик хедж-фонда, специализация — рынки предсказаний (Polymarket).
+Тебе дают сделку проверенного прибыльного кита из белого списка. Оцени КАЧЕСТВО СДЕЛКИ
+как инвестиционный кейс, а не описывай вводные.
+
+ЗАПРЕЩЕНО:
+- Пересказывать цифры («цена 0.94, до закрытия 3 часа») — пользователь видит их сам.
+- Общие фразы («высокая вероятность, но есть риск») — это мусор.
+- Эмодзи, вердикты, слово «риск N/10» — это проставит система.
+
+ТРЕБУЕТСЯ распознать СТРУКТУРУ сделки и дать инсайт уровня деска:
+- Дорогой фаворит (0.90+) на крупный размер → «сбор копеек»: малый апсайд, жирный tail-risk.
+- Низкая вероятность (<0.30) + агрессивный размер кита → возможный инсайд / асимметрия:
+  кит видит то, чего не видит рынок. Подсвети это.
+- Консенсус нескольких китов в одном исходе → усиление, но проверь скученность.
+- Тонкий запас времени до резолва → нет места для разворота, риск выше.
+- Цена ~0.50 → монетка; нужна причина, почему это не шум.
+
+Верни строго JSON по схеме: risk_score (1=низкий риск сделки, 10=высокий), signal_type,
+thesis (главный тезис), caution (главный риск). Русский, без воды, тон — аналитик, не маркетолог.
+```
+Set `temperature=0.2` (was 0.3) for verdict stability. On invalid JSON / schema refusal → fallback
+`risk_score=5`, `thesis="ИИ временно недоступен"`, label/colour from the mapping. Never crash.
+
+**B.4 — Persistence & migration.** Store `ai_score`, `ai_signal_type`, `ai_reason` on
+`trade_signals`. New column needs migration **015**: `alter table trade_signals add column if not
+exists ai_signal_type text;` (add to §6.9 / §6.10 with the implementation PR).
+
+**Acceptance criteria (14.B):**
+- Emoji, verdict label and number are always consistent (derived from one `risk_score`) — no more
+  "🟢 Рискованно · риск 3/10".
+- `thesis` never merely restates price/time; it names the structural pattern (e.g. penny-collecting,
+  longshot-size) — spot-check 10 live analyses.
+- Strict-schema call: malformed model output cannot leak emoji/verdict; fallback path verified.
+- Both the signals-mode broadcast and the copied-trade notification use the shared `risk_label`.
+
+---
+
+#### Cross-cutting
+- **The two problems are linked:** 14.A's degenerate Kelly funnels the bot into high-p penny-
+  collecting favorites — precisely the trades 14.B's analyst prompt is built to flag as high tail-
+  risk. Fixing 14.A widens the signal set; 14.B makes the per-trade risk legible.
+- **Migrations:** 14.B adds **015** (`trade_signals.ai_signal_type`). 14.A adds a Kelly config flag
+  (no schema change). Apply 015 with the BP14 code.
+- Both parts are strategy/UX changes → gate behind config flags with conservative defaults (§5.6) and
+  validate on real data before fleet-wide enable.
+
+---
+
 ## 5. Coding Guidelines (STRICT — safety first)
 
 These rules are non-negotiable. Money and private keys are at stake.
@@ -2394,15 +2604,18 @@ super-admin (`ADMIN_TELEGRAM_ID` from env) is always authorized regardless of th
 - **013** ✅ — `users.risk_state` + `risk_override_at` + `risk_override_count` +
   `realized_baseline` (Blueprint 8) → `migrations/013_risk_state_override.sql`
   (**applied** — deploy with Blueprint 8 code)
-- **014** 🟡 — `users.max_daily_trades` (Blueprint 13.2; `NULL` = unlimited) →
-  `migrations/014_max_daily_trades.sql` (design in §4 Blueprint 13 — apply with Blueprint 13 code)
+- **014** ✅ — `users.max_daily_trades` (Blueprint 13.2; `NULL` = unlimited) →
+  `migrations/014_max_daily_trades.sql` (applied — deploy with Blueprint 13 code)
+- **015** ✅ — `trade_signals.ai_signal_type` (Blueprint 14.B structured AI output) →
+  `migrations/015_ai_signal_type.sql` (applied — deploy with Blueprint 14 code)
 
 ### 6.10 Migration order
 
 `001` whale strategy → `002` access codes → `003` username → `004` admins → `005` deposit wallets →
 `006` wallet score → `007` tracked wallets → `008` settlement ledger → `009` tracked avg size →
 `010` risk controls → `011` user sizing mode → `012` position state (exit_tx + user/condition index) →
-`013` risk state + manual override (Blueprint 8) → `014` max daily trades (Blueprint 13.2).
+`013` risk state + manual override (Blueprint 8) → `014` max daily trades (Blueprint 13.2) →
+`015` ai_signal_type (Blueprint 14.B).
 
 ---
 

@@ -255,6 +255,22 @@ class Settings(BaseSettings):
     kelly_edge_cap: float = 0.06
     # Beta-prior strength for winrate shrinkage (α=β=prior → pulls toward 0.5 when n small).
     kelly_prior_strength: float = 10.0
+    # Blueprint 14.A: damping exponent applied to edge_hat before dividing by (1-p).
+    # Without damping, f_kelly = edge_hat/(1-p) diverges as p->1, so any fixed wallet
+    # edge auto-maxes the bet on expensive favorites (penny-collecting, high tail-risk) —
+    # this was the root cause of Kelly stakes clustering at the 5% cap in prod.
+    # gamma=1.0 fully cancels the 1/(1-p) blow-up (f_kelly == edge_hat, flat in price);
+    # gamma=0.0 reproduces the legacy (undamped) behaviour.
+    #
+    # DEFAULT IS 0.0 (OFF) — strategy-changing, money-moving knob (§5.6).  WARNING:
+    # at gamma=1.0, with the current kelly_edge_cap=0.06 and kelly_lambda=0.25, the
+    # MAXIMUM possible stake (best wallet, max consensus) is lambda*edge_cap*equity —
+    # Kelly cannot clear exchange_min_order_usdc ($5) until equity exceeds roughly
+    # exchange_min/(kelly_lambda*kelly_edge_cap) ≈ $333.  Below that, gamma>0 makes
+    # Kelly skip EVERY signal.  Before raising this above 0, either grow equity past
+    # that threshold or raise kelly_base_edge/kelly_edge_cap to compensate, then
+    # validate on the kelly_stake logs that real trades still clear the minimum.
+    kelly_edge_damping_gamma: float = 0.0
     # Hard risk cap per trade as a fraction of equity.
     max_risk_per_trade: float = 0.05
     # Polymarket platform minimum order size.

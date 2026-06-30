@@ -14,6 +14,10 @@ Integrations in this file:
           Soft-limit "$100" warning is mode-aware: shown only in kelly mode.
   BP13 — Correct sizing-mode hierarchy (User DB > global ENV); zero-edge Kelly skip
           (risk_gate:zero_edge); per-user daily-trade cap (risk_gate:max_daily_trades).
+  BP14 — Price-aware Kelly edge damping (core.sizing); AI analysis now returns
+          structured risk_score/signal_type/thesis/caution, emoji+verdict derived
+          via core.risk_label.risk_label() (single source of truth, shared with
+          worker.tasks.ai_filter).
 """
 
 import asyncio
@@ -198,6 +202,13 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             score = score_wallet(signal.get("source_wallet") or signal.get("whale_wallet") or "")
         except Exception:
             score = None
+        # BP14.A Step 2 observability: a wallet falling through to the unscored
+        # default (quality=0.5 in kelly_stake) means the edge can't differentiate
+        # signals. Track the scored/unscored split to catch a regression in
+        # source_wallet population upstream (poll_tracked_wallets / scan_markets).
+        if not score or not score.get("resolved_count"):
+            log.info("kelly_wallet_unscored", user_id=user_id,
+                     source_wallet=(signal.get("source_wallet") or "")[:10])
         k_stake = kelly_stake(
             p=float(signal.get("price") or 0),
             score=score,
@@ -509,10 +520,10 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         except Exception:
             remaining = 0.0
 
-        score_val, verdict, reason = None, None, None
+        score_val, signal_type_val, thesis_val, caution_val = None, None, None, None
         try:
             from worker.tasks.ai_filter import _call_gpt
-            score_val, verdict, reason = _call_gpt(signal)
+            score_val, signal_type_val, thesis_val, caution_val = _call_gpt(signal)
         except Exception:
             log.warning("ai_inline_failed", user_id=user_id)
 
@@ -541,7 +552,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
                  fill=fill_status, filled=round(filled, 2),
                  shares=shares_filled, cond=(cond or "")[:14])
         _notify(user["telegram_id"], signal, order_id, size_usdc, filled,
-                fill_status, remaining, score_val, verdict, reason,
+                fill_status, remaining, score_val, signal_type_val, thesis_val, caution_val,
                 concentration_warn=concentration_warn)
 
         return {"order_id": order_id, "user_id": user_id,
@@ -877,8 +888,9 @@ def _notify(
     intended_usdc: float, filled_usdc: float, fill_status: str,
     remaining: float = 0.0,
     ai_score: int | None = None,
-    ai_verdict: str | None = None,
-    ai_reason: str | None = None,
+    ai_signal_type: str | None = None,
+    ai_thesis: str | None = None,
+    ai_caution: str | None = None,
     concentration_warn: str | None = None,
 ) -> None:
     """One combined message: trade result + AI analysis + balance remaining.
@@ -928,13 +940,16 @@ def _notify(
             partial_note = f" из ${intended_usdc:.2f} (тонкий стакан)" if fill_status == "partial" else ""
 
             ai_block = ""
-            if ai_score is not None and ai_verdict and ai_reason:
-                risk_icon = "🟢" if ai_score <= 4 else ("🟡" if ai_score <= 6 else "🔴")
+            if ai_score is not None and ai_thesis:
+                from core.risk_label import risk_label
+                emoji, verdict = risk_label(ai_score)
+                caution_line = f"\n⚠️ {ai_caution}" if ai_caution else ""
                 ai_block = (
                     f"\n\n━━━━━━━━━━━━━━━━━\n"
                     f"🧠 <b>ИИ-анализ</b>\n"
-                    f"{risk_icon} <b>{ai_verdict}</b> · риск {ai_score}/10\n"
-                    f"💬 {ai_reason}"
+                    f"{emoji} <b>{verdict}</b> · риск {ai_score}/10\n"
+                    f"💬 {ai_thesis}"
+                    f"{caution_line}"
                 )
 
             # BP7: inline concentration note — appended here, no separate message.

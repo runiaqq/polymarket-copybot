@@ -13,6 +13,13 @@ Design rationale (from CURSOR.md §4 Blueprint 3):
 Blueprint 13.1: mode selection is the CALLER's responsibility.  ``kelly_stake``
 is pure math — it never checks ``cfg.sizing_mode``.  Return 0.0 means "no edge;
 do not bet".  The caller must skip the trade, not fall back to a fixed cap.
+
+Blueprint 14.A: prod logs showed a near-constant additive edge (wallet trust does
+not vary with market price), which makes the undamped fraction f_kelly = edge/(1-p)
+diverge as p->1 — Kelly auto-maxes the bet on expensive favorites (penny-collecting,
+high tail-risk) regardless of how thin the edge actually is. ``_damp_edge`` scales
+the edge by (1-p)^gamma before dividing, so a fixed wallet-trust edge no longer
+blows up at high prices; gamma=0 reproduces the legacy (undamped) behaviour.
 """
 
 import structlog
@@ -23,6 +30,17 @@ log = structlog.get_logger(__name__)
 def _shrunk_winrate(wins: int, n: int, prior: float) -> float:
     """Beta-shrunk win rate toward 0.5.  α=β=prior pulls small samples to 0.5."""
     return (wins + prior) / (n + 2 * prior)
+
+
+def _damp_edge(raw_edge: float, p: float, gamma: float) -> float:
+    """Damp the estimated edge so f_kelly = damped_edge/(1-p) does not diverge as p->1.
+
+    gamma=0.0 -> damped_edge == raw_edge (legacy undamped behaviour).
+    gamma=1.0 -> f_kelly == raw_edge (flat in price, fully cancels the 1/(1-p) blow-up).
+    """
+    if raw_edge <= 0 or p <= 0 or p >= 1:
+        return 0.0
+    return raw_edge * (1.0 - p) ** gamma
 
 
 def kelly_stake(
@@ -90,7 +108,13 @@ def kelly_stake(
     if q_hat <= p:
         return 0.0  # no edge → no bet
 
-    f_kelly = (q_hat - p) / (1.0 - p)
+    # BP14.A: damp the edge before dividing by (1-p) so a flat wallet-trust edge
+    # cannot auto-max the bet on expensive favorites.  q_hat itself (our belief
+    # about the true probability) is left undamped — only the risk-sizing fraction
+    # is adjusted.
+    raw_edge = q_hat - p
+    edge_eff = _damp_edge(raw_edge, p, cfg.kelly_edge_damping_gamma)
+    f_kelly = edge_eff / (1.0 - p)
     f = cfg.kelly_lambda * f_kelly
     f = min(f, cfg.max_risk_per_trade)
 
@@ -102,6 +126,8 @@ def kelly_stake(
         "kelly_stake",
         p=round(p, 4),
         q_hat=round(q_hat, 4),
+        raw_edge=round(raw_edge, 4),
+        edge_eff=round(edge_eff, 4),
         f_kelly=round(f_kelly, 4),
         f_final=round(f, 4),
         equity=round(equity, 2),
