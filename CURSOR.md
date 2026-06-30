@@ -322,6 +322,28 @@ code MUST follow §5 (idempotency, fail-closed, key safety).
 > `reconcile_settlements`), final "✅ Выигрыш зачислен" fires only from `redeem_position`
 > after on-chain tx + pUSD balance change confirmed, retry-exhausted sends
 > `_emit_win_retry_failed`. No new migration required.
+>
+> 🟢 **Blueprint 10 is IMPLEMENTED** — RCA of the 2026-06-30 prod incident
+> where one losing outcome erased the profit of multiple wins by riding to $0 with **no stop-loss
+> sell ever attempted** (`close_position` never invoked, ledger `exit_tx=0`; monitoring loop was
+> healthy the whole night). The only exit was a dead-deep `hard_stop_abs_price=0.07` floor,
+> disabled in the final `tp_sl_min_hours` and blind to neg-risk tokens that delist from the Data
+> API. **Product decision: ship a simple "Delta-Drop" stop, not heavy quant.** Approved params:
+> relative **X = 0.30** (exit when `best_bid ≤ entry×0.70`, caps loss ≈30% of stake — a relative
+> stop fixes dollar risk at `X·size` regardless of entry); **`min_entry_price` raised 0.05 → 0.40**
+> (don't enter dead-zone outcomes where the book is empty); `hard_stop 0.07` kept as floor; one
+> `position_mark` log line/cycle for future data-driven tuning of X. Implementation = Delta-Drop
+> check in `sync_positions` on the **live CLOB best_bid** + reuse of existing `close_position` for
+> the on-chain sell. **X could NOT be fitted to history** — the P&L ledger is corrupt (see
+> Blueprint 11) and the intra-trade price path is not stored; only `entry_price` is reliable.
+>
+> 🟢 **Blueprint 11 is IMPLEMENTED** — P&L booking bug surfaced during BP10
+> data-mining: `copy_trades.realized_pnl` is computed from a fragile wallet **balance-delta**
+> (`credited = bal_after − bal_before`), so on-chain-confirmed **wins are booked as −100%** (e.g.
+> id 695: real `redeem_tx`, `realized_pnl=-4.88`) or left NULL, while losses book correctly. The
+> ledger shows a false net-negative and **feeds phantom losses to the Blueprint 4/8 circuit
+> breakers**. Fix: source `realized_pnl` from actual redeemed proceeds / `sell_position` fill, not
+> a balance delta.
 
 ---
 
@@ -1474,6 +1496,120 @@ hook). **No new migration required.**
 - **`wallet_filter_mode` defaults to `observe`** — buyer track-record logged but not enforced.
 - **Single subscription tier** — no pricing/feature differentiation.
 - **`get_closed_positions` capped at `limit=100`** — long histories truncated (affects winrate stats).
+
+---
+
+### Blueprint 10 — Delta-Drop Stop-Loss (simple, data-informed) 🟡 FINAL DESIGN / READY TO IMPLEMENT
+
+**Product decision (Product Owner, 2026-06-30):** reject heavy quant (trailing stops, R/R entry
+filters). Ship a **dumb, robust "Delta-Drop" stop**: if the outcome price falls by **X** from our
+entry, sell the shares into the CLOB and exit. If price rises or holds, hold to resolution (that
+branch is profitable). One knob, predictable behaviour.
+
+#### Diagnosis recap (confirmed by prod logs + DB, do NOT re-diagnose)
+
+**Finding 1 — there is no working stop; the bot is pure hold-to-resolution.** The only exit in
+`sync_positions` is `cur_price < hard_stop_abs_price (0.07)` (`manage_positions.py:161-169`), and
+it is disabled in the final `tp_sl_min_hours=4 h` (`:144-145`) and blind to neg-risk tokens that
+delist from the Data API before reaching 0.07. A 12 h grep over `{hard_stop_triggered, sell_placed,
+sell_order_failed, position_closed, no_bid}` returned **zero** matches and the ledger has
+**`exit_tx = 0`** across all 368 rows → `close_position` was **never** invoked. The monitoring loop
+itself was healthy (`sync_positions_done` every 120 s, no failures).
+
+**Finding 2 (CRITICAL, blocks data-driven calibration) — the P&L ledger is corrupt.** Census of
+`copy_trades` (368 rows): 343 `failed`, 19 `confirmed`/`result=NULL`, 5 `loss`, 1 `win`;
+`result IS NULL` for 362/368; only 1 `redeem_tx`. The single `win` (id 695, entry 0.69) has a real
+on-chain `redeem_tx` but `realized_pnl = -4.88` (booked as −99.9 %) because `realized_pnl =
+credited − entry_cost` and `credited = bal_after − bal_before` measured ≈ $0 (the USDC.e→pUSD wrap
+had not settled when the balance was read). **Losses book correctly** (via on-chain
+`get_payout_numerator == 0`); **wins are systematically mis-booked or left NULL.** Net effect: the
+ledger shows a false −$26 when the live portfolio is positive.
+
+**Consequence for calibration:** `realized_pnl` is unusable, and the intra-trade **price path /
+drawdown is not stored anywhere** (logs only have `order_placed` on entry + `sync_positions_done`
+counts). Only `entry_price` is reliable (verified by arithmetic, e.g. id 714: 4.85/0.17 = 28.5
+shares ✓). Therefore **X cannot be fitted to historical drawdown** — it is chosen from first
+principles below and tuned later from the new `position_mark` logs.
+
+#### Why a RELATIVE X (% of entry), not absolute cents
+
+For a binary, the dollar loss when stopped is:
+`loss_$ = shares · (entry − exit) = (size/entry) · (entry − exit) = size · (1 − exit/entry) = size · X`.
+So a **relative** Delta-Drop caps the dollar risk at exactly **`X · size` regardless of entry
+price** — the predictable, "dumb" property we want. Absolute cents give a floating risk that is
+worse at low entries. → **use relative X.**
+
+#### Approved parameters (PO sign-off 2026-06-30)
+
+| Knob | Value | Rationale |
+|---|---|---|
+| `delta_drop_stop_pct` (**X**) | **0.30** | exit when `best_bid ≤ entry × 0.70`; caps loss at ≈30 % of stake. Wide enough to ride normal prediction-market noise on eventual winners, tight enough to convert −100 % wipeouts into −30 %. |
+| `min_entry_price` | **0.40** (was 0.05) | **Do not enter outcomes priced < 0.40.** Solves the dead-zone case (e.g. the 0.17 loss) at the source: a 30 % drop from ≥0.40 exits at ≥0.28, where the book still has bids and the stop can actually fill. |
+| `hard_stop_abs_price` | **0.07** (kept) | residual lower floor, runs alongside Delta-Drop. Harmless no-op in normal operation. |
+| mark logging | **ON** | one `position_mark` log line per cycle → calibrate the optimal X from real drawdown after 1–2 weeks. |
+
+**What X=0.30 would have done to the real (correctly-booked) losers, if the stop had filled:**
+id 710 (0.77) −$5.03→≈−$1.51 · id 712 (0.59) −$4.96→≈−$1.49 · id 711 (0.526) −$4.75→≈−$1.43 ·
+id 697 (0.42) −$2.02→≈−$0.61. The win (695 @ 0.69, resolved up) is never touched. (Assumes Step 2
+live-book exit is in place.)
+
+#### Step-by-step implementation
+
+**Step 1 — Config (`core/config.py`).**
+```python
+# Blueprint 10 — Delta-Drop stop-loss (relative drop from entry)
+delta_drop_stop_pct: float = 0.30          # exit when best_bid <= entry_price * (1 - X)
+delta_drop_min_hold_sec: int = 600         # ignore the first 10 min (avoid entry-tick whipsaw)
+log_position_marks: bool = True            # emit one position_mark line per open position per cycle
+```
+Also change the existing `min_entry_price: float = 0.05` → `0.40`. Keep `hard_stop_abs_price = 0.07`
+and `tp_sl_min_hours` as-is (the Delta-Drop path below ignores the `tp_sl_min_hours` skip).
+
+**Step 2 — Delta-Drop checker in `sync_positions`** (`worker/tasks/manage_positions.py`, replace the
+hold/hard-stop block `:135-169`). For each open position with `shares > 0` and not `redeemable`:
+1. `entry = float(p.get("avg_price") or 0)` (fallback to the ledger `entry_price` via
+   `get_open_trade_by_token` if `avg_price` is missing — neg-risk safety).
+2. `book = get_order_book(token_id)`; `best_bid = float(book.get("best_bid") or 0)`.
+   **Use the live CLOB book, not the Data-API `cur_price`** (the book does not delist neg-risk early
+   and is the price we can actually exit at).
+3. **Mark logging** (when `log_position_marks`): emit
+   `log.info("position_mark", token=token_id[:14], entry=entry, best_bid=best_bid,
+   drop=round(1-best_bid/entry,3), hours=...)` — this is the dataset for future X tuning.
+4. Enforce `delta_drop_min_hold_sec` (reuse the existing `_first_seen` map) to skip very fresh
+   positions.
+5. **Trigger:** if `entry > 0 and best_bid > 0 and (1 - best_bid/entry) >= delta_drop_stop_pct` →
+   `_closing.add(ckey); close_position.delay(uid, token_id, "delta_drop_stop"); continue`.
+   **Do NOT apply the `hours < tp_sl_min_hours: continue` skip on this path** (that guard is what
+   let the loss ride to zero — Finding 1).
+6. Leave the existing `hard_stop_abs_price (0.07)` check below as the residual floor (unchanged).
+
+**Step 3 — Emergency sell = reuse existing `close_position`** (`manage_positions.py:262`). It already
+places a marketable FAK SELL into the book at `best_bid` with `exit_slippage_pct` and books P&L
+(Blueprint 6). Because `min_entry_price=0.40` keeps us out of dead books, the existing
+`best_bid < 0.01 → no_bid` abort (`:303-327`) will not fire on a Delta-Drop exit. **No change to the
+sell logic needed** — only add the `"delta_drop_stop"` label to `_notify_closed` (`:592-613`):
+`"delta_drop_stop": "🛑 Стоп-лосс (−30% от входа)"`.
+
+**Step 4 — Entry filter** is already enforced at `execute_copy.py:312-321` (and `detector.py:142`);
+it reads `settings.min_entry_price`, so raising the config value to 0.40 is sufficient — no new code.
+
+**Cadence note:** v1 runs inside the existing 120 s `sync_positions` loop (simplest, "dumb"). If a
+faster reaction is needed later, lift the Delta-Drop block into a dedicated 30 s task — the logic is
+identical.
+
+#### Acceptance criteria / test plan
+- Unit: pure helper `delta_drop_hit(entry, best_bid, X) -> bool` (deterministic, no I/O) with cases
+  0.77→0.50 (hit), 0.77→0.60 (no), 0.69→1.0 (no, win), entry/bid ≤ 0 (no).
+- Integration (staging): open a tiny position, push a synthetic book where `best_bid ≤ entry·0.70`,
+  assert `delta_drop_triggered` + `position_closed reason=delta_drop_stop` + a non-empty `exit_tx`
+  written to the ledger.
+- Prod smoke: confirm `position_mark` lines appear every cycle, and `min_entry_price=0.40` rejects a
+  sub-0.40 copy with `skip_price_out_of_range`.
+
+> **Out of scope → Blueprint 11 (separate):** the P&L booking bug (Finding 2). `realized_pnl` must be
+> sourced from the actual redeemed proceeds / `sell_position` fill, not a fragile wallet
+> balance-delta. Until fixed, the daily-loss / drawdown circuit breakers (Blueprint 4/8) are fed
+> phantom −100 % wins and cannot be trusted.
 
 ---
 

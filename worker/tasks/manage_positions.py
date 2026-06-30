@@ -59,7 +59,7 @@ def _hours_left(end_date: str | None) -> float | None:
 @celery_app.task(name="worker.tasks.sync_positions", queue="periodic")
 def sync_positions() -> dict:
     from core.db import get_active_subscribers
-    from core.polymarket import get_closed_positions, get_positions
+    from core.polymarket import get_closed_positions, get_order_book, get_positions
 
     subscribers = get_active_subscribers()
     if not subscribers:
@@ -132,23 +132,20 @@ def sync_positions() -> dict:
                         actions += 1
                 continue
 
-            # ── Hold-to-resolution strategy ───────────────────────────────
-            # Binary markets pay $1 (win) or $0 (loss) at resolution.
-            # Selling early almost always hurts EV, so we hold.
-            # Exception: "hard stop" when the MARKET itself prices this
-            # outcome at near-zero — it's effectively dead, exit now.
+            # ── Blueprint 10: Delta-Drop stop-loss ────────────────────────
+            # Primary strategy: hold to resolution (binary pays $1 win / $0 loss).
+            # Exception 1 — Delta-Drop: exit when the live CLOB best_bid has fallen
+            #   >= delta_drop_stop_pct (30%) from entry.  tp_sl_min_hours guard is
+            #   intentionally NOT applied — it caused the 2026-06-30 incident.
+            # Exception 2 — hard_stop floor: residual absolute safety net at 0.07.
 
             hours = _hours_left(p.get("end_date"))
 
-            # When very close to resolution — let it settle, never hard-stop.
-            if hours is not None and hours < settings.tp_sl_min_hours:
-                continue
-
-            # Enforce minimum hold time (API P&L data unreliable on fresh positions).
+            # Enforce minimum hold time (avoids tick-level entry whipsaw).
             fkey = f"{uid}:{token_id}"
             seen_at = _first_seen.setdefault(fkey, now)
             age_sec = now - seen_at
-            if age_sec < settings.position_min_hold_sec:
+            if age_sec < settings.delta_drop_min_hold_sec:
                 log.debug("exit_skipped_too_new",
                           user_id=uid, token=token_id[:14],
                           age_min=round(age_sec / 60, 1))
@@ -158,9 +155,41 @@ def sync_positions() -> dict:
             if ckey in _closing:
                 continue
 
-            # Hard stop: market has priced this outcome as essentially dead.
-            best_bid = p.get("cur_price", p.get("best_bid"))
-            if best_bid is not None and float(best_bid) < settings.hard_stop_abs_price:
+            # Live best_bid from CLOB order book.  The book does not delist
+            # neg-risk tokens early (unlike Data-API cur_price).
+            try:
+                book = get_order_book(token_id)
+                best_bid = float(book.get("best_bid") or 0) if book else 0.0
+            except Exception:
+                best_bid = float(p.get("cur_price") or p.get("best_bid") or 0)
+
+            # Cost-basis entry price from Data-API avg_price.
+            entry_px = float(p.get("avg_price") or 0)
+
+            # Mark logging — accumulate to calibrate delta_drop_stop_pct over time.
+            if settings.log_position_marks and entry_px > 0 and best_bid > 0:
+                log.info("position_mark",
+                         user_id=uid, token=token_id[:14],
+                         entry=entry_px, best_bid=round(best_bid, 4),
+                         drop=round(1.0 - best_bid / entry_px, 3),
+                         hours=round(hours, 2) if hours is not None else None)
+
+            # Delta-Drop trigger: exit if best_bid fell >= X from entry.
+            if entry_px > 0 and best_bid > 0:
+                drop_pct = 1.0 - best_bid / entry_px
+                if drop_pct >= settings.delta_drop_stop_pct:
+                    log.info("delta_drop_triggered",
+                             user_id=uid, token=token_id[:14],
+                             entry=entry_px, best_bid=round(best_bid, 4),
+                             drop=round(drop_pct, 3),
+                             threshold=settings.delta_drop_stop_pct)
+                    _closing.add(ckey)
+                    close_position.delay(uid, token_id, "delta_drop_stop")
+                    actions += 1
+                    continue
+
+            # Hard-stop floor: residual safety net when book is near-zero.
+            if best_bid > 0 and best_bid < settings.hard_stop_abs_price:
                 log.info("hard_stop_triggered",
                          user_id=uid, token=token_id[:14],
                          cur_price=best_bid, threshold=settings.hard_stop_abs_price)
@@ -476,6 +505,7 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
 
     # Blueprint 6 (2): dust guard — skip if on-chain ERC-1155 balance is negligible.
     # Outcome tokens have 6 decimal places: 1 share = 1_000_000 units.
+    shares_bal: float = 0.0  # initialised here so BP11 P&L calc can reference it safely
     try:
         from core.relayer import ctf_token_balance
         raw_bal = ctf_token_balance(dw, token_id)
@@ -529,11 +559,16 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
         credited = max(0.0, bal_after - bal_before)
         redeem_tx = r.get("tx") or ""
 
-        # BP1: write result + redeem_tx back onto the copy_trades ledger row.
+        # BP1 + BP11: write result + redeem_tx back onto the copy_trades ledger row.
+        # BP11 fix: use on-chain share count (shares_bal × $1.00/share) as gross
+        # proceeds instead of the fragile wallet balance-delta (credited).  The
+        # balance-delta is unreliable because USDC.e→pUSD wrapping often settles
+        # after the snapshot, causing wins to appear as -100%.
         if trade_id:
             try:
                 from core.db import mark_trade_settled
-                pnl = credited - float(entry_cost or 0)
+                gross = shares_bal if shares_bal > 0 else credited
+                pnl = gross - float(entry_cost or 0)
                 mark_trade_settled(trade_id, result="win",
                                    realized_pnl=pnl, redeem_tx=redeem_tx)
             except Exception:
@@ -591,10 +626,11 @@ def _event_link(event_slug: str | None) -> str:
 def _notify_closed(telegram_id: int, position: dict, reason: str,
                    remaining: float | None = None) -> None:
     labels = {
-        "take_profit": "🎯 Тейк-профит",
-        "stop_loss":   "🛑 Стоп-лосс",
-        "hard_stop":   "🚨 Жёсткий стоп (цена ~0)",
-        "manual":      "✋ Вручную",
+        "take_profit":     "🎯 Тейк-профит",
+        "stop_loss":       "🛑 Стоп-лосс",
+        "hard_stop":       "🚨 Жёсткий стоп (цена ~0)",
+        "delta_drop_stop": "📉 Дельта-дроп стоп (-30%)",
+        "manual":          "✋ Вручную",
     }
     pnl = position.get("cash_pnl", 0)
     pct = max(-1.0, min(10.0, position.get("percent_pnl", 0)))

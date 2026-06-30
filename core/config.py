@@ -88,7 +88,7 @@ class Settings(BaseSettings):
     max_spread_pct: float = 0.03
     # Don't enter above/below these prices (little upside / likely already resolved).
     max_entry_price: float = 0.95
-    min_entry_price: float = 0.05
+    min_entry_price: float = 0.40
     # Skip if the market taker fee exceeds this (basis points).
     fee_bps_max: float = 500.0
     # Require at least this much fillable ask depth (USDC) to copy into.
@@ -121,14 +121,27 @@ class Settings(BaseSettings):
     #
     # Percentage TP/SL are disabled (set to unreachable values).
     take_profit_pct: float = 99.0   # disabled — hold to resolution
-    stop_loss_pct: float = 99.0     # disabled — use hard_stop_abs_price instead
-    # Exit if best_bid drops below this absolute price (market says <7% chance).
+    stop_loss_pct: float = 99.0     # disabled — use delta_drop_stop_pct instead
+    # Residual absolute floor (harmless no-op in normal operation — book is empty
+    # by the time price hits 0.07, but kept as a last-resort safety net).
     hard_stop_abs_price: float = 0.07
-    # tp_sl_min_hours kept for the "hold when close to resolution" guard —
-    # when < this many hours remain we NEVER hard-stop (let it resolve naturally).
+    # tp_sl_min_hours kept for the redeemable / closed-position hold guard only.
+    # Delta-Drop intentionally ignores this guard (it was what let losses ride to $0).
     tp_sl_min_hours: float = 4.0
     # Minimum hold time before any automated exit is evaluated.
     position_min_hold_sec: int = 1800
+
+    # ── Blueprint 10 — Delta-Drop stop-loss ──────────────────────────────────────
+    # Exit when best_bid (live CLOB) drops X from entry. Dollar risk = X * size,
+    # independent of entry price — the "dumb, robust" stop.
+    # X = 0.30 approved by PO 2026-06-30 (data-informed: covers real loss cases,
+    # wide enough to avoid whipsawing winners).
+    delta_drop_stop_pct: float = 0.30
+    # Ignore the first N seconds after entry (avoids tick-level entry whipsaw).
+    delta_drop_min_hold_sec: int = 600
+    # Emit one position_mark log line per open position per sync cycle.
+    # Use to calibrate delta_drop_stop_pct from real drawdown after ~2 weeks.
+    log_position_marks: bool = True
     # Wider slippage when exiting (books thin out near resolution).
     exit_slippage_pct: float = 0.03
     # Portfolio cap: max simultaneous open positions per user.
