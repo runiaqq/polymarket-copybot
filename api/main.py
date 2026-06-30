@@ -17,13 +17,23 @@ log = structlog.get_logger(__name__)
 
 
 def _check_core_imports() -> None:
-    """BP9 Layer 2b: fail loud at boot if core.db exports are missing.
+    """BP9/BP12 Layer 2b: fail loud at boot if core.db exports are missing.
 
     Catches the 'release drift' class of bugs (untracked files not deployed)
     at container start time instead of silently at periodic-task runtime.
     """
     import core.db as _db
     missing = [n for n in _db.__all__ if not hasattr(_db, n)]
+    _REQUIRED = {
+        "get_open_trade_by_token",
+        "mark_trade_closed",
+        "mark_trade_settled",
+        "has_terminal_trade",
+        "get_outstanding_copy_trades",
+        "get_open_trades_cost",
+        "get_supabase",
+    }
+    missing += sorted(_REQUIRED - set(dir(_db)))
     if missing:
         raise ImportError(
             f"core.db is missing required exports: {missing}. "

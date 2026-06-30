@@ -292,6 +292,10 @@ class Settings(BaseSettings):
     # Additional notional floor: also skip when shares * resolve_price < this.
     claim_dust_min_usdc: float = 1.0
 
+    # ── Blueprint 12: withdrawal ───────────────────────────────────────────────
+    # Minimum single withdrawal (USDC). Below $1 is dust; platform fees eat it.
+    min_withdraw_usdc: float = 1.0
+
     # ── Blueprint 8: equity accounting + unified per-trade risk cap ────────────
     # Equity definition used by the drawdown breaker / HWM / exposure gates.
     # "cost_basis" = open positions valued at filled entry cost (no phantom drawdown).

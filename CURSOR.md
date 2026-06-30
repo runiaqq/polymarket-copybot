@@ -273,6 +273,18 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   false-success notifications — "✅ Выигрыш зачислен" is only ever sent after the
   `redeemPositions` + `convert_dw_usdce_to_pusd` batch confirms on-chain.
 
+- **[BP12] Close-handler import fix + withdrawal balance fix & FSM redesign**:
+  **(A)** `get_open_trade_by_token` re-exported from `core/db/__init__.py`; boot self-checks
+  in `api/main.py` and `worker/celery_app.py` extended with an explicit required-name set so
+  the drift regression class fails loud at container start, not at runtime on the money path.
+  **(B)** `withdrawable_usdc(db_user)` added to `core/polygon.py` — single source of truth
+  (deposit-wallet pUSD + EOA pusd/usdc_e/usdc); `transfer_usdc` now waits for the on-chain
+  receipt; `withdraw_funds` task rewritten as fail-loud: pre-flight balance gate, POL gas
+  check, per-leg error propagation (no swallowing), Polygonscan link on success. Withdrawal
+  FSM in `telegram.py`: stale-state reset on re-entry, real "Доступно" balance from
+  `withdrawable_usdc`, pre-flight amount validation, confirm step kept. `min_withdraw_usdc`
+  config constant added. No new migration required.
+
 ---
 
 ## 4. Known Bugs & Missing Features
@@ -344,6 +356,20 @@ code MUST follow §5 (idempotency, fail-closed, key safety).
 > ledger shows a false net-negative and **feeds phantom losses to the Blueprint 4/8 circuit
 > breakers**. Fix: source `realized_pnl` from actual redeemed proceeds / `sell_position` fill, not
 > a balance delta.
+>
+> ✅ **Blueprint 12 is IMPLEMENTED** — two prod operational failures reported 2026-06-30.
+> **(Bug A — close crash)** `get_open_trade_by_token` added to `core/db/__init__.py` imports and
+> `__all__`; boot self-checks in `api/main.py` and `worker/celery_app.py` extended with explicit
+> required-name sets so this class of regression fails loud at container start.
+> **(Bug B — broken withdrawal + UX redesign)** `withdrawable_usdc(db_user)` helper added to
+> `core/polygon.py` as single source of truth (deposit-wallet pUSD + EOA pusd/usdc_e/usdc);
+> `transfer_usdc` now waits for the on-chain receipt before returning; `withdraw_funds` task
+> (fail-loud): pre-flight balance gate, POL gas check, per-leg error propagation (no silent
+> swallow), on-chain receipt confirmed before "✅ Вывод успешно завершён + Polygonscan" notify;
+> withdrawal FSM in `telegram.py` uses `withdrawable_usdc` for the "Доступно" display and
+> pre-flight amount validation, stale state reset on re-entry, confirm step kept.
+> `core/config.py` gains `min_withdraw_usdc = 1.0`. No new migration required.
+> *(Numbered 12 because Blueprint 11 was already taken by the P&L-booking fix above.)*
 
 ---
 
@@ -1610,6 +1636,178 @@ identical.
 > sourced from the actual redeemed proceeds / `sell_position` fill, not a fragile wallet
 > balance-delta. Until fixed, the daily-loss / drawdown circuit breakers (Blueprint 4/8) are fed
 > phantom −100 % wins and cannot be trusted.
+
+---
+
+### Blueprint 12 — Close-handler import regression + withdrawal balance fix & FSM redesign ✅ IMPLEMENTED
+
+> **Numbering note:** the prompt asked for "Blueprint 11", but Blueprint 11 already exists (the
+> P&L-booking fix, IMPLEMENTED). This work is filed as **Blueprint 12** to avoid overwriting it.
+
+Two unrelated prod incidents reported on 2026-06-30, bundled here because both are operational
+breakages on the money path. Root causes were confirmed by code inspection — **no `pm2 logs`
+were required** (see the optional verification commands at the end if you want runtime confirmation).
+
+---
+
+#### Part A — Bug A: "Закрыть #N" crashes with `ImportError`
+
+**Symptom:** tapping **❌ Закрыть #1** alerts:
+`cannot import name 'get_open_trade_by_token' from 'core.db' (/app/core/db/__init__.py)`.
+
+**Exact crash path:**
+1. `api/routers/telegram.py` (`close_` callback, ~L1435) dispatches `close_position.delay(uid, token_id, "manual")`.
+2. The worker task `worker/tasks/manage_positions.py::close_position` runs and, inside its `try:` block, executes:
+
+```381:381:worker/tasks/manage_positions.py
+        from core.db import get_open_trade_by_token, mark_trade_closed
+```
+
+3. `get_open_trade_by_token` **is defined** in `core/db/queries.py` (L454) but is **not re-exported**
+   from `core/db/__init__.py` — it is missing from both the `from core.db.queries import (...)` block
+   and from `__all__`. (`mark_trade_closed` *is* exported, so only the first name fails.)
+4. The `ImportError` is caught by `close_position`'s `except Exception as exc:` (L439), retried twice,
+   and after `max_retries` the task notifies the user with `…<code>{str(exc)[:200]}</code>` — which is
+   the exact ImportError text the user sees in the alert.
+
+**This is a repeat of the Blueprint 9 Layer-1 class of bug** (`has_terminal_trade` was missing from
+`core.db` exports). The package boundary `core/db/__init__.py` is hand-maintained and drifts from
+`queries.py`.
+
+**Fix (one file, two edits):** in `core/db/__init__.py`
+1. Add `get_open_trade_by_token` to the `from core.db.queries import (...)` import block (alphabetical,
+   next to `get_open_trades_cost`).
+2. Add `"get_open_trade_by_token",` to `__all__`.
+
+**Hardening (prevent the whole class, pick at least the first):**
+- Extend the BP9 Layer-2 boot self-check `_check_core_imports()` to assert every name `close_position`,
+  `redeem_position`, `reconcile_settlements`, and `backfill_legacy_redemptions` import from `core.db`
+  (`get_open_trade_by_token`, `mark_trade_closed`, `mark_trade_settled`, `has_terminal_trade`,
+  `get_outstanding_copy_trades`, `get_open_trades_cost`, `get_supabase`, …). Fail loud at boot, not
+  on the money path.
+- Add a trivial test `tests/test_db_exports.py` that asserts `import core.db` then `getattr(core.db, n)`
+  for every `n in core.db.__all__`, **and** that every public `def` in `queries.py` used by workers is
+  present in `__all__`. This makes the drift a red CI, not a prod alert.
+
+**Acceptance (Bug A):** with the export added, `python -c "from core.db import get_open_trade_by_token"`
+succeeds; closing a live position writes a non-empty `exit_tx` + `realized_pnl` to the `copy_trades`
+row and the user gets "✅ Позиция закрыта" instead of the ImportError alert.
+
+---
+
+#### Part B — Bug B: withdrawal reads/sends the wrong balance + UX redesign
+
+**Symptom:** user has **$7.00 USDC**, taps Вывод, and gets
+*"Недостаточно средств: доступно $0.00, запрошено $7.00"*.
+
+**Root cause (two compounding defects):**
+
+1. **Wrong wallet for the "available" figure.** The amount step in
+   `api/routers/telegram.py` (~L1134–1139) computes the balance from the **EOA**:
+   `addr = db_user.get("wallet_address")` → `get_balances(addr)["total_usdc"]`. But in V2 the user's
+   liquid funds live as **pUSD in the deposit wallet** (`deposit_wallet_address`), which `get_balances`
+   only reads when called on that wallet. So the EOA shows ≈$0 even though the trading wallet holds $7.
+
+2. **Wrong asset checked at transfer time + silent conversion failures.**
+   `worker/tasks/wallet_ops.py::withdraw_funds` tries to assemble **native USDC on the EOA** by:
+   pull pUSD from deposit wallet → EOA (relayer), unwrap pUSD→USDC.e, swap USDC.e→native USDC — but
+   **every leg is wrapped in a swallowing `try/except` that only logs a warning**. If the relayer pull
+   or a swap fails (e.g. no POL for gas, relayer busy), execution proceeds anyway to
+   `transfer_usdc(..., use_bridged=False)`, whose own balance guard (`core/polygon.py` L267–270) finds
+   **0 native USDC** and raises the exact *"доступно $0.00, запрошено $7.00"* message. The user's hunch
+   ("checks locked pUSD vs free USDC") is the right shape: the *displayed* balance and the *actually
+   transferable* balance are computed from different wallets/assets and never reconciled.
+
+3. **No pre-flight validation.** The amount is accepted with only a `>= $1` check; the real
+   insufficiency surfaces deep inside an on-chain revert instead of an upfront, friendly message.
+
+**Design principle — ONE source of truth for "withdrawable":**
+
+Add a single helper (put it in `core/polygon.py` or a thin wrapper in the telegram router) and use it
+for **both** the displayed "Доступно" **and** the pre-flight validation **and** the task's own guard:
+
+```python
+def withdrawable_usdc(db_user: dict) -> float:
+    """Total liquid USD the bot can actually convert + send out, across both wallets.
+    = deposit-wallet pUSD (trading collateral)  +  EOA (pusd + usdc_e + usdc native)."""
+    eoa = db_user.get("wallet_address")
+    dw  = db_user.get("deposit_wallet_address")
+    dw_pusd = get_balances(dw).get("pusd", 0.0) if dw else 0.0
+    e = get_balances(eoa) if eoa else {}
+    return dw_pusd + e.get("pusd", 0.0) + e.get("usdc_e", 0.0) + e.get("usdc", 0.0)
+```
+
+This is exactly the pool `withdraw_funds` already tries to mobilize, so display, validation, and
+execution can never disagree again.
+
+**New withdrawal FSM (replaces the current address → amount → confirm flow).**
+State key: `context.user_data["withdraw_step"]`. The existing handlers in `telegram.py` (cmd_withdraw
+~L617, the `withdraw_start`/`withdraw_cancel`/`withdraw_confirm` callbacks ~L1363, and the text router
+~L1117) are refactored — do **not** add a parallel flow.
+
+| # | State | Bot action | On valid input → |
+|---|-------|-----------|------------------|
+| 1 | `start` (button `withdraw_start` or `/withdraw`) | reset any stale `withdraw_*` keys; set step=`address`; prompt: **"Введите адрес кошелька (Polygon) для вывода:"** + ❌ Отмена | `address` |
+| 2 | `address` (text in) | `from core.polygon import is_valid_address`; reject non-`0x…`/bad-length with a re-prompt | store `withdraw_to`; step=`amount` |
+| 3 | `amount` prompt | compute `avail = withdrawable_usdc(db_user)`; prompt: **"Введите сумму для вывода (Доступно: {avail:.2f} USDC)"** + ❌ Отмена | — |
+| 4 | `amount` (text in) | parse (`$`,`,`→`.`); validate `>= MIN_WITHDRAW_USDC` (1.0) **and `<= avail`** (recompute `avail` fresh here — this is the pre-flight gate). On `> avail`: friendly "Недостаточно средств. Доступно: {avail:.2f} USDC" + re-prompt | store `withdraw_amount`; go to execute |
+| 5 | execute | edit message to **"⏳ Выполняю вывод…"**; clear `withdraw_*` step keys; `withdraw_funds.delay(uid, to, amount)` | task runs |
+| 6 | task success | `transfer_usdc` waits for the receipt; task notifies **"✅ Вывод успешно завершён.\nТранзакция: https://polygonscan.com/tx/{tx}"** | done |
+
+> **Confirm step:** the prompt's 6-step spec omits the old "✅ Подтвердить" screen, so this design
+> goes straight from amount → execution. If you'd rather keep an explicit money-movement confirmation
+> (recommended for safety), insert a one-tap confirm between steps 4 and 5 showing amount + address;
+> it does not change any of the balance logic below. **Decision left to the implementer; default to
+> following the 6-step spec (no confirm).**
+
+**Fixes inside `withdraw_funds` (`worker/tasks/wallet_ops.py`) — fail loud, never on bad data (§5.2):**
+1. **Pre-flight guard:** recompute `avail = withdrawable_usdc(user)` at task start; if `amount > avail`,
+   notify a clear "Недостаточно средств: доступно ${avail:.2f}" and return **before** any on-chain
+   action. (Belt-and-suspenders with the UI gate, in case balances moved.)
+2. **POL/gas pre-check** on the EOA before conversions; if `< ~0.02 POL`, notify "⛽️ Недостаточно POL
+   на газ" and abort (mirror `wrap_collateral`).
+3. **Stop swallowing conversion errors.** The relayer pull / unwrap / swap legs must surface failures:
+   on any leg failure, abort with a specific message ("не удалось вывести средства из торгового
+   кошелька / конвертация не удалась — попробуйте позже") instead of falling through to a misleading
+   "$0.00" transfer revert.
+4. **Confirm the tx before declaring success.** `core/polygon.py::transfer_usdc` currently sends the
+   raw tx and returns **without waiting for the receipt**. Route it through the existing `_exec_tx`
+   helper (or add `wait_for_transaction_receipt` + `status == 1` check) so the "✅ Вывод успешно
+   завершён" message + Polygonscan link is sent **only after on-chain confirmation** (matches the
+   prompt's "после успешного подтверждения").
+
+**Consistency cleanup (optional but recommended):** the wallet/positions/menu screens
+(`telegram.py` L150–182, L573–599, L1295–1300) compute "available" several different ways
+(`total_usdc`, `dw_pusd + on_eoa`, etc.). Point them at `withdrawable_usdc()` too so every screen shows
+the same number the user can actually withdraw.
+
+**Config:** add `MIN_WITHDRAW_USDC = 1.0` to `core/config.py::Settings` (no magic numbers, §5.6).
+No DB migration required.
+
+**Acceptance / test plan (Bug B):**
+- Unit: `withdrawable_usdc` returns `dw_pusd + eoa(pusd+usdc_e+usdc)` for mocked balances (deposit-only,
+  EOA-only, split, empty).
+- FSM (staging): a user whose $7 sits as deposit-wallet pUSD sees **"Доступно: 7.00 USDC"** at step 3;
+  entering `7` passes the pre-flight gate; entering `8` is rejected upfront (no on-chain call).
+- Integration (staging, tiny amount): full path pulls pUSD→EOA, converts, transfers native USDC, waits
+  for receipt, and the success message contains a valid `polygonscan.com/tx/…` link; the position/wallet
+  screens then show the reduced "Доступно".
+- Negative: simulate a failed swap leg → user gets a specific failure message, **never** a misleading
+  "$0.00 available", and no partial silent drain.
+
+---
+
+#### Optional runtime verification (only if you want logs, not required)
+
+```bash
+# Bug A — confirm the import actually fails in the deployed image
+pm2 logs nexa-worker --lines 200 --nostream | grep -iE "get_open_trade_by_token|close_position_failed|ImportError"
+docker exec -it <worker_container> python -c "from core.db import get_open_trade_by_token; print('OK')"
+
+# Bug B — confirm where the $7 actually is and which wallet the flow read
+pm2 logs nexa-worker --lines 300 --nostream | grep -iE "withdraw_failed|withdraw_dw_pull_failed|Недостаточно"
+# (substitute the user's deposit + EOA addresses to compare pUSD vs native USDC balances)
+```
 
 ---
 

@@ -10,9 +10,24 @@ _log = structlog.get_logger(__name__)
 
 
 def _check_core_imports() -> None:
-    """BP9 Layer 2b: fail loud at worker boot if core.db exports are missing."""
+    """BP9/BP12 Layer 2b: fail loud at worker boot if core.db exports are missing.
+
+    Asserts every name in __all__ is reachable, plus the close/settle/redeem
+    helpers that triggered the BP9 and BP12 import regressions.
+    """
     import core.db as _db
     missing = [n for n in _db.__all__ if not hasattr(_db, n)]
+    # Explicit guard for close-path names (fail loud even if __all__ drifts again)
+    _REQUIRED = {
+        "get_open_trade_by_token",
+        "mark_trade_closed",
+        "mark_trade_settled",
+        "has_terminal_trade",
+        "get_outstanding_copy_trades",
+        "get_open_trades_cost",
+        "get_supabase",
+    }
+    missing += sorted(_REQUIRED - set(dir(_db)))
     if missing:
         raise ImportError(
             f"core.db is missing required exports: {missing}. "

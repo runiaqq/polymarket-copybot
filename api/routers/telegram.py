@@ -622,6 +622,8 @@ async def cmd_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not db_user or not db_user.get("wallet_address"):
         await update.message.reply_text("Сначала отправь /start", parse_mode="HTML")  # type: ignore[union-attr]
         return
+    for k in ("withdraw_step", "withdraw_to", "withdraw_amount"):
+        context.user_data.pop(k, None)
     context.user_data["withdraw_step"] = "address"
     await update.message.reply_text(  # type: ignore[union-attr]
         "💸 <b>Вывод USDC</b>\n\n"
@@ -1120,7 +1122,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         from core.polygon import is_valid_address
         if not is_valid_address(text):
             await update.message.reply_text(  # type: ignore[union-attr]
-                "⚠️ Неверный адрес. Укажи корректный адрес Polygon (0x…).\n\nПопробуй ещё раз или нажми Отмена:",
+                "⚠️ Неверный адрес. Укажи корректный адрес Polygon (0x…, 42 символа).\n\nПопробуй ещё раз или нажми Отмена:",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("❌ Отмена", callback_data="withdraw_cancel")
@@ -1132,15 +1134,12 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["withdraw_step"] = "amount"
 
         db_user = get_user_by_telegram_id(tg_user.id) or {}
-        addr = db_user.get("wallet_address", "")
-
-        from core.polygon import get_balances
-        balances = get_balances(addr) if addr else {}
-        total = balances.get("total_usdc", 0)
+        from core.polygon import withdrawable_usdc as _withdrawable_usdc
+        avail = _withdrawable_usdc(db_user)
 
         await update.message.reply_text(  # type: ignore[union-attr]
             f"💵 <b>Сколько USDC вывести?</b>\n\n"
-            f"Баланс: <b>${total:.2f} USDC</b>\n"
+            f"Доступно: <b>${avail:.2f} USDC</b>\n"
             f"На адрес: <code>{text[:10]}…{text[-6:]}</code>\n\n"
             "Введи сумму (например: <code>25</code>):",
             parse_mode="HTML",
@@ -1151,6 +1150,9 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if withdraw_step == "amount":
+        from core.config import settings as _settings
+        from core.polygon import withdrawable_usdc as _withdrawable_usdc
+
         amount_text = text.replace("$", "").replace(",", ".")
         try:
             amount = float(amount_text)
@@ -1161,8 +1163,25 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             return
 
-        if amount < 1:
-            await update.message.reply_text("⚠️ Минимум <b>$1 USDC</b>", parse_mode="HTML")  # type: ignore[union-attr]
+        if amount < _settings.min_withdraw_usdc:
+            await update.message.reply_text(  # type: ignore[union-attr]
+                f"⚠️ Минимум <b>${_settings.min_withdraw_usdc:.2f} USDC</b>",
+                parse_mode="HTML",
+            )
+            return
+
+        db_user = get_user_by_telegram_id(tg_user.id) or {}
+        avail = _withdrawable_usdc(db_user)
+        if amount > avail:
+            await update.message.reply_text(  # type: ignore[union-attr]
+                f"⚠️ Недостаточно средств.\n"
+                f"Доступно: <b>${avail:.2f} USDC</b>, запрошено: <b>${amount:.2f} USDC</b>.\n\n"
+                "Введи другую сумму или нажми Отмена:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data="withdraw_cancel")
+                ]]),
+            )
             return
 
         context.user_data["withdraw_amount"] = amount
@@ -1177,8 +1196,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("✅ Подтвердить", callback_data="withdraw_confirm"),
-                    InlineKeyboardButton("❌ Отмена",      callback_data="withdraw_cancel"),
+                    InlineKeyboardButton("✅ Подтвердить вывод", callback_data="withdraw_confirm"),
+                    InlineKeyboardButton("❌ Отмена",            callback_data="withdraw_cancel"),
                 ]
             ]),
         )
@@ -1361,6 +1380,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if data == "withdraw_start":
+        # Reset any stale state from a previous abandoned flow
+        for k in ("withdraw_step", "withdraw_to", "withdraw_amount"):
+            context.user_data.pop(k, None)
         context.user_data["withdraw_step"] = "address"
         await query.edit_message_text(
             "💸 <b>Вывод USDC</b>\n\n"
@@ -1392,23 +1414,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Кошелёк не найден", show_alert=True)
             return
 
-        to_addr   = context.user_data.get("withdraw_to", "")
-        amount    = float(context.user_data.get("withdraw_amount", 0))
-        context.user_data.pop("withdraw_step", None)
+        to_addr = context.user_data.get("withdraw_to", "")
+        amount  = float(context.user_data.get("withdraw_amount", 0))
+        # Clear state before dispatching so a retry can't re-confirm
+        for k in ("withdraw_step", "withdraw_to", "withdraw_amount"):
+            context.user_data.pop(k, None)
 
         try:
             from worker.tasks import withdraw_funds
             withdraw_funds.delay(db_user["id"], to_addr, amount)
             await query.edit_message_text(
                 "⏳ <b>Выполняю вывод…</b>\n\n"
-                "При необходимости конвертирую pUSD → USDC.e и отправляю. "
-                "Результат с ссылкой на транзакцию придёт отдельным сообщением.",
+                "Конвертирую pUSD → USDC и отправляю на указанный адрес.\n"
+                "✅ Результат с ссылкой на Polygonscan придёт отдельным сообщением.",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
                 ]]),
             )
-            log.info("withdrawal_queued", user_id=tg_user.id, amount=amount)
+            log.info("withdrawal_queued", user_id=tg_user.id, amount=amount, to=to_addr[:10])
         except Exception:
             await query.edit_message_text(
                 "❌ <b>Не удалось запустить вывод.</b> Попробуй позже.",

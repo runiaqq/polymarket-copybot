@@ -278,9 +278,12 @@ def transfer_usdc(
     })
 
     signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    raw_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(raw_hash, timeout=180)
+    if receipt.get("status") != 1:
+        raise RuntimeError(f"transfer_usdc_reverted tx={raw_hash.hex()}")
     log.info("usdc_transfer", from_addr=wallet_address[:10], to=to_address[:10], amount=amount_usdc)
-    return tx_hash.hex()
+    return raw_hash.hex()
 
 
 def _swap_exact_in(
@@ -386,6 +389,31 @@ def fund_deposit_wallet(private_key_enc: str, eoa_address: str, deposit_wallet: 
         return 0.0
     sweep_pusd_to_deposit_wallet(private_key_enc, eoa_address, deposit_wallet)
     return pusd
+
+
+def withdrawable_usdc(db_user: dict) -> float:
+    """Single source of truth for the total liquid USD the bot can convert and send out.
+
+    Sums deposit-wallet pUSD (trading collateral) plus all USDC variants on the EOA.
+    This is the pool that withdraw_funds actually mobilises, so display, pre-flight
+    validation, and the task guard can never disagree.
+    """
+    eoa = db_user.get("wallet_address")
+    dw = db_user.get("deposit_wallet_address")
+    try:
+        dw_pusd = get_balances(dw).get("pusd", 0.0) if dw else 0.0
+    except Exception:
+        dw_pusd = 0.0
+    try:
+        eoa_bal = get_balances(eoa) if eoa else {}
+    except Exception:
+        eoa_bal = {}
+    return (
+        dw_pusd
+        + eoa_bal.get("pusd", 0.0)
+        + eoa_bal.get("usdc_e", 0.0)
+        + eoa_bal.get("usdc", 0.0)
+    )
 
 
 def is_valid_address(address: str) -> bool:
