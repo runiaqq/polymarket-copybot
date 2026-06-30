@@ -117,6 +117,11 @@ def poll_tracked_wallets() -> dict:
     # execute_copy_trade will floor their size to the exchange minimum.
     eligible_users: list[dict] = []
     for user in subscribers:
+        # Signal-only users trade manually — no wallet/balance requirement.
+        # execute_copy_trade short-circuits them into a notification.
+        if user.get("is_signal_only"):
+            eligible_users.append(user)
+            continue
         dw = user.get("deposit_wallet_address")
         if not dw:
             continue

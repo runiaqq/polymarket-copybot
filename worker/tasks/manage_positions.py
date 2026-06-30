@@ -68,6 +68,9 @@ def sync_positions() -> dict:
     now = time.time()
     actions = 0
     for user in subscribers:
+        # NB: do NOT skip is_signal_only users here. Signal-Only Mode gates only
+        # ENTRY into new trades (execute_copy). Open positions a user accumulated
+        # before switching must keep being monitored, exited on TP/SL, and redeemed.
         wallet = user.get("deposit_wallet_address")
         if not wallet:
             continue

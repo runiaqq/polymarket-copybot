@@ -72,9 +72,18 @@ def get_active_subscribers() -> list[dict]:
         # Honor drawdown / daily-loss pause (null = not paused, past date = expired pause).
         .or_(f"copy_paused_until.is.null,copy_paused_until.lt.{now}")
     )
-    if settings.auto_copy_enabled:
-        q = q.eq("copy_active", True).not_.is_("wallet_address", "null")
-    return q.execute().data
+    rows = q.execute().data or []
+    if not settings.auto_copy_enabled:
+        return rows
+    # Auto-copy mode: custodial copiers need copy_active + a wallet to be dispatched.
+    # Signal-only users trade manually (off-platform) so they are included
+    # regardless of copy_active / wallet — execute_copy_trade short-circuits them
+    # into a notification before any on-chain path.
+    return [
+        u for u in rows
+        if u.get("is_signal_only")
+        or (u.get("copy_active") and u.get("wallet_address"))
+    ]
 
 
 def get_user_by_telegram_id(telegram_id: int) -> dict | None:
@@ -160,6 +169,8 @@ def set_subscription(telegram_id: int, days: int) -> dict:
             "sub_tier": ACTIVE_TIER,
             "sub_expires_at": new_exp.isoformat(),
             "copy_active": True,
+            # Renewal re-arms the expiry alert for the next cycle.
+            "subscription_notified_expired": False,
         })
         .eq("telegram_id", telegram_id)
         .execute()
@@ -324,6 +335,49 @@ def get_subscription_status(telegram_id: int) -> dict:
         except Exception:
             active = False
     return {"active": active, "tier": tier, "expires_at": expires_at}
+
+
+def is_subscription_active(user: dict) -> bool:
+    """Pure check (no side-effects): True when the user holds a non-free tier
+    whose ``sub_expires_at`` is still in the future."""
+    tier = user.get("sub_tier", "free")
+    if not tier or tier == "free":
+        return False
+    exp_raw = user.get("sub_expires_at")
+    if not exp_raw:
+        return False
+    try:
+        from dateutil.parser import parse as parse_dt
+
+        exp = parse_dt(exp_raw)
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        return exp > datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+
+def set_subscription_notified_expired(user_id: int, value: bool) -> None:
+    """Flip the 'expiry alert already sent' flag (migration 014)."""
+    sb = get_supabase()
+    sb.table("users").update(
+        {"subscription_notified_expired": bool(value)}
+    ).eq("id", user_id).execute()
+
+
+def set_signal_only(telegram_id: int, value: bool) -> dict:
+    """Toggle Signal-Only Mode for a user (migration 014).
+
+    When True the bot delivers signals but never places on-chain orders; only
+    new-trade ENTRY is affected — open positions keep being managed."""
+    sb = get_supabase()
+    res = (
+        sb.table("users")
+        .update({"is_signal_only": bool(value)})
+        .eq("telegram_id", telegram_id)
+        .execute()
+    )
+    return res.data[0]
 
 
 def insert_trade_signal(signal: dict) -> dict:

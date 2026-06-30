@@ -31,12 +31,12 @@ def _parse(s: str) -> datetime:
 
 @celery_app.task(name="worker.tasks.check_subscription_expiry", queue="periodic")
 def check_subscription_expiry() -> dict:
-    from core.db import get_supabase
+    from core.db import get_supabase, set_subscription_notified_expired
 
     sb = get_supabase()
     res = (
         sb.table("users")
-        .select("telegram_id,sub_tier,sub_expires_at")
+        .select("id,telegram_id,sub_tier,sub_expires_at,subscription_notified_expired")
         .neq("sub_tier", "free")
         .not_.is_("sub_expires_at", "null")
         .execute()
@@ -57,6 +57,13 @@ def check_subscription_expiry() -> dict:
         days_left = (exp - now).total_seconds() / 86400
 
         if days_left > 0:
+            # Still active — re-arm the expiry alert if it was previously set,
+            # keeping this cron in sync with the execute_copy subscription guard.
+            if u.get("subscription_notified_expired"):
+                try:
+                    set_subscription_notified_expired(u["id"], False)
+                except Exception:
+                    log.warning("sub_flag_reset_failed", user_id=u.get("id"))
             # Remind once at 1 day, once at 5 days (most urgent first).
             for n in (1, 5):
                 if days_left <= n and notify_once(f"subrem:{tg}:{expkey}:{n}", ttl=_REM_TTL):
@@ -64,8 +71,14 @@ def check_subscription_expiry() -> dict:
                     notified += 1
                     break
         elif -1.5 <= days_left <= 0:
-            if notify_once(f"subexp:{tg}:{expkey}", ttl=_REM_TTL):
+            # Just expired — DB-flag dedup keeps this to a single alert and avoids
+            # a double-send with the execute_copy subscription guard.
+            if not u.get("subscription_notified_expired"):
                 _notify_expired(tg)
+                try:
+                    set_subscription_notified_expired(u["id"], True)
+                except Exception:
+                    log.warning("sub_flag_set_failed", user_id=u.get("id"))
                 notified += 1
 
     log.info("subscription_check_done", checked=len(res.data or []), notified=notified)

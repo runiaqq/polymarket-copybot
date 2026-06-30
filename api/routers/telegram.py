@@ -102,6 +102,7 @@ def _settings_kb(
     current_max: float,
     sizing_mode: str = "fixed",
     max_daily: int | None = None,
+    is_signal_only: bool = False,
 ) -> InlineKeyboardMarkup:
     def _label(val: int) -> str:
         mark = " ✓" if abs(current_max - val) < 0.5 else ""
@@ -117,6 +118,16 @@ def _settings_kb(
         else InlineKeyboardButton("▶️ Возобновить", callback_data="resume")
     )
 
+    # Mode toggle: full copy-trading vs signals-only (no on-chain trades).
+    copy_mode_btn = InlineKeyboardButton(
+        "🤖 Копитрейдинг ✓" if not is_signal_only else "🤖 Копитрейдинг",
+        callback_data="mode_copy",
+    )
+    signal_mode_btn = InlineKeyboardButton(
+        "🔔 Только сигналы ✓" if is_signal_only else "🔔 Только сигналы",
+        callback_data="mode_signal",
+    )
+
     is_kelly = sizing_mode == "kelly"
     fixed_btn = InlineKeyboardButton(
         "📊 Фиксированный ✓" if not is_kelly else "📊 Фиксированный",
@@ -130,6 +141,8 @@ def _settings_kb(
     off_label = "♾ Без лимита" + (" ✓" if max_daily is None else "")
 
     return InlineKeyboardMarkup([
+        # Trading mode: automatic copy vs signals-only.
+        [copy_mode_btn, signal_mode_btn],
         [
             InlineKeyboardButton(_label(10),  callback_data="setmax_10"),
             InlineKeyboardButton(_label(25),  callback_data="setmax_25"),
@@ -837,7 +850,13 @@ def _settings_text(db_user: dict) -> str:
     max_pos = db_user.get("max_position_usdc") or 25
     sizing_mode = db_user.get("sizing_mode") or "fixed"
     max_daily = db_user.get("max_daily_trades")
+    is_signal_only = db_user.get("is_signal_only", False)
     copy_status = "▶️ Активно" if copy_active else "⏸ Приостановлено"
+    mode_line = (
+        "🔔 Режим: <b>Только сигналы</b> (бот не торгует за тебя)\n"
+        if is_signal_only
+        else "🤖 Режим: <b>Копитрейдинг</b> (бот торгует автоматически)\n"
+    )
 
     if sizing_mode == "kelly":
         sizing_line = "📐 Сайзинг: <b>🤖 Kelly (авто-расчёт)</b>\n"
@@ -861,6 +880,7 @@ def _settings_text(db_user: dict) -> str:
 
     return (
         f"⚙️ <b>Настройки</b>\n\n"
+        f"{mode_line}"
         f"🔄 Копирование: {copy_status}\n"
         f"{sizing_line}"
         f"{daily_line}"
@@ -882,7 +902,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(  # type: ignore[union-attr]
         _settings_text(db_user),
         parse_mode="HTML",
-        reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, db_user.get("max_daily_trades")),
+        reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, db_user.get("max_daily_trades"), db_user.get("is_signal_only", False)),
     )
 
 
@@ -1256,7 +1276,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await update.message.reply_text(  # type: ignore[union-attr]
                 "♾ <b>Лимит снят</b> — сделок без ограничений в день.",
                 parse_mode="HTML",
-                reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, None),
+                reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, None, db_user.get("is_signal_only", False)),
             )
         elif n > 100:
             await update.message.reply_text(  # type: ignore[union-attr]
@@ -1269,7 +1289,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await update.message.reply_text(  # type: ignore[union-attr]
                 f"✅ <b>Лимит установлен: {n} сделок/день (UTC)</b>",
                 parse_mode="HTML",
-                reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, n),
+                reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, n, db_user.get("is_signal_only", False)),
             )
         return
 
@@ -1304,7 +1324,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(  # type: ignore[union-attr]
         f"✅ <b>Готово!</b> Макс. позиция: <b>${val:.0f} USDC</b>",
         parse_mode="HTML",
-        reply_markup=_settings_kb(copy_active, val, sizing_mode, db_user.get("max_daily_trades")),
+        reply_markup=_settings_kb(copy_active, val, sizing_mode, db_user.get("max_daily_trades"), db_user.get("is_signal_only", False)),
     )
 
 
@@ -1586,7 +1606,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(
             _settings_text(db_user),
             parse_mode="HTML",
-            reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, db_user.get("max_daily_trades")),
+            reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, db_user.get("max_daily_trades"), db_user.get("is_signal_only", False)),
         )
         return
 
@@ -1633,7 +1653,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(
             _settings_text(db_user),
             parse_mode="HTML",
-            reply_markup=_settings_kb(copy_active, val, sizing_mode, db_user.get("max_daily_trades")),
+            reply_markup=_settings_kb(copy_active, val, sizing_mode, db_user.get("max_daily_trades"), db_user.get("is_signal_only", False)),
         )
         return
 
@@ -1656,7 +1676,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text(
                 _settings_text(db_user),
                 parse_mode="HTML",
-                reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, None),
+                reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, None, db_user.get("is_signal_only", False)),
             )
             return
 
@@ -1691,7 +1711,42 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(
             _settings_text(db_user),
             parse_mode="HTML",
-            reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, n),
+            reply_markup=_settings_kb(copy_active, max_pos, sizing_mode, n, db_user.get("is_signal_only", False)),
+        )
+        return
+
+    # ── Trading mode toggle: copy-trading vs signals-only ─────────────────────
+    if data in ("mode_copy", "mode_signal"):
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user:
+            await query.answer("Отправь /start", show_alert=True)
+            return
+        new_signal_only = data == "mode_signal"
+        update_user(tg_user.id, {"is_signal_only": new_signal_only})
+        if new_signal_only:
+            await query.answer("🔔 Режим «Только сигналы» включён")
+            note = (
+                "🔔 <b>Режим «Только сигналы» включён</b>\n\n"
+                "Бот больше не открывает сделки за тебя — вместо этого присылает "
+                "детальный сигнал: событие, исход, цену и метрики кита. "
+                "Заходишь на Polymarket и торгуешь вручную.\n\n"
+                "ℹ️ Уже открытые позиции продолжают отслеживаться: бот закроет их "
+                "по стоп-лоссу / тейк-профиту и заберёт выигрыш при резолве."
+            )
+        else:
+            await query.answer("🤖 Копитрейдинг включён")
+            note = (
+                "🤖 <b>Копитрейдинг включён</b>\n\n"
+                "Бот снова автоматически копирует сделки китов на твой кошелёк.\n\n"
+                "Убедись, что копирование не на паузе и на балансе есть <b>USDC</b>."
+            )
+        await query.edit_message_text(
+            note,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
+            ]),
         )
         return
 
@@ -1711,7 +1766,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(
             _settings_text(db_user),
             parse_mode="HTML",
-            reply_markup=_settings_kb(copy_active, max_pos, new_mode, db_user.get("max_daily_trades")),
+            reply_markup=_settings_kb(copy_active, max_pos, new_mode, db_user.get("max_daily_trades"), db_user.get("is_signal_only", False)),
         )
         return
 

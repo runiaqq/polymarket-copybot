@@ -81,7 +81,27 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     res = sb.table("users").select("*").eq("id", user_id).maybe_single().execute()
     user = res.data if res else None
 
-    if not user or not user.get("wallet_private_key_enc"):
+    if not user:
+        log.warning("skip_no_user", user_id=user_id)
+        return {"skipped": True, "reason": "no_user"}
+
+    # ── Subscription Enforcer ─────────────────────────────────────────────────
+    # Gate BEFORE copying OR signalling. Expired subscriptions are skipped and
+    # the user is alerted exactly once (DB-backed flag, resets on renewal).
+    if not _subscription_guard(user):
+        return {"skipped": True, "reason": "subscription_expired"}
+
+    # ── Signal-Only Mode ──────────────────────────────────────────────────────
+    # The user opted out of custodial trading: we send a fully-detailed signal
+    # but make NO smart-contract / Web3 calls. Open positions (if any) are still
+    # managed by sync_positions — this flag only gates ENTRY into new trades.
+    if user.get("is_signal_only"):
+        _notify_signal_only(user["telegram_id"], signal)
+        log.info("signal_only_delivered", user_id=user_id,
+                 market=(signal.get("market_id") or "")[:14])
+        return {"signal_only": True, "user_id": user_id}
+
+    if not user.get("wallet_private_key_enc"):
         log.warning("skip_no_wallet", user_id=user_id)
         return {"skipped": True, "reason": "no_wallet"}
 
@@ -454,33 +474,6 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         "entry_price":    round(entry_price, 6),
     })
 
-    # TODO: REMOVE_SIGNAL_ONLY_HACK_LEVERAGE75
-    _SIGNAL_ONLY_TELEGRAM_IDS = {1443641096}
-    _SIGNAL_ONLY_USERNAMES = {"leverage75"}
-    if (
-        user.get("telegram_id") in _SIGNAL_ONLY_TELEGRAM_IDS
-        or str(user.get("username") or "").lower() in _SIGNAL_ONLY_USERNAMES
-    ):
-        log.info(
-            "signal_only_demo_skipped_blockchain",
-            user_id=user_id,
-            username=user.get("username"),
-            signal_id=signal_id,
-        )
-        try:
-            sb.table("copy_trades").update(
-                {"status": "unfilled", "error_msg": "signal_only_demo"}
-            ).eq("id", trade_row["id"]).execute()
-        except Exception:
-            pass
-        _notify(
-            user["telegram_id"], signal, "DEMO",
-            size_usdc, size_usdc, "full",
-            tradeable, demo_mode=True,
-        )
-        return {"order_id": "DEMO", "user_id": user_id, "fill": "demo", "filled": size_usdc}
-    # TODO: REMOVE_SIGNAL_ONLY_HACK_LEVERAGE75
-
     try:
         result = place_order(
             private_key_enc=user["wallet_private_key_enc"],
@@ -566,7 +559,132 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         raise self.retry(exc=exc)
 
 
+# ── Subscription Enforcer ───────────────────────────────────────────────────
+
+def _subscription_guard(user: dict) -> bool:
+    """Return True when the user's subscription is active (copy/signal allowed).
+
+    Idempotent side-effects:
+      * active subscription  → clear ``subscription_notified_expired`` once, so a
+        future expiry can alert again.
+      * expired/inactive     → send the expiry message exactly once and set
+        ``subscription_notified_expired = True`` to prevent per-trade spam.
+
+    Returns False when the subscription is not active (caller must skip the trade).
+    """
+    from core.db import is_subscription_active, set_subscription_notified_expired
+
+    uid = user.get("id")
+    if is_subscription_active(user):
+        if user.get("subscription_notified_expired"):
+            try:
+                set_subscription_notified_expired(uid, False)
+            except Exception:
+                log.warning("sub_flag_reset_failed", user_id=uid)
+        return True
+
+    if not user.get("subscription_notified_expired"):
+        _notify_subscription_expired(user["telegram_id"])
+        try:
+            set_subscription_notified_expired(uid, True)
+        except Exception:
+            log.warning("sub_flag_set_failed", user_id=uid)
+    log.info("skip_subscription_expired", user_id=uid)
+    return False
+
+
+def _notify_subscription_expired(telegram_id: int) -> None:
+    from telegram import Bot
+    from core.config import settings
+
+    async def _send() -> None:
+        bot = Bot(token=settings.telegram_bot_token)
+        await bot.send_message(
+            chat_id=telegram_id,
+            text=(
+                "❌ <b>Ваша подписка истекла.</b>\n\n"
+                "Торговля и отправка сигналов остановлены. "
+                "Продлите подписку для продолжения работы."
+            ),
+            parse_mode="HTML",
+        )
+
+    try:
+        asyncio.run(_send())
+    except Exception:
+        log.exception("notify_sub_expired_failed", telegram_id=telegram_id)
+
+
 # ── Notifications ─────────────────────────────────────────────────────────────
+
+def _notify_signal_only(telegram_id: int, signal: dict) -> None:
+    """Signal-Only Mode alert — a complete manual-trade brief.
+
+    Carries everything the user needs to place the trade by hand on Polymarket:
+    event title, the concrete outcome (Yes/No or candidate/team name), the live
+    price / implied probability, and the whale conviction metrics.
+    """
+    from telegram import Bot
+    from core.config import settings
+    from core.polymarket import event_url
+
+    async def _send() -> None:
+        from core.polymarket import format_time_left, get_order_book
+        bot = Bot(token=settings.telegram_bot_token)
+        title = (signal.get("title") or "—")[:80]
+        url = event_url(signal.get("event_slug"))
+        title_html = f"<a href=\"{url}\">{title}</a>" if url else f"<b>{title}</b>"
+        outcome = signal.get("outcome") or "—"
+
+        # Prefer a fresh order-book ask; fall back to the signal's VWAP entry.
+        price = float(signal.get("price") or 0)
+        token_id = signal.get("token_id")
+        if token_id:
+            try:
+                book = get_order_book(token_id)
+                if book and book.get("best_ask"):
+                    price = float(book["best_ask"])
+            except Exception:
+                pass
+        prob = f"{price * 100:.0f}%" if price else "—"
+
+        whale_usdc = float(signal.get("size_usdc") or 0)
+        fills = int(signal.get("fills") or 0)
+        consensus = int(signal.get("consensus") or 1)
+        whale_line = (
+            f"🐳 Кит вошёл на: <b>${whale_usdc:,.0f}</b>"
+            if whale_usdc else "🐳 Сигнал от кита"
+        )
+        if fills > 1:
+            whale_line += f" ({fills} сделок)"
+        if consensus >= 2:
+            whale_line += f"\n🔥 <b>Консенсус: {consensus} кита</b> в этом исходе"
+
+        # BP5: compute time-left fresh at send time, never from a cached scalar.
+        time_left = format_time_left(signal.get("resolution_iso"))
+        hours_line = f" · ⏳ {time_left}" if time_left else ""
+        link_line = f"\n🔗 <a href=\"{url}\">Открыть рынок на Polymarket</a>" if url else ""
+
+        msg = (
+            f"🔔 <b>Новый сигнал по киту</b>\n\n"
+            f"📌 {title_html}\n"
+            f"🎯 Исход: <b>{outcome}</b> @ {price:.3f} (~{prob}){hours_line}\n"
+            f"{whale_line}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "💡 Режим <b>«Только сигналы»</b>: бот не открывает сделку за тебя.\n"
+            f"Чтобы войти — открой рынок и купи <b>{outcome}</b> вручную."
+            f"{link_line}"
+        )
+        await bot.send_message(
+            chat_id=telegram_id, text=msg, parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+    try:
+        asyncio.run(_send())
+    except Exception:
+        log.exception("notify_signal_only_failed", telegram_id=telegram_id)
+
 
 def _notify_consensus(telegram_id: int, signal: dict, consensus: int) -> None:
     from telegram import Bot
@@ -762,7 +880,6 @@ def _notify(
     ai_verdict: str | None = None,
     ai_reason: str | None = None,
     concentration_warn: str | None = None,
-    demo_mode: bool = False,  # TODO: REMOVE_SIGNAL_ONLY_HACK_LEVERAGE75
 ) -> None:
     """One combined message: trade result + AI analysis + balance remaining.
 
@@ -806,10 +923,6 @@ def _notify(
             head = "✅ <b>Бот открыл позицию</b>"
             if fill_status == "partial":
                 head = "✅ <b>Бот открыл позицию (частично)</b>"
-            # TODO: REMOVE_SIGNAL_ONLY_HACK_LEVERAGE75
-            if demo_mode:
-                head = "[DEMO] " + head
-            # TODO: REMOVE_SIGNAL_ONLY_HACK_LEVERAGE75
 
             invested = filled_usdc if fill_status in ("full", "partial") else intended_usdc
             partial_note = f" из ${intended_usdc:.2f} (тонкий стакан)" if fill_status == "partial" else ""

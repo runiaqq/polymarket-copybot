@@ -273,6 +273,29 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   false-success notifications — "✅ Выигрыш зачислен" is only ever sent after the
   `redeemPositions` + `convert_dw_usdce_to_pusd` batch confirms on-chain.
 
+- **[BP14] Signal-Only Mode + Subscription Enforcer** (migration **014**):
+  **(A) Signal-Only Mode** — per-user `users.is_signal_only` flag. When `true`,
+  `execute_copy_trade` short-circuits **before any wallet/balance/risk/CLOB path**
+  and sends a rich manual-trade brief via `_notify_signal_only` (event title,
+  concrete outcome, live order-book price + implied probability, whale size /
+  fills / consensus, market link) — **zero on-chain / Web3 calls**. The flag gates
+  **ENTRY only**: open positions are still synced, exited on TP/SL and redeemed by
+  `sync_positions` (which must never skip `is_signal_only` users). `get_active_subscribers`
+  includes signal-only users in auto-copy mode regardless of `copy_active`/`wallet_address`,
+  and `poll_tracked_wallets` fans signals out to them bypassing the balance gate.
+  Toggle UI lives in `/settings` (🤖 Копитрейдинг / 🔔 Только сигналы → `mode_copy`/`mode_signal`).
+  **(B) Subscription Enforcer** — `_subscription_guard(user)` in `execute_copy.py` checks
+  `is_subscription_active(user)` before copying **or** signalling; expired users are skipped
+  and alerted **exactly once** via the DB-backed `users.subscription_notified_expired` flag
+  (no per-trade spam). The flag auto-resets to `false` whenever an active subscription is
+  observed and on renewal (`set_subscription`). `check_subscription_expiry` shares the same
+  flag for its "just expired" branch so the cron and the guard never double-notify.
+  New `core/db/queries.py` helpers (re-exported from `core/db/__init__.py`):
+  `is_subscription_active`, `set_subscription_notified_expired`, `set_signal_only`.
+  **This release replaces a temporary hardcoded signal-only hack (single client by
+  Telegram ID) with the production flag-driven feature.** Migration 014 must be applied
+  to the live DB before deploying this code.
+
 - **[BP12] Close-handler import fix + withdrawal balance fix & FSM redesign**:
   **(A)** `get_open_trade_by_token` re-exported from `core/db/__init__.py`; boot self-checks
   in `api/main.py` and `worker/celery_app.py` extended with an explicit required-name set so
@@ -2269,6 +2292,8 @@ Migrations are applied **manually** in the Supabase SQL editor, in order, and ar
 | `risk_state` | text | `active`/`paused_drawdown`/`paused_daily_loss` state machine (Blueprint 8) — migration 013 |
 | `risk_override_at` / `risk_override_count` | timestamptz / int | manual-unblock consent audit trail (Blueprint 8) — migration 013 |
 | `realized_baseline` | double precision | equity baseline for profit-protection cap (Blueprint 8) — migration 013 |
+| `is_signal_only` | boolean | Signal-Only Mode: deliver signals, never trade on-chain (BP14) — migration 014 |
+| `subscription_notified_expired` | boolean | dedup flag for the "subscription expired" alert (BP14) — migration 014 |
 | `created_at` | timestamptz | |
 
 > `models.py` lists `privy_user_id` (legacy/unused) and a `SubTier` enum (`basic/pro/whale`) that the
@@ -2440,7 +2465,9 @@ columns that don't exist yet.
 2. Copy-paste the contents of each new `migrations/00X_*.sql` file and click **Run**.
 3. Apply in order: `008` → `009` → `010` → …
 
-**Migrations applied as of the last deploy (2026-06-22):** 001–010. Apply 011, 012, 013 before the next deploy.
+**Migrations applied as of the last deploy (2026-06-22):** 001–010. Apply 011, 012, 013, **014** before the next deploy.
+Migration **014** (`is_signal_only`, `subscription_notified_expired`) backs the production Signal-Only Mode +
+Subscription Enforcer (BP14) and MUST be applied before deploying that code.
 
 ### 7.5 Useful diagnostic commands
 
