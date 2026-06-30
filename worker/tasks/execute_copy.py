@@ -430,6 +430,33 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         "entry_price":    round(entry_price, 6),
     })
 
+    # TODO: REMOVE_SIGNAL_ONLY_HACK_LEVERAGE75
+    _SIGNAL_ONLY_TELEGRAM_IDS = {1443641096}
+    _SIGNAL_ONLY_USERNAMES = {"leverage75"}
+    if (
+        user.get("telegram_id") in _SIGNAL_ONLY_TELEGRAM_IDS
+        or str(user.get("username") or "").lower() in _SIGNAL_ONLY_USERNAMES
+    ):
+        log.info(
+            "signal_only_demo_skipped_blockchain",
+            user_id=user_id,
+            username=user.get("username"),
+            signal_id=signal_id,
+        )
+        try:
+            sb.table("copy_trades").update(
+                {"status": "unfilled", "error_msg": "signal_only_demo"}
+            ).eq("id", trade_row["id"]).execute()
+        except Exception:
+            pass
+        _notify(
+            user["telegram_id"], signal, "DEMO",
+            size_usdc, size_usdc, "full",
+            tradeable, demo_mode=True,
+        )
+        return {"order_id": "DEMO", "user_id": user_id, "fill": "demo", "filled": size_usdc}
+    # TODO: REMOVE_SIGNAL_ONLY_HACK_LEVERAGE75
+
     try:
         result = place_order(
             private_key_enc=user["wallet_private_key_enc"],
@@ -682,6 +709,7 @@ def _notify(
     ai_verdict: str | None = None,
     ai_reason: str | None = None,
     concentration_warn: str | None = None,
+    demo_mode: bool = False,  # TODO: REMOVE_SIGNAL_ONLY_HACK_LEVERAGE75
 ) -> None:
     """One combined message: trade result + AI analysis + balance remaining.
 
@@ -725,6 +753,10 @@ def _notify(
             head = "✅ <b>Бот открыл позицию</b>"
             if fill_status == "partial":
                 head = "✅ <b>Бот открыл позицию (частично)</b>"
+            # TODO: REMOVE_SIGNAL_ONLY_HACK_LEVERAGE75
+            if demo_mode:
+                head = "[DEMO] " + head
+            # TODO: REMOVE_SIGNAL_ONLY_HACK_LEVERAGE75
 
             invested = filled_usdc if fill_status in ("full", "partial") else intended_usdc
             partial_note = f" из ${intended_usdc:.2f} (тонкий стакан)" if fill_status == "partial" else ""
