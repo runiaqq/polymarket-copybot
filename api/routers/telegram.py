@@ -47,7 +47,24 @@ def _is_risk_paused(db_user: dict) -> bool:
         return False
 
 
-def _main_kb(is_paused: bool = False) -> InlineKeyboardMarkup:
+def _onboarding_stage(db_user: dict) -> str:
+    """Derive onboarding stage from existing DB fields — no migration required.
+
+    fresh  → wallet not yet created
+    demo   → wallet exists but is_signal_only=True (default for new users, BP15)
+    intent → opted into autotrade but not yet registered on Polymarket
+    active → registered, auto-trading enabled
+    """
+    if not db_user.get("wallet_address"):
+        return "fresh"
+    if db_user.get("is_signal_only", True):
+        return "demo"
+    if not db_user.get("wallet_registered"):
+        return "intent"
+    return "active"
+
+
+def _main_kb(is_paused: bool = False, is_demo: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton("💼 Кошелёк",  callback_data="wallet"),
@@ -59,6 +76,10 @@ def _main_kb(is_paused: bool = False) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("❓ Помощь", callback_data="help")],
     ]
+    if is_demo:
+        rows.insert(0, [InlineKeyboardButton(
+            "🚀 Перейти к автоторговле", callback_data="onb_autotrade"
+        )])
     if is_paused:
         rows.insert(0, [InlineKeyboardButton(
             "🔓 Снять блокировку риск-менеджера", callback_data="unlock_drawdown"
@@ -72,6 +93,41 @@ def _signals_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("⭐️ Подписка", callback_data="subscription"),
             InlineKeyboardButton("❓ Как работает", callback_data="help"),
         ],
+    ])
+
+
+# ── BP15: Progressive-disclosure onboarding keyboards ────────────────────────
+
+def _onboarding_kb() -> InlineKeyboardMarkup:
+    """L0 — Welcome screen. Primary CTA is risk-free demo, money CTA is secondary."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎬 Смотреть сигналы (без риска)", callback_data="onb_signals")],
+        [InlineKeyboardButton("🚀 Перейти к автоторговле",       callback_data="onb_autotrade")],
+        [
+            InlineKeyboardButton("❓ Как это работает", callback_data="help"),
+            InlineKeyboardButton("🛡 Это безопасно?",  callback_data="onb_trust"),
+        ],
+    ])
+
+
+def _autotrade_gate_kb() -> InlineKeyboardMarkup:
+    """L1 — Trust gate. Still no address; deposit reveal requires an explicit tap."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Показать адрес для пополнения", callback_data="onb_fund_steps")],
+        [InlineKeyboardButton("💸 А как выводить деньги?",        callback_data="onb_withdraw_info")],
+        [InlineKeyboardButton("↩️ Вернуться в режим сигналов",    callback_data="onb_signals")],
+    ])
+
+
+def _funding_steps_kb() -> InlineKeyboardMarkup:
+    """L2 — Funding + register. The deposit address lives only behind this screen."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔐 Зарегистрировать кошелёк", callback_data="register")],
+        [
+            InlineKeyboardButton("🔄 Проверить баланс", callback_data="wallet_balance"),
+            InlineKeyboardButton("💸 Как вывести",      callback_data="onb_withdraw_info"),
+        ],
+        [InlineKeyboardButton("↩️ Назад", callback_data="onb_autotrade")],
     ])
 
 
@@ -279,6 +335,101 @@ def _new_user_text(addr: str) -> str:
         "4️⃣ Готово — бот копирует крупные сделки китов\n\n"
         "⚠️ Только сеть <b>Polygon</b> — не Ethereum, не BSC!\n"
         "ℹ️ Торговля идёт в <b>pUSD</b> (V2) — конвертация из USDC автоматическая."
+    )
+
+
+# ── BP15: Progressive-disclosure onboarding texts ────────────────────────────
+
+def _onboarding_welcome_text() -> str:
+    """L0 — First message. Zero money asks, zero deposit address."""
+    return (
+        "🧠 <b>Добро пожаловать в Nexa AI!</b>\n\n"
+        "Мы копируем сделки проверенных <b>китов Polymarket</b> — трейдеров, которые "
+        "годами стабильно зарабатывают на прогнозах. Наш ИИ следит за их крупными "
+        "покупками 24/7 и присылает разбор каждой.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🎬 <b>Начни без риска</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "Мы понимаем, что доверие нужно заслужить. Начни с <b>режима сигналов</b> — "
+        "посмотри, как мы торгуем, без риска для твоих средств.\n\n"
+        "Ты будешь получать те же сигналы по китам с ИИ-анализом, что и платные "
+        "подписчики, а решение о деньгах примешь позже — когда сам увидишь результат.\n\n"
+        "👇 С чего начнём?"
+    )
+
+
+def _onb_signals_text() -> str:
+    """Confirm that demo / signals mode is on."""
+    return (
+        "🎬 <b>Режим сигналов включён</b>\n\n"
+        "Теперь ты получаешь сигналы по китам с ИИ-анализом — <b>без единого цента на "
+        "счёте</b>. По каждому сигналу: событие, исход, цена входа кита, объём и оценка "
+        "риска от ИИ + ссылка на рынок.\n\n"
+        "Когда захочешь, чтобы бот торговал это <b>за тебя автоматически</b> — "
+        "нажми «🚀 Перейти к автоторговле». Это займёт пару минут."
+    )
+
+
+def _autotrade_gate_text() -> str:
+    """L1 — Trust reassurance before showing the deposit address."""
+    return (
+        "🚀 <b>Автоторговля — сделки копируются сами</b>\n\n"
+        "В этом режиме бот сам открывает позиции на <b>твоём личном кошельке</b>, как "
+        "только кит заходит крупно. Перед первым пополнением — 3 факта, чтобы было "
+        "спокойно:\n\n"
+        "🔑 <b>Кошелёк под твоим контролем.</b> Вывести средства можно в любой момент "
+        "кнопкой «💸 Вывод» — без подтверждений с нашей стороны.\n"
+        "🌐 <b>Только сеть Polygon.</b> Не Ethereum, не BSC — иначе деньги уйдут в "
+        "чужую сеть.\n"
+        "🪙 <b>Только USDC.</b> Бот сам сконвертирует в торговый баланс (pUSD). Газ "
+        "(POL) для старта не нужен — регистрация газлесс.\n\n"
+        "Готов? Покажу адрес и пошаговую инструкцию по пополнению."
+    )
+
+
+def _onb_trust_text() -> str:
+    """On-demand trust FAQ — answers the most common fears honestly."""
+    return (
+        "🛡 <b>Часто волнует — отвечаем честно</b>\n\n"
+        "💸 <b>Деньги выводятся в любой момент.</b>\n"
+        "Кнопка «💸 Вывод» отправит USDC на любой твой адрес Polygon. Мы не держим "
+        "твои средства в заложниках и не требуем разрешений.\n\n"
+        "🌐 <b>Только сеть Polygon.</b>\n"
+        "Пополняй строго в сети Polygon (не Ethereum / BSC / Arbitrum) — иначе монеты "
+        "уйдут в чужую сеть и потеряются. Это главное правило безопасности.\n\n"
+        "🪙 <b>Только USDC, и старт без газа.</b>\n"
+        "Достаточно обычного USDC — бот сам сконвертирует его в торговый баланс. "
+        "Регистрация кошелька газлесс: POL на старте не нужен.\n\n"
+        "🎬 <b>Старт — бесплатный и без депозита.</b>\n"
+        "Режим сигналов не требует ни цента на счёте. Сначала смотришь, потом решаешь."
+    )
+
+
+def _onb_withdraw_info_text() -> str:
+    """Withdraw reassurance — shown on demand from L1/L2."""
+    return (
+        "💸 <b>Вывод средств — в любой момент</b>\n\n"
+        "Нажимаешь «💸 Вывод» → вводишь свой адрес Polygon → сумму → подтверждаешь.\n"
+        "Бот сконвертирует pUSD обратно в USDC и отправит на указанный адрес; в ответ "
+        "придёт ссылка на транзакцию в Polygonscan.\n\n"
+        "Никаких блокировок и периодов ожидания — деньги твои."
+    )
+
+
+def _funding_steps_text(addr: str) -> str:
+    """L2 — Only place the deposit address and network instructions appear."""
+    return (
+        "🚀 <b>Пополнение — 3 шага</b>\n\n"
+        "📬 <b>Твой адрес для пополнения (USDC, сеть Polygon):</b>\n"
+        f"<code>{addr}</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ Отправь <b>USDC</b> на адрес выше — <b>строго в сети Polygon</b>\n"
+        "2️⃣ Нажми <b>🔐 Зарегистрировать кошелёк</b> (газлесс, 30–60 сек)\n"
+        "3️⃣ Готово — бот начнёт копировать крупные сделки китов\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⚠️ <b>Только сеть Polygon</b> — не Ethereum, не BSC, не Arbitrum!\n"
+        "ℹ️ Бот сам сконвертирует USDC в торговый баланс (pUSD). Вывести средства можно "
+        "в любой момент кнопкой «💸 Вывод»."
     )
 
 
@@ -531,22 +682,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not db_user.get("wallet_address"):
+        # BP15: silent wallet creation — no address/deposit push on first message.
         await update.message.reply_text(  # type: ignore[union-attr]
-            "⏳ Создаём твой кошелёк…",
+            "⏳ Создаём твой аккаунт…",
             parse_mode="HTML",
         )
         try:
             wallet = generate_wallet()
             update_user(tg_user.id, {
-                "wallet_address":       wallet["address"],
+                "wallet_address":         wallet["address"],
                 "wallet_private_key_enc": wallet["private_key_enc"],
+                "is_signal_only":         True,  # BP15: default to demo mode
             })
             db_user = get_user_by_telegram_id(tg_user.id) or db_user
-            addr = db_user.get("wallet_address", "—")
             await update.message.reply_text(  # type: ignore[union-attr]
-                _new_user_text(addr),
+                _onboarding_welcome_text(),
                 parse_mode="HTML",
-                reply_markup=_main_kb(),
+                reply_markup=_onboarding_kb(),
             )
         except Exception:
             log.exception("wallet_create_failed", telegram_id=tg_user.id)
@@ -555,11 +707,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="HTML",
             )
     else:
-        await update.message.reply_text(  # type: ignore[union-attr]
-            _dashboard_text(db_user, tg_user.first_name),
-            parse_mode="HTML",
-            reply_markup=_main_kb(is_paused=_is_risk_paused(db_user)),
-        )
+        # BP15: route by onboarding stage — demo users get the value-first welcome.
+        if _onboarding_stage(db_user) == "demo":
+            await update.message.reply_text(  # type: ignore[union-attr]
+                _onboarding_welcome_text(),
+                parse_mode="HTML",
+                reply_markup=_onboarding_kb(),
+            )
+        else:
+            await update.message.reply_text(  # type: ignore[union-attr]
+                _dashboard_text(db_user, tg_user.first_name),
+                parse_mode="HTML",
+                reply_markup=_main_kb(is_paused=_is_risk_paused(db_user)),
+            )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -960,6 +1120,8 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         result = _register_deposit_wallet(tg_user.id, db_user)
         dw = result.get("deposit_wallet", "")
+        # BP15: hand-off from demo → active auto-trading mode.
+        update_user(tg_user.id, {"is_signal_only": False})
         await msg.edit_text(  # type: ignore[union-attr]
             "✅ <b>Кошелёк готов к торговле!</b>\n\n"
             f"Торговый адрес (deposit wallet):\n<code>{dw}</code>\n\n"
@@ -1351,11 +1513,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     reply_markup=_signals_kb(),
                 )
             else:
-                await query.edit_message_text(
-                    _dashboard_text(db_user, tg_user.first_name),
-                    parse_mode="HTML",
-                    reply_markup=_main_kb(is_paused=_is_risk_paused(db_user)),
-                )
+                # BP15: demo users return to the value-first welcome, not the full dashboard.
+                if _onboarding_stage(db_user) == "demo":
+                    await query.edit_message_text(
+                        _onboarding_welcome_text(),
+                        parse_mode="HTML",
+                        reply_markup=_onboarding_kb(),
+                    )
+                else:
+                    await query.edit_message_text(
+                        _dashboard_text(db_user, tg_user.first_name),
+                        parse_mode="HTML",
+                        reply_markup=_main_kb(is_paused=_is_risk_paused(db_user)),
+                    )
         return
 
     if data == "subscription":
@@ -1427,10 +1597,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         try:
             result = _register_deposit_wallet(tg_user.id, db_user)
             dw = result.get("deposit_wallet", "")
+            # BP15: hand-off from demo → active auto-trading mode.
+            update_user(tg_user.id, {"is_signal_only": False})
             await query.edit_message_text(
                 "✅ <b>Кошелёк готов к торговле!</b>\n\n"
                 f"Торговый адрес (deposit wallet):\n<code>{dw}</code>\n\n"
-                "Бот может копировать сделки. Включи копирование: /resume",
+                "Бот может копировать сделки. Убедись, что копирование включено: /resume",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
@@ -1447,6 +1619,74 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 ]]),
             )
         return
+
+    # ── BP15: Progressive-disclosure onboarding callbacks ─────────────────────
+
+    if data == "onb_signals":
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user:
+            await query.answer("Отправь /start", show_alert=True)
+            return
+        update_user(tg_user.id, {"is_signal_only": True})
+        await query.edit_message_text(
+            _onb_signals_text(),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚀 Перейти к автоторговле", callback_data="onb_autotrade")],
+                [
+                    InlineKeyboardButton("⭐️ Подписка",      callback_data="subscription"),
+                    InlineKeyboardButton("🏠 Меню",           callback_data="menu"),
+                ],
+            ]),
+        )
+        return
+
+    if data == "onb_autotrade":
+        # L1 — show trust gate; does NOT flip is_signal_only yet (abandoned funnel stays safe).
+        await query.edit_message_text(
+            _autotrade_gate_text(),
+            parse_mode="HTML",
+            reply_markup=_autotrade_gate_kb(),
+        )
+        return
+
+    if data == "onb_trust":
+        await query.edit_message_text(
+            _onb_trust_text(),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎬 Остаться на сигналах",    callback_data="onb_signals")],
+                [InlineKeyboardButton("🚀 Перейти к автоторговле",  callback_data="onb_autotrade")],
+            ]),
+        )
+        return
+
+    if data == "onb_fund_steps":
+        # L2 — the ONLY place the deposit address and network instructions are shown.
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user or not db_user.get("wallet_address"):
+            await query.answer("Отправь /start", show_alert=True)
+            return
+        addr = db_user["wallet_address"]
+        await query.edit_message_text(
+            _funding_steps_text(addr),
+            parse_mode="HTML",
+            reply_markup=_funding_steps_kb(),
+        )
+        return
+
+    if data == "onb_withdraw_info":
+        await query.edit_message_text(
+            _onb_withdraw_info_text(),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Продолжить к пополнению", callback_data="onb_fund_steps")],
+                [InlineKeyboardButton("🏠 Меню",                    callback_data="menu")],
+            ]),
+        )
+        return
+
+    # ──────────────────────────────────────────────────────────────────────────
 
     if data == "wrap":
         db_user = get_user_by_telegram_id(tg_user.id)

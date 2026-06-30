@@ -2392,6 +2392,301 @@ exists ai_signal_type text;` (add to §6.9 / §6.10 with the implementation PR).
 
 ---
 
+### Blueprint 15 — Onboarding & Trust UX Redesign (Progressive Disclosure) 🟡 FINAL DESIGN / READY TO IMPLEMENT
+
+**Symptom (conversion drop at onboarding).** In the custodial copy-trading deployment
+(`AUTO_COPY_ENABLED=true`), the very first message after `/start` creates a wallet and immediately
+fires `_new_user_text()` (`api/routers/telegram.py` L267–282) — a wall of *"пополни USDC / пополни POL
+/ зарегистрируй кошелёк"*. For a cold Web3 user this reads as a scam: an unknown bot demanding money
+before delivering any value. They don't deposit, and they leave.
+
+**Goal.** Replace "money-first" with **value-first, money-when-ready** (Progressive Disclosure):
+welcome → explain the value → default into a **risk-free signals (demo) mode** → and only reveal
+deposit/network/USDC instructions when the user *taps a button to opt in* to auto-trading.
+
+> **Scope.** This blueprint redesigns the **`AUTO_COPY_ENABLED=true` (custodial)** onboarding only.
+> The `AUTO_COPY_ENABLED=false` deployment is already a pure non-custodial signals bot with a soft
+> intro (`_signals_welcome_text`, L308) and is the *tone reference* for this redesign.
+
+---
+
+#### ⚠️ Honesty constraint — DO NOT call the wallet "non-custodial"
+
+The prompt asks to mention "кошелёк некастодиальный (если это так)". **It is NOT.** Per §1 and §5.1 the
+bot **generates and holds the user's private key (encrypted)** — this is a **custodial** model. Claiming
+"non-custodial" would be a false safety claim and is **forbidden** (§5.1, §5.7). Use only **truthful**
+trust levers instead:
+
+1. **"Выводи в любой момент"** — true: `/withdraw` (BP12) sends funds to any Polygon address the user
+   names, no approval from us. This is the strongest *honest* fear-reducer.
+2. **"Старт без депозита"** — the demo/signals mode genuinely requires $0 on-chain.
+3. **"Только сеть Polygon"** — concrete, protects the user from losing funds on the wrong chain.
+4. **"Только USDC, газлесс-регистрация"** — bot auto-converts USDC→pUSD; registration costs the user
+   no gas (relayer-deployed deposit wallet, see §2 / `_register_deposit_wallet`).
+5. **Optional, only if implemented:** "ключ хранится в зашифрованном виде" — true (Fernet at rest),
+   but do **not** oversell it as "только у тебя".
+
+---
+
+#### Part A — Progressive-disclosure model (3 layers)
+
+| Layer | When shown | Contains | Money mentioned? |
+|---|---|---|---|
+| **L0 Welcome / Demo** | immediately on first `/start` (wallet silently created in background) | value pitch + the trust quote + the offer to start in signals mode | **No** |
+| **L1 Upsell gate** | only after user taps **🚀 Перейти к автоторговле** | the 3 honest trust facts (withdraw-anytime / Polygon-only / USDC-only) + a single "show me the address" CTA | network/asset rules, **no address yet** |
+| **L2 Funding steps** | only after user taps **✅ Показать адрес для пополнения** | deposit address + numbered steps + 🔐 register button (the *content* of the old `_new_user_text`, but earned, not pushed) | **Yes — fully** |
+
+The deposit address / network / "buy USDC" instructions live **only in L2**. They are never the first
+message and never appear unless the user explicitly walks L0 → L1 → L2.
+
+---
+
+#### Part B — Onboarding FSM
+
+**State source of truth.** Derive the stage from existing fields (mirrors how `_checklist()` already
+derives status) — **no migration required**:
+
+```python
+# Proposed helper in telegram.py — pure function over the db_user row.
+def _onboarding_stage(db_user: dict) -> str:
+    if not db_user.get("wallet_address"):
+        return "fresh"                      # /start not finished creating wallet
+    if db_user.get("is_signal_only", True): # NEW DEFAULT: True for new users
+        return "demo"                       # L0 — risk-free signals, no money ask
+    if not db_user.get("wallet_registered"):
+        return "intent"                     # opted into autotrade, not yet registered
+    # funded? reuse _checklist math (dw_pusd + on_eoa) >= MIN_USDC_READY
+    return "active"                         # auto-trading
+```
+
+> **One small behavioural change required:** new users must default to **`is_signal_only = True`**.
+> Today new rows default to copy-mode. Set `is_signal_only=True` at wallet-creation time in `cmd_start`
+> (and as the column default in a future migration if convenient — not blocking).
+
+| # | State | Entry trigger | Bot shows | Exit → |
+|---|-------|--------------|-----------|--------|
+| 1 | `fresh` | `/start`, no wallet | "⏳ Готовлю твой аккаунт…" then silently `generate_wallet()`; set `is_signal_only=True` | → `demo` |
+| 2 | `demo` | wallet ready / `onb_signals` / `/start` returning demo user | **L0 welcome** (`_onboarding_welcome_text`) + `_onboarding_kb()` | tap 🚀 → `intent` · tap 🎬 → stays `demo`, confirms signals on |
+| 3 | `intent` | `onb_autotrade` | **L1 upsell** (`_autotrade_gate_text`) + `_autotrade_gate_kb()` | tap ✅ → `funding` view · tap ↩️ → `demo` |
+| 4 | `funding` (view, not a stored state) | `onb_fund_steps` | **L2 funding** (`_funding_steps_text` = deposit addr + steps) + 🔐 register | tap 🔐 → existing `register` flow |
+| 5 | `register` | `register` callback (unchanged, BP9/BP12) | gasless deploy → "✅ Кошелёк готов" | on success set `is_signal_only=False`; → `active` |
+| 6 | `active` | registered + (auto-detected funds) | normal `_dashboard_text` + `_main_kb` (existing) | — |
+
+**Seamless demo → autotrade hand-off.** The user never re-enters anything: tapping **🚀 Перейти к
+автоторговле** in `demo` flips intent, L1 reassures, L2 reveals the address, 🔐 register reuses the
+existing gasless flow and **flips `is_signal_only=False` on success** — at which point the dashboard
+becomes the full auto-trading view. Going back is always one tap (**↩️ Вернуться в режим сигналов**),
+which never deletes the wallet — it just sets `is_signal_only=True`.
+
+> **Subscription gate (product decision, flag it).** In copy-mode deployments, signal broadcasts are
+> gated by an active subscription. To make the demo *genuinely* risk-free and not a dead end, **default
+> recommendation:** grant new demo users a small free sample — e.g. the next **3 signals** or a **48h
+> window** (Redis counter keyed by `telegram_id`, no schema change). If the business refuses a free
+> tier, L0's copy must instead say signals require a subscription (still framed as "watch us trade
+> before funding"). **Default to the 3-signal sample; leave the final call to the operator.**
+
+---
+
+#### Part C — Concrete message drafts & inline-button structure (start screen)
+
+All texts are HTML parse-mode, Russian (matches the existing bot voice). These are **drafts ready to
+paste** into new builders in `telegram.py`.
+
+**L0 — Welcome / Demo (`_onboarding_welcome_text`)** — replaces `_new_user_text` as the first message:
+
+```
+🧠 <b>Добро пожаловать в Nexa AI!</b>
+
+Мы копируем сделки проверенных <b>китов Polymarket</b> — трейдеров, которые
+годами стабильно зарабатывают на прогнозах. Наш ИИ следит за их крупными
+покупками 24/7 и присылает разбор каждой.
+
+━━━━━━━━━━━━━━━━━━━━━
+🎬 <b>Начни без риска</b>
+━━━━━━━━━━━━━━━━━━━━━
+Мы понимаем, что доверие нужно заслужить. Начни с <b>режима сигналов</b> —
+посмотри, как мы торгуем, без риска для твоих средств.
+
+Ты будешь получать те же сигналы по китам с ИИ-анализом, что и платные
+подписчики, а решение о деньгах примешь позже — когда сам увидишь результат.
+
+👇 С чего начнём?
+```
+
+`_onboarding_kb()` — inline keyboard (primary CTA first, money CTA secondary):
+
+```python
+InlineKeyboardMarkup([
+    [InlineKeyboardButton("🎬 Смотреть сигналы (без риска)", callback_data="onb_signals")],
+    [InlineKeyboardButton("🚀 Перейти к автоторговле",       callback_data="onb_autotrade")],
+    [
+        InlineKeyboardButton("❓ Как это работает", callback_data="help"),
+        InlineKeyboardButton("🛡 Это безопасно?",  callback_data="onb_trust"),
+    ],
+])
+```
+
+**`onb_trust` — trust FAQ (fear-killer), shown on demand:**
+
+```
+🛡 <b>Часто волнует — отвечаем честно</b>
+
+💸 <b>Деньги выводятся в любой момент.</b>
+Кнопка «💸 Вывод» отправит USDC на любой твой адрес Polygon. Мы не держим
+твои средства в заложниках и не требуем разрешений.
+
+🌐 <b>Только сеть Polygon.</b>
+Пополняй строго в сети Polygon (не Ethereum / BSC / Arbitrum) — иначе монеты
+уйдут в чужую сеть и потеряются. Это главное правило безопасности.
+
+🪙 <b>Только USDC, и старт без газа.</b>
+Достаточно обычного USDC — бот сам сконвертирует его в торговый баланс.
+Регистрация кошелька газлесс: POL на старте не нужен.
+
+🎬 <b>Старт — бесплатный и без депозита.</b>
+Режим сигналов не требует ни цента на счёте. Сначала смотришь, потом решаешь.
+```
+Buttons: `[🎬 Остаться на сигналах → onb_signals]` · `[🚀 Перейти к автоторговле → onb_autotrade]`
+
+> Note: this text deliberately says **"деньги выводятся в любой момент"** and **"мы не держим в
+> заложниках"** (true), and **never** the word "некастодиальный" (false). Keep it that way.
+
+**`onb_signals` — confirm demo mode (sets `is_signal_only=True`, no deposit):**
+
+```
+🎬 <b>Режим сигналов включён</b>
+
+Теперь ты получаешь сигналы по китам с ИИ-анализом — <b>без единого цента на
+счёте</b>. По каждому сигналу: событие, исход, цена входа кита, объём и оценка
+риска от ИИ + ссылка на рынок.
+
+Когда захочешь, чтобы бот торговал это <b>за тебя автоматически</b> —
+нажми «🚀 Перейти к автоторговле». Это займёт пару минут.
+```
+Buttons: `[🚀 Перейти к автоторговле → onb_autotrade]` · `[⭐️ Подписка → subscription]` · `[🏠 Меню → menu]`
+
+**L1 — Autotrade upsell gate (`_autotrade_gate_text`)** — shown on `onb_autotrade`. **Still no address:**
+
+```
+🚀 <b>Автоторговля — сделки копируются сами</b>
+
+В этом режиме бот сам открывает позиции на <b>твоём личном кошельке</b>, как
+только кит заходит крупно. Перед первым пополнением — 3 факта, чтобы было
+спокойно:
+
+🔑 <b>Кошелёк под твоим контролем.</b> Вывести средства можно в любой момент
+кнопкой «💸 Вывод» — без подтверждений с нашей стороны.
+🌐 <b>Только сеть Polygon.</b> Не Ethereum, не BSC — иначе деньги уйдут в чужую
+сеть.
+🪙 <b>Только USDC.</b> Бот сам сконвертирует в торговый баланс (pUSD). Газ (POL)
+для старта не нужен — регистрация газлесс.
+
+Готов? Покажу адрес и пошаговую инструкцию по пополнению.
+```
+
+`_autotrade_gate_kb()`:
+
+```python
+InlineKeyboardMarkup([
+    [InlineKeyboardButton("✅ Показать адрес для пополнения", callback_data="onb_fund_steps")],
+    [InlineKeyboardButton("💸 А как выводить деньги?",        callback_data="onb_withdraw_info")],
+    [InlineKeyboardButton("↩️ Вернуться в режим сигналов",    callback_data="onb_signals")],
+])
+```
+
+**L2 — Funding steps (`_funding_steps_text(addr)`)** — shown on `onb_fund_steps`. This is the *only*
+place the address + deposit steps appear (refined `_new_user_text`):
+
+```
+🚀 <b>Пополнение — 3 шага</b>
+
+📬 <b>Твой адрес для пополнения (USDC, сеть Polygon):</b>
+<code>{addr}</code>
+
+━━━━━━━━━━━━━━━━━━━━━
+1️⃣ Отправь <b>USDC</b> на адрес выше — <b>строго в сети Polygon</b>
+2️⃣ Нажми <b>🔐 Зарегистрировать кошелёк</b> (газлесс, 30–60 сек)
+3️⃣ Готово — бот начнёт копировать крупные сделки китов
+━━━━━━━━━━━━━━━━━━━━━
+
+⚠️ <b>Только сеть Polygon</b> — не Ethereum, не BSC, не Arbitrum!
+ℹ️ Бот сам сконвертирует USDC в торговый баланс (pUSD). Вывести средства можно
+в любой момент кнопкой «💸 Вывод».
+```
+
+Buttons:
+
+```python
+InlineKeyboardMarkup([
+    [InlineKeyboardButton("🔐 Зарегистрировать кошелёк", callback_data="register")],
+    [
+        InlineKeyboardButton("🔄 Проверить баланс", callback_data="wallet_balance"),
+        InlineKeyboardButton("💸 Как вывести",      callback_data="onb_withdraw_info"),
+    ],
+    [InlineKeyboardButton("↩️ Назад", callback_data="onb_autotrade")],
+])
+```
+
+**`onb_withdraw_info` — withdraw reassurance (links to the BP12 flow):**
+
+```
+💸 <b>Вывод средств — в любой момент</b>
+
+Нажимаешь «💸 Вывод» → вводишь свой адрес Polygon → сумму → подтверждаешь.
+Бот сконвертирует pUSD обратно в USDC и отправит на указанный адрес; в ответ
+придёт ссылка на транзакцию в Polygonscan.
+
+Никаких блокировок и периодов ожидания — деньги твои.
+```
+Buttons: `[🚀 Продолжить к пополнению → onb_fund_steps]` · `[🏠 Меню → menu]`
+
+---
+
+#### Part D — Wiring (files & touch-points; implement later)
+
+1. **`cmd_start` (L485–562).** For `AUTO_COPY_ENABLED=true`:
+   - On wallet creation, set `is_signal_only=True` (default into demo).
+   - Returning users: branch on `_onboarding_stage(db_user)` → `demo` shows `_onboarding_welcome_text`
+     + `_onboarding_kb`; `active` shows the existing `_dashboard_text` + `_main_kb`.
+   - **Delete the immediate `_new_user_text` push.** Its content survives, relocated to L2.
+2. **New callbacks in `callback_handler` (L1333+):** `onb_signals`, `onb_autotrade`, `onb_trust`,
+   `onb_fund_steps`, `onb_withdraw_info`. `onb_signals` sets `is_signal_only=True`; `onb_autotrade`
+   only renders L1 (does **not** flip the flag yet — the flag flips to copy-mode on **register
+   success**, so an abandoned funnel never silently arms auto-trading).
+3. **`register` success (L1428–1438 and `cmd_register` L963–968):** on success
+   `update_user(tg_user.id, {"is_signal_only": False})` so the hand-off to `active` is automatic.
+4. **Dashboard (`_dashboard_text` L222 / `_checklist` L177):** when stage==`demo`, suppress the
+   funding checklist entirely and show a one-line demo banner + the single 🚀 CTA. The checklist only
+   makes sense once the user has opted into autotrade.
+5. **`_main_kb` (L50):** for demo users, surface **🚀 Перейти к автоторговле** as the top row instead
+   of wallet/positions clutter (those are meaningless with $0 and no positions).
+6. **Reuse, don't fork:** registration, wrap, withdraw, subscription flows are unchanged (BP9/BP12).
+   This blueprint adds *only* the pre-funding disclosure layer and the demo default.
+
+**Config (§5.6, no magic literals):** add `ONBOARDING_FREE_SIGNALS = 3` (or `ONBOARDING_DEMO_HOURS`)
+to `core/config.py::Settings` if the free-sample option is taken. No DB migration is required for the
+FSM (stage is derived); the only data change is the `is_signal_only=True` default for new users.
+
+---
+
+#### Acceptance criteria (Blueprint 15)
+
+- A brand-new `/start` (copy-mode deployment) shows the **value-first L0 welcome** containing the exact
+  trust quote — and **no deposit address, network instructions, or "пополни" wording**.
+- The deposit address and funding steps appear **only** after `onb_autotrade` → `onb_fund_steps`
+  (two explicit taps). They never appear in L0/L1.
+- New users land in `is_signal_only=True` (demo); the dashboard hides the funding checklist until they
+  opt in.
+- **🚀 Перейти к автоторговле** → L1 reassurance → L2 address → 🔐 register → on success
+  `is_signal_only` flips to False and the full auto-trading dashboard renders — with no re-entry of any
+  data. **↩️ Вернуться в режим сигналов** returns to demo without destroying the wallet.
+- No user-facing copy claims the wallet is "non-custodial"; only truthful levers (withdraw-anytime,
+  Polygon-only, USDC-only, gasless, no-deposit demo) are used.
+- (If free-sample taken) a demo user with no subscription receives the configured sample of real
+  signals, then is prompted to subscribe — proving "watch before you fund" end to end.
+
+---
+
 ## 5. Coding Guidelines (STRICT — safety first)
 
 These rules are non-negotiable. Money and private keys are at stake.
