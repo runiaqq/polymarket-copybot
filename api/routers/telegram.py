@@ -388,6 +388,34 @@ async def _set_commands(app: Application) -> None:
     ])
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global PTB error handler — BP9 Layer 2a.
+
+    Converts silent handler crashes into a structured log entry and a user-visible
+    fallback, so a bug can never again produce a dead button with no trace.
+    """
+    data = ""
+    user_id = None
+    if isinstance(update, Update):
+        if update.callback_query:
+            data = update.callback_query.data or ""
+        if update.effective_user:
+            user_id = update.effective_user.id
+    log.error(
+        "telegram_callback_error",
+        data=data,
+        user_id=user_id,
+        exc=str(context.error),
+    )
+    if isinstance(update, Update) and update.callback_query:
+        try:
+            await update.callback_query.answer(
+                "⚠️ Что-то пошло не так — открой /start", show_alert=True
+            )
+        except Exception:
+            pass
+
+
 def build_application() -> Application:
     app = Application.builder().token(settings.telegram_bot_token).post_init(_set_commands).build()
     app.add_handler(CommandHandler("start",     cmd_start))
@@ -409,6 +437,8 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(callback_handler))
     # Must be last — catches free-text input
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
+    # BP9 Layer 2a: global error handler — no more silent dead buttons.
+    app.add_error_handler(on_error)
     return app
 
 
@@ -1593,25 +1623,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         uid = db_user["id"]
-        risk_state = db_user.get("risk_state") or "active"
-
-        if risk_state not in ("paused_drawdown", "paused_daily_loss"):
+        # Use copy_paused_until as the source of truth — risk_state may be NULL
+        # if migration 013 hasn't been applied yet.
+        if not _is_risk_paused(db_user):
             await query.answer("Блокировка уже снята.", show_alert=True)
             return
 
-        # Compute current cost-basis equity to use as the new HWM.
+        import structlog as _sl
+        _log = _sl.get_logger(__name__)
+
+        # ── Step 1: critical — lift the pause (always works, pre-dates BP8) ──
+        try:
+            from core.db import resume_user_copying
+            resume_user_copying(uid)
+        except Exception:
+            _log.exception("unlock_drawdown_resume_failed", user_id=uid)
+            await query.answer("Ошибка при снятии блокировки. Попробуй позже.", show_alert=True)
+            return
+
+        # ── Step 2: compute current equity for HWM reset ─────────────────────
+        new_equity: float = 0.0
         try:
             from core.polygon import get_balances as _gb
             from core.polymarket import get_positions as _gp
             from core.risk import total_equity
-            from core.db import (
-                get_open_trades_cost, get_realized_baseline,
-                record_risk_override, reset_risk_baseline,
-                resume_user_copying, set_risk_state,
-            )
-            from core.cache import _client as _redis_client
-            # settings is already imported at module level — no local re-import
-
+            from core.db import get_open_trades_cost
             dw = db_user.get("deposit_wallet_address")
             free_pusd = _gb(dw).get("pusd", 0.0) if dw else 0.0
             positions = _gp(dw) if dw else []
@@ -1619,39 +1655,55 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             new_equity = total_equity(
                 free_pusd, positions, ledger_cost, mode=settings.drawdown_equity_mode
             )
-
-            old_hwm = db_user.get("equity_hwm") or 0.0
-
-            reset_risk_baseline(uid, new_equity)
-            record_risk_override(uid)
-            resume_user_copying(uid)
-            set_risk_state(uid, "active")
-
-            # Clear Redis notify keys so a future real drawdown can alert again.
-            try:
-                r = _redis_client()
-                r.delete(f"once:drawdown_alert:{uid}")
-                r.delete(f"once:risk_gate:{uid}:drawdown")
-                r.delete(f"once:resume_alert:{uid}")
-            except Exception:
-                pass
-
-            import structlog as _sl
-            _sl.get_logger(__name__).info(
-                "risk_override_manual",
-                user_id=uid,
-                old_hwm=round(float(old_hwm), 2),
-                new_hwm=round(new_equity, 2),
-            )
-
-            await query.edit_message_text(
-                "✅ <b>Блокировка снята. Ты берёшь риск на себя.</b>\n\n"
-                f"Точка отсчёта просадки сброшена на <b>${new_equity:.2f}</b>.\n"
-                "Копирование возобновлено. Риск-защита снова активна от этого уровня.",
-                parse_mode="HTML",
-            )
         except Exception:
-            import structlog as _sl
-            _sl.get_logger(__name__).exception("unlock_drawdown_failed", user_id=db_user["id"])
-            await query.answer("Ошибка при снятии блокировки. Попробуй позже.", show_alert=True)
+            _log.warning("unlock_drawdown_equity_failed", user_id=uid)
+            new_equity = float(db_user.get("equity_hwm") or 0.0)
+
+        # ── Step 3: BP8 audit trail (graceful — columns may not exist yet) ───
+        old_hwm = float(db_user.get("equity_hwm") or 0.0)
+        try:
+            from core.db import reset_risk_baseline
+            reset_risk_baseline(uid, new_equity)
+        except Exception:
+            _log.warning("unlock_drawdown_baseline_failed", user_id=uid)
+
+        try:
+            from core.db import record_risk_override
+            record_risk_override(uid)
+        except Exception:
+            _log.warning("unlock_drawdown_override_record_failed", user_id=uid)
+
+        try:
+            from core.db import set_risk_state
+            set_risk_state(uid, "active")
+        except Exception:
+            _log.warning("unlock_drawdown_state_failed", user_id=uid)
+
+        # ── Step 4: clear Redis notify-once keys ─────────────────────────────
+        try:
+            from core.cache import _client as _redis_client
+            r = _redis_client()
+            r.delete(f"once:drawdown_alert:{uid}")
+            r.delete(f"once:risk_gate:{uid}:drawdown")
+            r.delete(f"once:resume_alert:{uid}")
+        except Exception:
+            pass
+
+        _log.info(
+            "risk_override_manual",
+            user_id=uid,
+            old_hwm=round(old_hwm, 2),
+            new_hwm=round(new_equity, 2),
+        )
+
+        equity_line = f"Точка отсчёта просадки сброшена на <b>${new_equity:.2f}</b>.\n" if new_equity > 0 else ""
+        await query.edit_message_text(
+            "✅ <b>Блокировка снята. Ты берёшь риск на себя.</b>\n\n"
+            f"{equity_line}"
+            "Копирование возобновлено. Риск-защита снова активна от этого уровня.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
+            ]]),
+        )
         return
