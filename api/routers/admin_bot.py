@@ -111,6 +111,30 @@ HELP_SUPER = (
 )
 
 
+async def on_admin_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global PTB error handler for the admin bot — BP9 Layer 2a."""
+    data = ""
+    user_id = None
+    if isinstance(update, Update):
+        if update.callback_query:
+            data = update.callback_query.data or ""
+        if update.effective_user:
+            user_id = update.effective_user.id
+    log.error(
+        "admin_bot_callback_error",
+        data=data,
+        user_id=user_id,
+        exc=str(context.error),
+    )
+    if isinstance(update, Update) and update.callback_query:
+        try:
+            await update.callback_query.answer(
+                "⚠️ Ошибка — попробуй ещё раз или отправь /help", show_alert=True
+            )
+        except Exception:
+            pass
+
+
 def build_admin_application() -> Application | None:
     if not is_enabled():
         return None
@@ -130,6 +154,8 @@ def build_admin_application() -> Application | None:
     app.add_handler(CommandHandler("admins", cmd_admins))
     app.add_handler(CommandHandler("deladmin", cmd_deladmin))
     app.add_handler(CallbackQueryHandler(on_callback))
+    # BP9 Layer 2a: global error handler — converts silent crashes into logs.
+    app.add_error_handler(on_admin_error)
     return app
 
 

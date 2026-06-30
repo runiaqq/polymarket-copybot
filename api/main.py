@@ -15,6 +15,24 @@ from core.config import settings
 
 log = structlog.get_logger(__name__)
 
+
+def _check_core_imports() -> None:
+    """BP9 Layer 2b: fail loud at boot if core.db exports are missing.
+
+    Catches the 'release drift' class of bugs (untracked files not deployed)
+    at container start time instead of silently at periodic-task runtime.
+    """
+    import core.db as _db
+    missing = [n for n in _db.__all__ if not hasattr(_db, n)]
+    if missing:
+        raise ImportError(
+            f"core.db is missing required exports: {missing}. "
+            "Apply pending migrations and rebuild the image."
+        )
+
+
+_check_core_imports()
+
 # Build the main bot application once at startup.
 tg_app = build_application()
 # Optional admin bot (only if a token is configured).

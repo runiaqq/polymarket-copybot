@@ -1,8 +1,47 @@
 import ssl
 
+import structlog
 from celery import Celery
+from celery.signals import task_failure
 
 from core.config import settings
+
+_log = structlog.get_logger(__name__)
+
+
+def _check_core_imports() -> None:
+    """BP9 Layer 2b: fail loud at worker boot if core.db exports are missing."""
+    import core.db as _db
+    missing = [n for n in _db.__all__ if not hasattr(_db, n)]
+    if missing:
+        raise ImportError(
+            f"core.db is missing required exports: {missing}. "
+            "Apply pending migrations and rebuild the image."
+        )
+
+
+_check_core_imports()
+
+# BP9 Layer 2c: periodic tasks whose failure must be escalated immediately.
+_CRITICAL_PERIODIC_TASKS = {
+    "worker.tasks.backfill_legacy_redemptions",
+    "worker.tasks.reconcile_settlements",
+    "worker.tasks.sync_positions",
+    "worker.tasks.monitor_deposits",
+}
+
+
+@task_failure.connect
+def on_task_failure(sender=None, task_id=None, exception=None, **kwargs):
+    task_name = getattr(sender, "name", str(sender))
+    if task_name not in _CRITICAL_PERIODIC_TASKS:
+        return
+    _log.error(
+        "periodic_task_failure_alert",
+        task=task_name,
+        task_id=task_id,
+        exc=str(exception),
+    )
 
 _redis_url = settings.redis_url
 

@@ -94,25 +94,42 @@ def sync_positions() -> dict:
                 cur = float(p.get("cur_price") or 0)
                 pnl = p.get("cash_pnl", 0)
                 won = cur >= 0.5
-                if _notify_once(f"settle:{uid}:{condition_id}"):
-                    if won:
+
+                if won and settings.auto_redeem_enabled:
+                    # BP9 Layer 3: claim the redeem slot first so we know whether
+                    # a concurrent process (reconcile_settlements) is already
+                    # handling this — if so, skip the pending message entirely to
+                    # avoid an out-of-order "processing…" after "зачислено".
+                    redeem_claimed = _notify_once(f"redeem:{uid}:{condition_id}")
+                    if _notify_once(f"settle:{uid}:{condition_id}"):
+                        if redeem_claimed:
+                            # We own the redeem — send the pending message.
+                            # Final "✅ Выигрыш зачислен" comes from redeem_position.
+                            _emit_win_pending(tg, p.get("title"), p.get("outcome"),
+                                             event_slug=p.get("event_slug"))
+                        # else: another process already dispatched and may have
+                        # sent the final notification — stay silent.
+                        actions += 1
+                    if redeem_claimed:
+                        redeem_position.delay(
+                            uid, token_id, condition_id,
+                            bool(p.get("neg_risk", False)), p.get("outcome"),
+                            p.get("title"), p.get("event_slug"),
+                            p.get("outcome_index"),
+                        )
+                        actions += 1
+                elif won:
+                    # auto_redeem disabled: send the terminal win notification
+                    # with a manual-claim instruction (no on-chain tx expected).
+                    if _notify_once(f"settle:{uid}:{condition_id}"):
                         _emit_win(tg, p.get("title"), p.get("outcome"), pnl,
                                   claimable=True, event_slug=p.get("event_slug"))
-                    else:
+                        actions += 1
+                else:
+                    if _notify_once(f"settle:{uid}:{condition_id}"):
                         _emit_loss(tg, p.get("title"), p.get("outcome"), pnl,
                                    event_slug=p.get("event_slug"))
-                    actions += 1
-                # Auto-redeem winnings into pUSD (separate guard so a prior
-                # notification doesn't block the on-chain redeem).
-                if (won and settings.auto_redeem_enabled
-                        and _notify_once(f"redeem:{uid}:{condition_id}")):
-                    redeem_position.delay(
-                        uid, token_id, condition_id,
-                        bool(p.get("neg_risk", False)), p.get("outcome"),
-                        p.get("title"), p.get("event_slug"),
-                        p.get("outcome_index"),
-                    )
-                    actions += 1
+                        actions += 1
                 continue
 
             # ── Hold-to-resolution strategy ───────────────────────────────
@@ -164,15 +181,58 @@ def sync_positions() -> dict:
             resolved_loss = cur <= 0.02
             if not (resolved_win or resolved_loss):
                 continue  # mid-market sell (TP/SL/manual) — already notified at close
-            if not _notify_once(f"settle:{uid}:{c['condition_id']}"):
-                continue
-            if resolved_win:
-                _emit_win(tg, c.get("title"), c.get("outcome"), c.get("realized_pnl", 0),
-                          event_slug=c.get("event_slug"))
+            cond_id = c["condition_id"]
+
+            if resolved_win and settings.auto_redeem_enabled:
+                # BP9 Layer 3: this branch caused the prod bug (sent "выиграно"
+                # with no corresponding redeem dispatch).  Same guard logic as the
+                # redeemable branch: claim redeem slot first, then send pending.
+                redeem_claimed = _notify_once(f"redeem:{uid}:{cond_id}")
+                if _notify_once(f"settle:{uid}:{cond_id}"):
+                    if redeem_claimed:
+                        _emit_win_pending(tg, c.get("title"), c.get("outcome"),
+                                         event_slug=c.get("event_slug"))
+                    actions += 1
+                if redeem_claimed:
+                    # Try to look up ledger fields and dispatch the redeem.
+                    # Falls back to backfill_legacy_redemptions for legacy rows
+                    # with NULL token_id (those have no ledger entry).
+                    try:
+                        from core.db import get_supabase as _gsb
+                        _sb = _gsb()
+                        _tr = (
+                            _sb.table("copy_trades")
+                            .select("id,token_id,neg_risk,outcome_index")
+                            .eq("user_id", uid)
+                            .eq("condition_id", cond_id)
+                            .eq("status", "confirmed")
+                            .is_("redeemed_at", "null")
+                            .limit(1)
+                            .execute()
+                        )
+                        _row = (_tr.data or [None])[0]
+                        if _row and _row.get("token_id"):
+                            redeem_position.delay(
+                                uid, _row["token_id"], cond_id,
+                                bool(_row.get("neg_risk", False)),
+                                c.get("outcome"), c.get("title"), c.get("event_slug"),
+                                _row.get("outcome_index"),
+                            )
+                            actions += 1
+                    except Exception:
+                        log.warning("closed_win_redeem_dispatch_failed",
+                                    user_id=uid, cond=cond_id[:14])
+            elif resolved_win:
+                # auto_redeem disabled — terminal notification with manual-claim note.
+                if _notify_once(f"settle:{uid}:{cond_id}"):
+                    _emit_win(tg, c.get("title"), c.get("outcome"),
+                              c.get("realized_pnl", 0), event_slug=c.get("event_slug"))
+                    actions += 1
             else:
-                _emit_loss(tg, c.get("title"), c.get("outcome"), c.get("realized_pnl", 0),
-                           event_slug=c.get("event_slug"))
-            actions += 1
+                if _notify_once(f"settle:{uid}:{cond_id}"):
+                    _emit_loss(tg, c.get("title"), c.get("outcome"),
+                               c.get("realized_pnl", 0), event_slug=c.get("event_slug"))
+                    actions += 1
 
         # ── BP4/BP8: update HWM + check circuit breakers (cost-basis equity) ────
         try:
@@ -493,6 +553,15 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
         return {"redeemed": True, "credited": credited}
     except Exception as exc:
         log.exception("redeem_failed", user_id=user_id, token=token_id[:14])
+        # BP9 Layer 3: on final retry exhaustion, tell the user their credit is
+        # delayed rather than leaving them with only the pending message.
+        if self.request.retries >= self.max_retries:
+            try:
+                tg_id = user.get("telegram_id")
+                if tg_id:
+                    _emit_win_retry_failed(tg_id, title, outcome, event_slug)
+            except Exception:
+                pass
         raise self.retry(exc=exc)
 
 
@@ -571,6 +640,38 @@ def _emit_loss(telegram_id: int, title: str | None, outcome: str | None,
         f"📌 {(title or '—')[:50]}\n"
         f"🎯 Исход: <b>{outcome or '—'}</b>\n"
         f"📉 Результат: <b>{pnl:+.2f}$</b>"
+        f"{_event_link(event_slug)}",
+    )
+
+
+def _emit_win_pending(telegram_id: int, title: str | None, outcome: str | None,
+                      event_slug: str | None = None) -> None:
+    """BP9 Layer 3 — interim 'processing' notification sent at resolution detection.
+
+    The final '✅ Выигрыш зачислен' comes only from redeem_position after the
+    on-chain tx + pUSD balance change are confirmed.  Never call _emit_win from a
+    branch that also dispatches auto-redeem — this is the replacement.
+    """
+    _notify(
+        telegram_id,
+        f"🏁 <b>Событие выиграно — оформляю зачисление</b>\n\n"
+        f"📌 {(title or '—')[:50]}\n"
+        f"🎯 Исход: <b>{outcome or '—'}</b>\n"
+        f"⏳ Средства будут зачислены после подтверждения on-chain транзакции."
+        f"{_event_link(event_slug)}",
+    )
+
+
+def _emit_win_retry_failed(telegram_id: int, title: str | None, outcome: str | None,
+                           event_slug: str | None = None) -> None:
+    """BP9 Layer 3 — sent when redeem_position exhausts all retries without success."""
+    _notify(
+        telegram_id,
+        f"⏳ <b>Выигрыш определён, зачисление задерживается</b>\n\n"
+        f"📌 {(title or '—')[:50]}\n"
+        f"🎯 Исход: <b>{outcome or '—'}</b>\n"
+        f"Повторяем попытку автоматически. Если баланс не изменится в течение "
+        f"нескольких минут — обратись в поддержку."
         f"{_event_link(event_slug)}",
     )
 
@@ -661,6 +762,14 @@ def reconcile_settlements() -> dict:
                             continue
                     except Exception:
                         log.warning("reconcile_dust_check_failed", user_id=uid)
+
+                # BP9 Layer 3: send pending notification before dispatching so the
+                # user knows resolution was detected (final "зачислено" comes from
+                # redeem_position after the on-chain tx confirms).
+                if _notify_once(f"settle:{uid}:{cond}"):
+                    _resolve_user_for_notification(
+                        sb, uid, cond, won=True, entry_cost=entry_cost, pending=True
+                    )
 
                 redeem_position.delay(
                     uid, token_id, cond, neg_risk,
@@ -827,11 +936,16 @@ def backfill_legacy_redemptions() -> dict:
 
 
 def _resolve_user_for_notification(sb, uid: int, cond: str,
-                                   won: bool, entry_cost: float) -> None:
+                                   won: bool, entry_cost: float,
+                                   pending: bool = False) -> None:
     """Load the user record and send a win/loss notification.
 
     Blueprint 6: hydrates title/outcome from trade_signals via the copy_trades
     ledger so the notification always carries a human-readable market name.
+
+    BP9 Layer 3: when pending=True and won=True, sends _emit_win_pending instead
+    of the terminal _emit_win, so the final "зачислено" is reserved for
+    redeem_position after the on-chain tx confirms.
     """
     try:
         res = sb.table("users").select("telegram_id").eq("id", uid).maybe_single().execute()
@@ -861,7 +975,9 @@ def _resolve_user_for_notification(sb, uid: int, cond: str,
         except Exception:
             pass
 
-        if won:
+        if won and pending:
+            _emit_win_pending(tg, title, None)
+        elif won:
             _emit_win(tg, title, None, entry_cost)
         else:
             _emit_loss(tg, title, None, -entry_cost)

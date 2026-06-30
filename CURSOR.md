@@ -263,6 +263,14 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   set their own size → stay silent). `result_expires=3600` added to Celery to prevent
   `celery-task-meta-*` key explosion in Redis. No new migration required.
 
+- **[BP9] Release-integrity: fail-loud architecture + money-safety win invariant**:
+  global PTB error handler on both bots (`add_error_handler`) converts silent dead buttons
+  into logged + user-visible fallbacks; boot self-check (`_check_core_imports`) fails the
+  container immediately if `core.db` exports are missing; Celery `task_failure` signal
+  escalates crashed periodic tasks; `_emit_win_pending` + `_emit_win_retry_failed` replace
+  false-success notifications — "✅ Выигрыш зачислен" is only ever sent after the
+  `redeemPositions` + `convert_dw_usdce_to_pusd` batch confirms on-chain.
+
 ---
 
 ## 4. Known Bugs & Missing Features
@@ -300,6 +308,18 @@ code MUST follow §5 (idempotency, fail-closed, key safety).
 > and adds a **manual "🔓 Снять блокировку" inline button** with consent audit trail.
 > **Migration 013 applied** (`risk_state`, `risk_override_at`, `risk_override_count`,
 > `realized_baseline` columns on `users`).
+>
+> ✅ **Blueprint 9 is IMPLEMENTED** — three-layer fix for the live-test prod failures
+> caused by **release drift**: **(Layer 1)** working-tree untracked files committed and
+> deployed (no `settings` shadow in `callback_handler`, `has_terminal_trade` exported
+> from `core.db`); **(Layer 2)** fail-loud architecture: global PTB `add_error_handler`
+> on both bots, boot self-check `_check_core_imports()` in api+worker, `task_failure`
+> Celery signal escalating crashed periodic tasks; **(Layer 3)** money-safety invariant:
+> `_emit_win_pending` replaces false-success `_emit_win` at resolution detection in all
+> three paths (`sync_positions` redeemable branch, closed-positions branch,
+> `reconcile_settlements`), final "✅ Выигрыш зачислен" fires only from `redeem_position`
+> after on-chain tx + pUSD balance change confirmed, retry-exhausted sends
+> `_emit_win_retry_failed`. No new migration required.
 
 ---
 
@@ -1308,6 +1328,135 @@ are reused unchanged.)
   (`risk_override_at`, `risk_override_count`), clears the pause, returns `risk_state`
   to `active`, and re-arms the breaker from the new baseline; the action is logged and
   the message updates in place. Behaviour is restart-safe (state in the DB, not Redis).
+
+---
+
+### Blueprint 9 — Release-integrity RCA: silent callback crash + dead redemption safety-net ✅ IMPLEMENTED
+
+**Symptoms (live test, real funds):**
+1. **Telegram navigation dead.** From any deeper screen (settings / positions / wallet),
+   tapping "🏠 Главное меню" does nothing — the bot ignores the press, no return to root.
+2. **Late resolve + no claim.** A resolved Polymarket event sent "Событие выиграно! +1.25$"
+   only ~24 h later, and **no USDC was credited** (deposit-wallet balance unchanged).
+
+**✅ Confirmed by production logs (2026-06-29), do NOT re-diagnose from symptoms:**
+```
+# api container — once PER button press, swallowed (no error handler):
+No error handlers are registered, logging exception.
+  File "/app/api/routers/telegram.py", line 1169, in callback_handler
+    if not settings.auto_copy_enabled:
+UnboundLocalError: cannot access local variable 'settings' where it is not associated with a value
+
+# worker container — every 600 s:
+Task worker.tasks.backfill_legacy_redemptions ... raised unexpected:
+  ImportError("cannot import name 'has_terminal_trade' from 'core.db' (/app/core/db/__init__.py)")
+reconcile_settlements_done   checked=6 processed=0          # runs, but redeems nothing
+# beat schedules every task correctly; all 4 containers Up; redis healthy.
+```
+
+**Infra reminder:** this stack is **Docker Compose, not PM2** (§7.1). Diagnose with
+`docker compose logs --no-color {api|worker|beat}`, not `pm2 logs`.
+
+#### Root cause — two code defects, one shared meta-cause (RELEASE DRIFT)
+
+The running images execute **older code than the working tree**. Both fixes already exist
+locally but were never committed / pushed / rebuilt, so `git pull` + `docker compose build`
+on the VPS baked the stale versions. Evidence: `core/db/__init__.py` **already exports**
+`has_terminal_trade` locally (lines 19/63) yet the container throws `ImportError`; and
+`callback_handler` already carries the comment *"settings is already imported at module
+level — no local re-import"* (`telegram.py:1579`) yet the container still shadows it. The
+relevant files show as **untracked** in `git status` (`core/db/queries.py`, `core/risk.py`,
+`core/config.py`, `api/routers/telegram.py`, `worker/tasks/manage_positions.py`,
+`worker/tasks/execute_copy.py`, `migrations/013_*`).
+
+**Defect A (Problem 1) — `settings` shadowed as a function-local.**
+Python binds a name as **function-local for the entire scope** if it is assigned/imported
+*anywhere* in that function. The deployed `callback_handler` re-imports `settings`
+(`from core.config import settings`) inside one of its branches, so the **first** read at
+`telegram.py:1169` (`if not settings.auto_copy_enabled:`, the `data == "menu"` branch)
+raises `UnboundLocalError`. Because `query.answer()` already fired (`:1159`) **and there is
+no `app.add_error_handler`** (`:359-377`), the exception is logged by PTB and the user just
+sees a dead button. This breaks **every** callback path that touches `settings`
+(menu / help / wallet / …), not only "Главное меню". The FSM hypothesis is wrong — there is
+no `ConversationHandler`; navigation is a single global `CallbackQueryHandler`.
+
+**Defect B (Problem 2) — the on-chain redemption safety-net is dead, and the win
+notification is decoupled from the actual claim.**
+1. `backfill_legacy_redemptions` (the catch-all that redeems neg-risk/legacy winners the
+   Data API hides) imports `has_terminal_trade` from `core.db`
+   (`manage_positions.py:740`), which the **deployed** `core/db/__init__.py` does not export
+   → `ImportError` on **every** run → the task never does anything.
+2. `reconcile_settlements` runs but `processed=0` (the 6 outstanding rows are not detected as
+   resolved on-chain via `is_condition_resolved`, `manage_positions.py:614`).
+3. The Data-API `redeemable` branch in `sync_positions` never fires for neg-risk (Blueprint 1).
+4. The only path that *did* fire was `sync_positions`' **closed-positions branch**
+   (`manage_positions.py:159-175`): it sends `_emit_win` (the "+$1.25") **but never dispatches
+   a redeem**. That is where the late, content-rich message came from (~1 day later, when the
+   position finally surfaced as closed in the Data API).
+5. **Net:** no `redeemPositions` tx was ever sent → balance unchanged, exactly the symptom.
+
+**Secondary defect (money-safety, independent of the deploy gap).** In `sync_positions`
+(`:97-115`) the win **notification** and the **redeem** dispatch sit behind *separate* Redis
+guards (`settle:` vs `redeem:`), and the closed-positions branch notifies with **no** redeem
+at all. So a "выиграно" message is **never proof of an on-chain credit** — the core invariant
+this blueprint must restore.
+
+#### Design — three layers (do all three; Layer 1 is the hotfix, 2–3 are the architecture)
+
+**Layer 1 — Immediate correctness (commit + redeploy the working tree).**
+- Ensure `callback_handler` has **no** function-local rebinding of `settings`; rely on the
+  module-level import (`telegram.py:16`). (Working tree already correct.)
+- Ensure `has_terminal_trade` (+ `get_open_trade_by_token`, `mark_trade_closed`,
+  `get_open_trades_cost`, …) exist in `core/db/queries.py` **and** are listed in
+  `core/db/__init__.__all__`. (Working tree already correct.)
+- Commit the untracked files, push, apply any unapplied migrations (008–012 per §7.4), then
+  `docker compose build --no-cache api worker beat && docker compose up -d`.
+
+**Layer 2 — Fail-loud, never-silent (the architectural fix that would have caught both).**
+- **(2a) Global PTB error handler.** Register `app.add_error_handler(on_error)` on **both**
+  bots. Log structured (`telegram_callback_error`, `data`, `user_id`) and reply with a safe
+  fallback ("⚠️ Что-то пошло не так — открой /start"), so a handler exception can never again
+  produce a silent dead button. Converts Problem 1 from invisible to logged + recoverable.
+- **(2b) Import-time integrity self-check.** At api/worker boot **and** in CI, import every
+  task module and assert that all names in `core.db.__all__` resolve
+  (`python -c "import worker.tasks, api.routers.telegram"`). A missing export then fails the
+  container HEALTHCHECK / CI **loudly at deploy time**, instead of crashing one periodic task
+  forever. Prefer module-top imports over per-function `from core.db import …` so an
+  ImportError surfaces at import, not silently per-run.
+- **(2c) Crashed-periodic-task alerting.** A Celery `task_failure` signal handler (or a beat
+  watchdog) escalates when a periodic task — especially `backfill_legacy_redemptions` /
+  `reconcile_settlements` — raises repeatedly, so a dead safety-net pages us within minutes
+  instead of rotting silently for a day.
+
+**Layer 3 — Couple the win message to a CONFIRMED on-chain credit (money-safety invariant).**
+- **Never** send "Выигрыш зачислён +$X" until `redeem_winnings` **and**
+  `convert_dw_usdce_to_pusd` have **confirmed** (a tx hash + observed pUSD balance delta).
+- On resolution detection, send an interim "🏁 Событие выиграно — оформляю зачисление…"
+  (pending); send the final "✅ Выигрыш зачислён: +$X (pUSD)" **only** after the redeem+wrap
+  relayer batch confirms. On failure, send "⏳ Выигрыш определён, зачисление задерживается —
+  повторяю" and keep the row in the outstanding queue for idempotent retry — never a false
+  success.
+- Concretely: move the terminal win emit **into `redeem_position` after `redeem_done`**
+  (gate it on `mark_trade_settled` success), and make `sync_positions`' closed-positions
+  branch (`:159-175`) **not** emit a terminal win without also ensuring redemption
+  (dispatch `redeem_position` / leave to reconcile). Keep `notify_once`/`claim` dedup so
+  retries never double-notify. Result: **notification ⟺ credited**, always.
+
+**Files:** `api/routers/telegram.py` (error handler; verify no `settings` shadow),
+`api/main.py` + `worker/entrypoint.py` (boot self-check / healthcheck), `core/db/__init__.py`
+(verify exports), `worker/tasks/manage_positions.py` (win emit moved post-redeem;
+closed-branch must not falsely claim a win), `worker/celery_app.py` (`task_failure` alert
+hook). **No new migration required.**
+
+**Acceptance:**
+- Every inline button works; any future handler exception shows a fallback **and** a
+  structured log — never a dead button.
+- A missing `core.db` export (or any task-module ImportError) **fails CI / the container
+  healthcheck at deploy**, and pages on repeated runtime failure; the redemption safety-net
+  can never again be silently disabled.
+- A won position credits pUSD on-chain (**confirmed tx**) **before** any "зачислён" message;
+  on redeem failure the user sees a pending/retry state, never a false success; **no win
+  notification is ever sent without a corresponding confirmed credit.**
 
 ---
 
