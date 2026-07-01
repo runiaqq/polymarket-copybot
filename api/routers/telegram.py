@@ -2171,6 +2171,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception:
             _log.warning("unlock_drawdown_override_record_failed", user_id=uid)
 
+        # ── Step 3b: Blueprint 17.B — set self-expiring override flag ────────
+        # Persists risk_override_until = next 00:00 UTC so the monitor cannot
+        # re-trip either breaker for the rest of the UTC day, even though the
+        # daily-loss counter is still > 0.
+        try:
+            from core.db import set_risk_override_until
+            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+            _next_midnight = (
+                _dt.now(_tz.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+                + _td(days=1)
+            ).isoformat()
+            set_risk_override_until(uid, _next_midnight)
+            _log.info("risk_override_until_set", user_id=uid, until=_next_midnight)
+        except Exception:
+            _log.warning("unlock_drawdown_override_until_failed", user_id=uid)
+
         try:
             from core.db import set_risk_state
             set_risk_state(uid, "active")
@@ -2198,7 +2214,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(
             "✅ <b>Блокировка снята. Ты берёшь риск на себя.</b>\n\n"
             f"{equity_line}"
-            "Копирование возобновлено. Риск-защита снова активна от этого уровня.",
+            "Копирование возобновлено. Защита по дневному лимиту отключена "
+            "<b>до 00:00 UTC</b> — после полуночи риск-менеджер снова включится автоматически.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🏠 Главное меню", callback_data="menu")

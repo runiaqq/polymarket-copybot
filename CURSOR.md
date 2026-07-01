@@ -308,6 +308,25 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   `withdrawable_usdc`, pre-flight amount validation, confirm step kept. `min_withdraw_usdc`
   config constant added. No new migration required.
 
+- **[BP17] Spread-Trap stop-loss hardening + Broken-Override state reset** (2026-07-02):
+  **(A — Spread Trap)** Four-layer Delta-Drop hardening in `manage_positions.py`: Layer 1 —
+  drop computed from mid `(bid+ask)/2` instead of raw best_bid; Layer 2 — spread veto skips
+  the stop when `(ask-bid)/mid > max_spread_for_stop_pct (0.08)`, logging
+  `stop_skipped_wide_spread`; Layer 3 — optional bid-vs-bid comparison using `entry_bid`
+  persisted at fill time; Layer 4 — persistence debounce requires `delta_drop_confirm_ticks
+  (2)` consecutive breaching polls, logging `delta_drop_confirming` on unconfirmed ticks.
+  Hold-time anchor moved from in-process `_first_seen` dict to `copy_trades.created_at`
+  (survives worker restarts); `delta_drop_min_hold_sec` raised 600 → 900 s. Five new config
+  knobs in `core/config.py`. Migration `016_entry_bid.sql` adds `copy_trades.entry_bid`.
+  **(B — Broken Override)** `risk_override_until timestamptz` added to `users`
+  (migration 016). `unlock_drawdown` handler now sets this flag to next 00:00 UTC via
+  `set_risk_override_until`. The `_update_hwm_and_check_breakers` monitor returns immediately
+  while the flag is active, suppressing both the drawdown and daily-loss breakers. The
+  `execute_copy` pre-trade path passes `daily_pnl=0` to `check_risk_gates` while the override
+  is active, so gate 4 does not block new entries. Confirmation message updated to state
+  "принято до 00:00 UTC". Two new DB helpers (`get_risk_override_until`,
+  `set_risk_override_until`) exported from `core/db`.
+
 ---
 
 ## 4. Known Bugs & Missing Features
@@ -3321,3 +3340,276 @@ silently → the interim `status='placed'` transition never persists (the row st
 the later `confirmed`/`unfilled` update, which omits `order_id`, succeeds). Not part of Blueprint 16;
 file as a follow-up (either add an `order_id text` column via migration, or drop the field from the
 write). Flagging so it is not lost.
+
+---
+
+## Blueprint 17 — Spread-Trap stop-loss hardening + Broken-Override state reset ✅ IMPLEMENTED 2026-07-02
+
+Two independent prod risk-manager defects, designed together because both live in the risk/exit
+path and share the same monitor (`sync_positions` → `_update_hwm_and_check_breakers`) and the same
+override button (`callback_data="unlock_drawdown"`).
+
+- **17.A — Spread Trap:** the Delta-Drop stop fires within minutes of entry on illiquid markets,
+  closing profitable/neutral positions at a loss because it compares the **ask-based fill price**
+  against the **live best_bid** across a wide spread — measuring the spread, not a real move.
+- **17.B — Broken Override State:** the manual "Снять блокировку" handler lifts the pause and resets
+  the HWM baseline but **never neutralizes the daily-loss counter**, so the next monitor cycle
+  re-trips `paused_daily_loss` and re-locks the user in a loop, with no new losing trades.
+
+### 17.1 Root cause — 17.A (Spread Trap)
+
+`worker/tasks/manage_positions.py` (BP10 Delta-Drop block, L166–195):
+
+```183:195:worker/tasks/manage_positions.py
+            # Delta-Drop trigger: exit if best_bid fell >= X from entry.
+            if entry_px > 0 and best_bid > 0:
+                drop_pct = 1.0 - best_bid / entry_px
+                if drop_pct >= settings.delta_drop_stop_pct:
+                    log.info("delta_drop_triggered", ...)
+                    _closing.add(ckey)
+                    close_position.delay(uid, token_id, "delta_drop_stop")
+```
+
+- `entry_px = float(p.get("avg_price"))` — the Data-API cost basis, i.e. we **bought at the ask**
+  (`execute_copy` sets `entry_price = book["best_ask"]`, L368–373).
+- `best_bid` — the **live top-of-book bid** from `get_order_book(token_id)`.
+
+On an illiquid binary market the resting spread is enormous (buy fills at ask `0.80`, the best
+standing bid is `0.50`). `drop_pct = 1 - 0.50/0.80 = 0.375 ≥ 0.30` → **instant stop**, even though
+the market's fair value (mid ≈ `0.65`) hasn't moved and the probability hasn't fallen. We are
+measuring the **bid-ask spread**, not a drop in win probability, then crystallising it as a real
+loss by market-selling into that same thin bid.
+
+The existing `delta_drop_min_hold_sec = 600` (10 min) guard does **not** save us: the spread is
+present from t=0 and persists, so the drop is still there after the hold window expires. And
+`_first_seen` is an in-process dict that **resets on worker restart** (L32–34), so a restart can
+make an old position instantly "mature" and eligible.
+
+### 17.2 Design — 17.A Spread-Trap defense (layered, defense-in-depth)
+
+The stop must trigger on a **real fall in fair value**, not on an empty book. Four layers; ship all
+of them (cheap, independent, each closes a different failure mode):
+
+**Layer 1 — Measure drop from MID, not from best_bid.**
+`get_order_book` already returns `best_bid` **and** `best_ask`. Compute
+`mid = (best_bid + best_ask) / 2` and `drop_pct = 1 - mid/entry_px`. Mid is spread-insensitive:
+a hollow bid with a sane ask no longer fabricates a drop. Fall back to best_bid only if `best_ask`
+is missing/zero (and in that case Layer 2 will veto anyway).
+
+**Layer 2 — Spread / liquidity gate (veto).**
+Before trusting *any* stop signal, compute `spread_pct = (best_ask - best_bid) / mid`. If
+`spread_pct > settings.max_spread_for_stop_pct` (proposed `0.08`), the book is too thin to be a
+reliable price source → **skip the stop this cycle** and log `stop_skipped_wide_spread`
+(user_id, token, best_bid, best_ask, spread_pct). Optionally also require a minimum bid size/notional
+(`min_bid_notional_usdc`) if depth is available from the book. This is the single highest-leverage
+fix: it directly rejects the Spread-Trap condition.
+
+**Layer 3 — Entry-anchored bid baseline (reference the book we actually entered against).**
+Persist the CLOB `best_bid` observed **at buy time** as `copy_trades.entry_bid` (written in
+`execute_copy` next to `entry_price`). Then the "real move" test becomes
+`drop_from_entry_bid = 1 - best_bid/entry_bid` — a like-for-like bid-vs-bid comparison that is
+immune to the ask-vs-bid spread asymmetry entirely. Fire the stop only when **both** the mid-based
+drop (Layer 1) *and* the entry-bid-based drop clear the threshold. (If `entry_bid` is NULL for
+legacy rows, gracefully skip this leg and rely on Layers 1+2+4.)
+
+**Layer 4 — Persistence / debounce + robust cooldown.**
+- Require the drop to persist across **N consecutive polls** (`delta_drop_confirm_ticks`, proposed
+  `2`) before closing — a single hollow-book snapshot never triggers. Track a small per-token
+  breach counter (in-process is fine; a transient false reading simply resets it).
+- Anchor min-hold to the **trade's real age**, not the in-process `_first_seen` dict: read
+  `copy_trades.created_at` for the token and enforce `age >= delta_drop_min_hold_sec`. Bump the
+  window to **900s (15 min)** per the incident. This survives worker restarts (the current dict does
+  not).
+
+**Recommended shipping combination:** Layer 2 (spread veto) + Layer 1 (mid) are mandatory and
+sufficient to kill the reported symptom; Layers 3 + 4 make it robust and calibratable. `hard_stop`
+(absolute floor at `0.07`) stays as-is — it is a true "market has abandoned this outcome" net and is
+not spread-sensitive at that price.
+
+### 17.3 Config knobs — 17.A (add to `core/config.py`)
+
+| Setting | Proposed default | Meaning |
+|---|---|---|
+| `max_spread_for_stop_pct` | `0.08` | above this (`(ask-bid)/mid`) the book is untrustworthy → skip stop |
+| `delta_drop_use_mid` | `True` | measure drop from mid instead of best_bid |
+| `delta_drop_confirm_ticks` | `2` | consecutive breaching polls required before closing |
+| `delta_drop_min_hold_sec` | `900` | raise from 600 → 15 min, anchored to `created_at` |
+| `min_bid_notional_usdc` | `0` (opt-in) | optional depth floor before trusting the bid |
+
+### 17.4 Files touched — 17.A
+
+| File | Change |
+|---|---|
+| `worker/tasks/manage_positions.py` | Delta-Drop block: fetch `best_ask`; compute `mid` + `spread_pct`; add spread veto (Layer 2), mid drop (Layer 1), entry-bid drop (Layer 3), persistence counter + `created_at`-anchored hold (Layer 4); new log events `stop_skipped_wide_spread`, `delta_drop_confirming` |
+| `worker/tasks/execute_copy.py` | Persist `entry_bid` (CLOB best_bid at fill) alongside `entry_price` |
+| `core/config.py` | Add the five knobs in §17.3 |
+| `core/db/queries.py` | `get_open_trade_by_token` / cost helper: also return `created_at`, `entry_bid` |
+| `migrations/016_entry_bid.sql` | `alter table copy_trades add column if not exists entry_bid double precision;` |
+
+### 17.5 Acceptance criteria — 17.A
+
+1. A position bought at ask `0.80` with a resting bid `0.50` and ask `0.80` (mid `0.65`, spread
+   `~0.46`) is **NOT** closed: the spread veto (Layer 2) skips it and logs `stop_skipped_wide_spread`.
+2. A position whose **mid** genuinely falls ≥30% from entry across ≥2 polls on a tight book (spread
+   < 8%) **is** closed with `reason="delta_drop_stop"` — real stops still work.
+3. No stop can fire before `created_at + 900s`, and this holds **across a worker restart**.
+4. `hard_stop` behaviour at `< 0.07` is unchanged.
+
+---
+
+### 17.6 Root cause — 17.B (Broken Override State / cyclic re-lock)
+
+The monitor re-pauses on daily loss using a counter the override never touches:
+
+```1138:1147:worker/tasks/manage_positions.py
+        # ── Daily loss limit ──────────────────────────────────────────────────
+        daily_pnl = get_daily_realized_pnl(uid)
+        if daily_pnl <= -(settings.daily_loss_limit_pct * equity):
+            ...
+            pause_user_copying(uid, next_utc_day)
+            set_risk_state(uid, "paused_daily_loss")
+```
+
+`get_daily_realized_pnl` sums `copy_trades.realized_pnl` over the trailing 24h (queries.py L515–529).
+The `unlock_drawdown` handler (`api/routers/telegram.py` L2117+) does:
+`resume_user_copying` (clears `copy_paused_until`) → `reset_risk_baseline` (resets `equity_hwm` +
+`realized_baseline`, fixing **only** the *drawdown* breaker) → `record_risk_override` (audit) →
+`set_risk_state("active")` → deletes Redis keys `drawdown_alert` / `risk_gate:*:drawdown` /
+`resume_alert`.
+
+**Nothing resets or masks the daily-loss sum.** So on the next `sync_positions` (seconds later):
+`current_state` is now `active` (the guard `if current_state in (paused_*): return` no longer
+short-circuits) → `daily_pnl` is still the same large negative number → the daily-loss branch
+re-fires, re-pauses, and re-sends the alert. Infinite re-lock, zero new losing trades. (The
+`daily_loss` alert has no `notify_once` guard — it relied on the state machine that the override just
+cleared.)
+
+### 17.7 Design — 17.B State Reset (hard, self-expiring override flag)
+
+Adopt the user-proposed **`manual_override_until_midnight_utc`** as a first-class, hard-respected
+flag. This is preferred over "zero the counter" because (a) it is self-documenting, (b) it expires
+exactly when the daily-loss window rolls over (00:00 UTC), matching daily-loss semantics, and (c) it
+also protects the drawdown breaker from an immediate re-trip while equity is still depressed.
+
+**Schema (migration 016):**
+`alter table users add column if not exists risk_override_until timestamptz;`
+(distinct from the existing `risk_override_at` audit stamp).
+
+**Handler (`unlock_drawdown`, api/routers/telegram.py):** in addition to the current steps, set
+`risk_override_until = next 00:00 UTC` via a new `set_risk_override_until(uid, ts)` query. Keep the
+existing HWM/baseline reset and audit increment.
+
+**Monitor (`_update_hwm_and_check_breakers`):** at the very top, after loading state, add a hard
+guard:
+
+```text
+override = user.get("risk_override_until")
+if override and now_utc < parse(override):
+    return   # user explicitly accepted risk for the rest of the UTC day — do NOT re-pause
+# (optional) if override elapsed, clear it and continue normally
+```
+
+This suppresses **both** breakers for the remainder of the UTC day, so no re-lock is possible. At
+midnight UTC the flag lapses and normal protection resumes automatically.
+
+**Pre-trade path (`execute_copy.check_risk_gates` caller, L400–411):** honor the same flag so the
+user can actually open trades after overriding. Either skip gate 4 (daily loss) when the override is
+active, or pass an `override_active: bool` into `check_risk_gates` and short-circuit gate 4 there.
+The pure `check_risk_gates` stays pure — the caller reads `risk_override_until` and decides.
+
+**Precise alternative (documented, not required):** instead of a blanket flag, snapshot
+`daily_loss_baseline = get_daily_realized_pnl(uid)` at override time and change the gate to compare
+`(daily_pnl - daily_loss_baseline)` against the limit, so **only losses booked *after* the override**
+count. This re-arms protection intra-day (stricter) but adds a column + baseline-reset-at-midnight
+logic. The flag approach is simpler and safer for the reported bug; ship the flag, keep this as a
+future tightening.
+
+### 17.8 Files touched — 17.B
+
+| File | Change |
+|---|---|
+| `migrations/016_entry_bid.sql` | also add `users.risk_override_until timestamptz` (combined migration) |
+| `core/db/queries.py` | **+** `set_risk_override_until(user_id, ts)`, `get_risk_override_until(user_id)`; export both |
+| `core/db/__init__.py` | re-export the two helpers (import block **and** `__all__` — BP12-A guard) |
+| `api/routers/telegram.py` | `unlock_drawdown`: set `risk_override_until = next UTC midnight`; message copy: "принято до 00:00 UTC" |
+| `worker/tasks/manage_positions.py` | `_update_hwm_and_check_breakers`: top-of-function hard guard that returns while override is active (covers drawdown **and** daily-loss) |
+| `worker/tasks/execute_copy.py` | pre-trade: honor override — skip gate-4 daily-loss block when `risk_override_until` is in the future |
+
+### 17.9 Acceptance criteria — 17.B
+
+1. User hits `paused_daily_loss`, taps "Снять блокировку": copying resumes and **stays** active — no
+   re-lock alert on the next `sync_positions` cycle (or any cycle before 00:00 UTC), with no new
+   losing trades.
+2. `risk_override_until` is set to the next 00:00 UTC; after it passes, normal daily-loss/drawdown
+   protection re-arms automatically without code intervention.
+3. While the override is active, `check_risk_gates` does not block new entries on gate 4 (daily loss),
+   but gates 1–3 (exposure/event/drawdown-from-new-baseline) still apply.
+4. The same button correctly clears **both** `paused_drawdown` and `paused_daily_loss` (single handler,
+   flag respected by both breaker branches).
+5. `python -c "from core.db import set_risk_override_until, get_risk_override_until"` succeeds.
+
+### 17.10 Evidence pass (run before coding)
+
+- **17.A:** `grep "delta_drop_triggered" ~/.pm2/logs/*-out.log` — confirm `entry` vs `best_bid` gap is
+  a spread, not a move (cross-check `position_mark` history for the same token; a bid that is hollow
+  from t=0 = trap). Confirms Layer 2 is the right primary fix.
+- **17.B:** for an affected user, verify `copy_paused_until` was cleared by the override yet a fresh
+  `daily_loss_limit_tripped` log line appears seconds later on the next `sync_positions` — that pair is
+  the re-lock signature.
+
+### 17.11 Verification result — prod, 2026-07-01 ✅ BOTH HYPOTHESES CONFIRMED
+
+Runtime is Docker (`app-worker-1` = celery worker running `sync_positions`; `app-api-1` = the
+`unlock_drawdown` handler), **not** pm2. Evidence pulled with `docker logs app-worker-1` /
+`app-api-1`. Note: structlog is emitted at Celery's `WARNING/MainProcess` wrapper level but the inner
+`[info]` events (`position_mark`, `delta_drop_triggered`, …) are intact and parseable.
+
+**17.A — every Delta-Drop stop was a single-cycle bid collapse, not a real move.** Three
+`delta_drop_stop` closes in the window, **all losses**, total ≈ **−$8.52** on high-probability
+(entry 0.88–0.93) positions:
+
+| token | entry | best_bid before (steady, multiple polls) | best_bid @ trigger (one poll) | drop | booked P&L |
+|---|---|---|---|---|---|
+| `77344318364307` (trade 755) | 0.8899 | **0.88** for ≥6 min | **0.13** | 0.854 | **−$5.03** |
+| `10205670933524` (trade 756) | 0.9299 | **0.89–0.90** | **0.65** | 0.301 *(barely over)* | **−$1.77** |
+| `47685817448…` (trade 716)   | — | — | — | — | −$1.72 |
+
+**Control case that proves the mechanism:** token `77893912283105` (entry 0.90) dipped to `0.71`
+(drop `0.211`, *just under* the 0.30 threshold) at 16:08, was therefore **not** stopped, and then
+**fully recovered to `0.999`** over the next ~25 min. The stopped tokens showed the *identical*
+transient-collapse shape — their bid simply cratered for a **single 2-min poll**. This is a hollow
+top-of-book / liquidity flush, not a fall in win probability.
+
+Consequences for the design priority (reordered vs §17.2):
+1. **Layer 4 (persistence/debounce) is now the PRIMARY fix.** Requiring the breach to persist across
+   **≥2 consecutive polls** (`delta_drop_confirm_ticks=2`, ~4 min at the observed 2-min cadence)
+   would have prevented **all three** false stops — the very next poll showed the bid restored to
+   0.88–0.90.
+2. **Layer 2 (spread veto) is co-primary.** At trigger, bid `0.13` against a ~`0.90` ask ⇒
+   `spread_pct ≈ 1.5`; bid `0.65` vs ~`0.92` ask ⇒ `spread_pct ≈ 0.34`. Both are far above the
+   proposed `0.08` cutoff and would be vetoed.
+3. **Layer 1 (mid) alone is INSUFFICIENT** for the 0.13 flush if the ask held (`mid ≈ 0.51`,
+   `drop ≈ 0.43` still fires). Keep mid, but it must be paired with Layers 2+4. `delta_drop_min_hold_sec`
+   was irrelevant here (trades were 20–30 min old) — do not rely on it as the guard.
+
+**17.B — re-lock loop reproduced verbatim.** From `app-worker-1` + `app-api-1`:
+
+```text
+17:00:30  daily_loss_limit_tripped  daily_pnl=-11.66  equity=114.75   ← first daily-loss pause
+23:21:53  risk_override_manual      new_hwm=116.54 old_hwm=128.71     ← user taps "Снять блокировку"
+23:22:30  daily_loss_limit_tripped  daily_pnl=-12.0   equity=116.54   ← RE-LOCK, +37 s
+23:22:55  risk_override_manual      new_hwm=116.54 old_hwm=116.54     ← taps again (HWM no-op)
+23:24:29  daily_loss_limit_tripped  daily_pnl=-12.0   equity=116.54   ← RE-LOCK again
+```
+
+`daily_pnl` is frozen at `-12.0` across both re-locks (no new trades) — a pure "counter/flag never
+reset" defect, exactly §17.6. The override moved the HWM (fixing the *drawdown* breaker) but the
+daily-loss gate reads `get_daily_realized_pnl` which is untouched, and `-12.0 < -(0.10 × 116.54) =
+-11.65` re-trips every cycle. **§17.7's `risk_override_until` flag (respected by the daily-loss
+branch) is confirmed as the correct fix.**
+
+**Cross-defect finding (important):** the `-12.0` daily loss was **substantially manufactured by
+17.A** — the three phantom spread-trap stops booked ≈ **−$8.52** of it. So **17.A is a root cause
+feeding 17.B**: false stops crystallised losses → tripped the daily-loss breaker → the broken
+override couldn't clear it → user locked out. Shipping 17.A materially reduces how often 17.B is even
+reached; ship both, but 17.A is the higher-leverage fix.

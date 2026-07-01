@@ -138,7 +138,24 @@ class Settings(BaseSettings):
     # wide enough to avoid whipsawing winners).
     delta_drop_stop_pct: float = 0.30
     # Ignore the first N seconds after entry (avoids tick-level entry whipsaw).
-    delta_drop_min_hold_sec: int = 600
+    # Blueprint 17: raised from 600 → 900s (15 min), anchored to created_at in DB.
+    delta_drop_min_hold_sec: int = 900
+
+    # ── Blueprint 17 — Spread-Trap hardening (Layers 1–4) ────────────────────────
+    # Layer 2 — Spread veto: if (ask-bid)/mid > this, the book is too thin to
+    # trust as a price signal — skip the stop this cycle.
+    max_spread_for_stop_pct: float = 0.08
+    # Layer 1 — Use mid price ((bid+ask)/2) instead of best_bid for drop math.
+    # Mid is spread-insensitive; a hollow bid with a sane ask no longer fabricates
+    # a drop.  Falls back to best_bid when best_ask is missing/zero.
+    delta_drop_use_mid: bool = True
+    # Layer 4 — Persistence / debounce: require the drop to breach the threshold
+    # this many consecutive polls before closing.  A single hollow-book snapshot
+    # never triggers; the counter resets on any non-breaching poll.
+    delta_drop_confirm_ticks: int = 2
+    # Layer 3 — Optional minimum bid notional (USDC) before trusting the bid.
+    # 0 = disabled (opt-in).
+    min_bid_notional_usdc: float = 0.0
     # Emit one position_mark log line per open position per sync cycle.
     # Use to calibrate delta_drop_stop_pct from real drawdown after ~2 weeks.
     log_position_marks: bool = True

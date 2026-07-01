@@ -29,9 +29,13 @@ log = structlog.get_logger(__name__)
 
 # Best-effort in-process guard for in-flight closes (per worker child).
 _closing: set[tuple] = set()
-# When a position was first observed (resets on restart — that's fine: old
-# positions are assumed mature and immediately eligible for TP/SL evaluation).
+# When a position was first observed (in-process; resets on restart).
+# Blueprint 17: hold-time is now anchored to copy_trades.created_at from DB,
+# so _first_seen is only used as a fast pre-DB fallback for brand-new positions.
 _first_seen: dict[str, float] = {}
+# Blueprint 17 Layer 4 — consecutive breaching poll counter per (uid, token).
+# Reset to 0 on any non-breaching poll; stop fires only at >= delta_drop_confirm_ticks.
+_drop_ticks: dict[str, int] = {}
 
 
 def _notify_once(key: str) -> bool:
@@ -135,66 +139,144 @@ def sync_positions() -> dict:
                         actions += 1
                 continue
 
-            # ── Blueprint 10: Delta-Drop stop-loss ────────────────────────
+            # ── Blueprint 10 + 17: Delta-Drop stop-loss (hardened) ───────────
             # Primary strategy: hold to resolution (binary pays $1 win / $0 loss).
-            # Exception 1 — Delta-Drop: exit when the live CLOB best_bid has fallen
-            #   >= delta_drop_stop_pct (30%) from entry.  tp_sl_min_hours guard is
-            #   intentionally NOT applied — it caused the 2026-06-30 incident.
+            # Exception 1 — Delta-Drop: exit when the fair-value mid has fallen
+            #   >= delta_drop_stop_pct from entry AND the drop persists across
+            #   >= delta_drop_confirm_ticks consecutive polls AND the book is liquid
+            #   enough to be trusted (spread veto, Layer 2).
             # Exception 2 — hard_stop floor: residual absolute safety net at 0.07.
             #
-            # BP13.3 invariant: this stop fires on entry_price vs best_bid only.
-            # Do NOT branch on users.sizing_mode here — the stop is sizing-agnostic.
+            # BP13.3 invariant: stop is sizing-agnostic; never branch on sizing_mode.
 
             hours = _hours_left(p.get("end_date"))
 
-            # Enforce minimum hold time (avoids tick-level entry whipsaw).
+            # ── Hold-time guard (Layer 4 sub-component) ────────────────────
+            # Anchor to DB created_at (survives worker restarts).  Fall back to
+            # the in-process _first_seen dict only when the DB row is unavailable.
             fkey = f"{uid}:{token_id}"
-            seen_at = _first_seen.setdefault(fkey, now)
-            age_sec = now - seen_at
+            age_sec: float = settings.delta_drop_min_hold_sec  # default: eligible
+            try:
+                from core.db import get_open_trade_by_token as _got
+                db_trade = _got(uid, token_id)
+                if db_trade and db_trade.get("created_at"):
+                    from dateutil.parser import parse as _pdt
+                    created = _pdt(db_trade["created_at"])
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    age_sec = (datetime.now(timezone.utc) - created).total_seconds()
+                else:
+                    seen_at = _first_seen.setdefault(fkey, now)
+                    age_sec = now - seen_at
+            except Exception:
+                seen_at = _first_seen.setdefault(fkey, now)
+                age_sec = now - seen_at
+
             if age_sec < settings.delta_drop_min_hold_sec:
                 log.debug("exit_skipped_too_new",
                           user_id=uid, token=token_id[:14],
                           age_min=round(age_sec / 60, 1))
+                _drop_ticks.pop(fkey, None)
                 continue
 
             ckey = (uid, token_id)
             if ckey in _closing:
                 continue
 
-            # Live best_bid from CLOB order book.  The book does not delist
-            # neg-risk tokens early (unlike Data-API cur_price).
+            # ── Live order book ─────────────────────────────────────────────
+            # The book does not delist neg-risk tokens early (unlike Data-API).
+            best_bid: float = 0.0
+            best_ask: float = 0.0
             try:
                 book = get_order_book(token_id)
-                best_bid = float(book.get("best_bid") or 0) if book else 0.0
+                if book:
+                    best_bid = float(book.get("best_bid") or 0)
+                    best_ask = float(book.get("best_ask") or 0)
             except Exception:
                 best_bid = float(p.get("cur_price") or p.get("best_bid") or 0)
 
             # Cost-basis entry price from Data-API avg_price.
             entry_px = float(p.get("avg_price") or 0)
 
-            # Mark logging — accumulate to calibrate delta_drop_stop_pct over time.
-            if settings.log_position_marks and entry_px > 0 and best_bid > 0:
+            # ── Layer 1: use mid price when both sides are present ──────────
+            if settings.delta_drop_use_mid and best_bid > 0 and best_ask > 0:
+                price_ref = (best_bid + best_ask) / 2.0
+            else:
+                price_ref = best_bid  # fallback: Layer 1 disabled or ask missing
+
+            # ── Mark logging ────────────────────────────────────────────────
+            if settings.log_position_marks and entry_px > 0 and price_ref > 0:
                 log.info("position_mark",
                          user_id=uid, token=token_id[:14],
                          entry=entry_px, best_bid=round(best_bid, 4),
-                         drop=round(1.0 - best_bid / entry_px, 3),
+                         best_ask=round(best_ask, 4), mid=round(price_ref, 4),
+                         drop=round(1.0 - price_ref / entry_px, 3),
                          hours=round(hours, 2) if hours is not None else None)
 
-            # Delta-Drop trigger: exit if best_bid fell >= X from entry.
-            if entry_px > 0 and best_bid > 0:
-                drop_pct = 1.0 - best_bid / entry_px
-                if drop_pct >= settings.delta_drop_stop_pct:
+            # ── Layer 2: spread veto ────────────────────────────────────────
+            # If the book is too thin (hollow bid) we cannot trust it as a
+            # price signal — skip the stop entirely this cycle.
+            if best_bid > 0 and best_ask > 0:
+                mid_val = (best_bid + best_ask) / 2.0
+                if mid_val > 0:
+                    spread_pct = (best_ask - best_bid) / mid_val
+                    if spread_pct > settings.max_spread_for_stop_pct:
+                        log.info("stop_skipped_wide_spread",
+                                 user_id=uid, token=token_id[:14],
+                                 best_bid=round(best_bid, 4),
+                                 best_ask=round(best_ask, 4),
+                                 spread_pct=round(spread_pct, 3),
+                                 threshold=settings.max_spread_for_stop_pct)
+                        _drop_ticks.pop(fkey, None)
+                        continue
+
+            # ── Delta-Drop evaluation ───────────────────────────────────────
+            if entry_px > 0 and price_ref > 0:
+                drop_pct = 1.0 - price_ref / entry_px
+
+                # ── Layer 3: optional entry-bid comparison ──────────────────
+                # If we stored entry_bid at fill time, also require a real move
+                # in the bid itself (bid-vs-bid, immune to ask/bid asymmetry).
+                layer3_ok = True
+                try:
+                    if db_trade and db_trade.get("entry_bid"):
+                        entry_bid_stored = float(db_trade["entry_bid"])
+                        if entry_bid_stored > 0 and best_bid > 0:
+                            drop_from_entry_bid = 1.0 - best_bid / entry_bid_stored
+                            layer3_ok = drop_from_entry_bid >= settings.delta_drop_stop_pct
+                except Exception:
+                    pass
+
+                if drop_pct >= settings.delta_drop_stop_pct and layer3_ok:
+                    # ── Layer 4: persistence / debounce ────────────────────
+                    _drop_ticks[fkey] = _drop_ticks.get(fkey, 0) + 1
+                    ticks = _drop_ticks[fkey]
+                    if ticks < settings.delta_drop_confirm_ticks:
+                        log.info("delta_drop_confirming",
+                                 user_id=uid, token=token_id[:14],
+                                 entry=entry_px, price_ref=round(price_ref, 4),
+                                 drop=round(drop_pct, 3),
+                                 ticks=ticks,
+                                 required=settings.delta_drop_confirm_ticks)
+                        continue
+                    # Confirmed across required consecutive polls — close.
                     log.info("delta_drop_triggered",
                              user_id=uid, token=token_id[:14],
                              entry=entry_px, best_bid=round(best_bid, 4),
+                             price_ref=round(price_ref, 4),
                              drop=round(drop_pct, 3),
+                             ticks=ticks,
                              threshold=settings.delta_drop_stop_pct)
+                    _drop_ticks.pop(fkey, None)
                     _closing.add(ckey)
                     close_position.delay(uid, token_id, "delta_drop_stop")
                     actions += 1
                     continue
+                else:
+                    # No breach this poll — reset debounce counter.
+                    _drop_ticks.pop(fkey, None)
 
-            # Hard-stop floor: residual safety net when book is near-zero.
+            # ── Hard-stop floor: residual safety net when book is near-zero ─
             if best_bid > 0 and best_bid < settings.hard_stop_abs_price:
                 log.info("hard_stop_triggered",
                          user_id=uid, token=token_id[:14],
@@ -1075,6 +1157,26 @@ def _update_hwm_and_check_breakers(
     tg = user["telegram_id"]
 
     try:
+        # ── Blueprint 17.B: manual override guard ─────────────────────────────
+        # If the user tapped "Снять блокировку" earlier today, risk_override_until
+        # is set to next 00:00 UTC.  While the flag is active we skip ALL breaker
+        # checks so neither the drawdown nor the daily-loss gate can re-lock them.
+        try:
+            from core.db import get_risk_override_until as _grou
+            override_ts = _grou(uid)
+            if override_ts:
+                from dateutil.parser import parse as _pdt
+                override_exp = _pdt(override_ts)
+                if override_exp.tzinfo is None:
+                    override_exp = override_exp.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) < override_exp:
+                    log.debug("risk_override_active_skip_breakers",
+                              user_id=uid,
+                              override_until=override_ts)
+                    return
+        except Exception:
+            pass
+
         current_state = get_risk_state(uid)
 
         # ── Update HWM when equity is at a new peak ───────────────────────────

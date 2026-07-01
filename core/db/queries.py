@@ -534,12 +534,14 @@ def get_daily_realized_pnl(user_id: int) -> float:
 def get_open_trade_by_token(user_id: int, token_id: str) -> dict | None:
     """Find the newest confirmed-and-unredeemed copy_trade for a token.
 
-    Used by close_position to obtain the trade_id + size_usdc for P&L booking.
+    Returns id, size_usdc, condition_id, signal_id, created_at, entry_bid.
+    Blueprint 17: created_at is used for hold-time anchor (survives worker
+    restarts); entry_bid enables the Layer-3 bid-vs-bid drop comparison.
     """
     sb = get_supabase()
     res = (
         sb.table("copy_trades")
-        .select("id, size_usdc, condition_id, signal_id")
+        .select("id, size_usdc, condition_id, signal_id, created_at, entry_bid")
         .eq("user_id", user_id)
         .eq("token_id", token_id)
         .eq("status", "confirmed")
@@ -613,6 +615,24 @@ def record_risk_override(user_id: int) -> None:
         "risk_override_at":    now,
         "risk_override_count": current + 1,
     }).eq("id", user_id).execute()
+
+
+def set_risk_override_until(user_id: int, until_ts: str) -> None:
+    """Set risk_override_until to suppress both breakers until that timestamp.
+
+    Blueprint 17.B: called by the unlock_drawdown handler with the next 00:00 UTC
+    so the daily-loss (and drawdown) monitor gate is bypassed for the rest of the
+    UTC day.  The monitor reads this column at the top of every cycle.
+    """
+    sb = get_supabase()
+    sb.table("users").update({"risk_override_until": until_ts}).eq("id", user_id).execute()
+
+
+def get_risk_override_until(user_id: int) -> str | None:
+    """Return the risk_override_until timestamp string for a user, or None."""
+    sb = get_supabase()
+    res = sb.table("users").select("risk_override_until").eq("id", user_id).maybe_single().execute()
+    return (res.data or {}).get("risk_override_until")
 
 
 def get_open_trades_cost(user_id: int) -> dict:

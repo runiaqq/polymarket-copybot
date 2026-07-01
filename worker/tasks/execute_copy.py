@@ -366,6 +366,9 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
 
     # ── Fresh order-book re-check ────────────────────────────────────────────
     entry_price = float(signal.get("price") or 0)
+    # Blueprint 17 Layer 3: capture best_bid at fill time for the bid-vs-bid
+    # drop comparison in the position monitor.
+    entry_bid_at_fill: float = 0.0
     try:
         from core.polymarket import get_order_book
         book = get_order_book(token_id)
@@ -381,6 +384,8 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             cap = fillable * settings.book_safe_frac
             if cap > 0:
                 size_usdc = min(size_usdc, cap)
+        if book and book.get("best_bid"):
+            entry_bid_at_fill = float(book["best_bid"])
     except Exception:
         log.warning("exec_book_check_failed", user_id=user_id)
 
@@ -398,12 +403,31 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     # BP8: execute_copy is now an ENFORCER only — it honors the pause but never
     #      sends the pause notification (that is solely manage_positions' job).
     # decision.max_stake is applied below; decision.warn is forwarded to _notify.
+    #
+    # Blueprint 17.B: if risk_override_until is in the future the user has
+    # explicitly accepted risk until midnight UTC.  Pass daily_pnl=0 so gate 4
+    # (daily-loss) does not block new entries for the rest of the day.
+    # Gates 1-3 (exposure / event / drawdown-from-new-baseline) still apply.
     concentration_warn: str | None = None
     try:
         from core.risk import check_risk_gates
-        from core.db import get_user_equity_hwm, get_daily_realized_pnl
+        from core.db import get_user_equity_hwm, get_daily_realized_pnl, get_risk_override_until
+        from datetime import datetime as _dt, timezone as _tz
         hwm = get_user_equity_hwm(user_id)
         daily_pnl = get_daily_realized_pnl(user_id)
+        try:
+            _override_ts = get_risk_override_until(user_id)
+            if _override_ts:
+                from dateutil.parser import parse as _pdt
+                _override_exp = _pdt(_override_ts)
+                if _override_exp.tzinfo is None:
+                    _override_exp = _override_exp.replace(tzinfo=_tz.utc)
+                if _dt.now(_tz.utc) < _override_exp:
+                    log.debug("risk_gate4_bypassed_override",
+                              user_id=user_id, override_until=_override_ts)
+                    daily_pnl = 0.0  # gate 4 sees no loss → does not block
+        except Exception:
+            pass
         decision = check_risk_gates(
             signal=signal,
             stake=size_usdc,
@@ -493,6 +517,9 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         "outcome_index":  int(outcome_index),
         "neg_risk":       bool(signal.get("neg_risk", False)),
         "entry_price":    round(entry_price, 6),
+        # Blueprint 17 Layer 3: CLOB best_bid at fill time (Layer 3 bid-vs-bid guard).
+        # NULL-safe: column may be absent in old DB schema — insert only when present.
+        **({"entry_bid": round(entry_bid_at_fill, 6)} if entry_bid_at_fill > 0 else {}),
     })
 
     try:
