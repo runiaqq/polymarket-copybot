@@ -3017,3 +3017,307 @@ nano /home/ubuntu/app/.env  # edit (then restart the affected containers)
 Key variables to verify are set: `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `ENCRYPTION_KEY`,
 `TELEGRAM_BOT_TOKEN`, `POLYGON_RPC_URL`, `ALCHEMY_API_KEY`, `BUILDER_API_KEY`,
 `BUILDER_SECRET`, `BUILDER_PASSPHRASE`, `REDIS_URL`, `AUTO_COPY_ENABLED`.
+
+---
+
+## Blueprint 16: Fix Entry Price & PnL in Positions List 🟡 FINAL DESIGN / READY TO IMPLEMENT
+
+> **Class of bug:** Data Persistence / State read-path defect (NOT a write-path loss). The correct
+> entry price *is* in our DB — the `/positions` view simply never reads it and trusts an on-chain
+> source that returns `0` for our custodial proxy wallets.
+
+### 16.0 Symptom (prod, Nexa AI)
+
+1. On entry, the trade notification (`_notify` in `worker/tasks/execute_copy.py`) shows the **correct**
+   price (e.g. `@ 0.875`) and invested amount (e.g. `$5.60`). ✅
+2. In `/positions` (`_build_positions` in `api/routers/telegram.py`) **every** position renders entry
+   price as `@ 0.000`, so the PnL % renders `(+0%)` and the "→ cur" arrow starts from zero. ❌
+
+The two numbers come from **two different sources** that were never reconciled — the exact same class
+of "displayed value ≠ stored value" split diagnosed for withdrawals in **Blueprint 12 Part B**.
+
+### 16.1 Root-cause analysis
+
+**Write path — CORRECT (not the bug).** `execute_copy_trade` already denormalizes the entry price onto
+the `copy_trades` row (Blueprint 1, migration 008):
+
+```485:486:worker/tasks/execute_copy.py
+        "entry_price":    round(entry_price, 6),
+    })
+```
+
+`entry_price` is the fresh order-book `best_ask` (L368–373), a non-zero float. So the DB **does** hold
+the right cost basis. (Caveat hardened in §16.4: nothing currently *guarantees* it is `> 0`.)
+
+**Read path — THE BUG.** `/positions` is sourced **100% on-chain / Data-API**, with **zero JOIN** to
+our own `copy_trades` table:
+
+```883:890:api/routers/telegram.py
+    for i, p in enumerate(positions):
+        title = (p.get("title") or "—")[:40]
+        outcome = p.get("outcome") or "—"
+        shares = p["shares"]
+        avg = p["avg_price"]
+        cur = p["cur_price"]
+        pnl = p["cash_pnl"]
+        pct = p["percent_pnl"]
+```
+
+`avg_price` / `percent_pnl` originate solely from the Polymarket Data API:
+
+```437:445:core/polymarket.py
+                "shares":       float(p.get("size") or 0),
+                "avg_price":    float(p.get("avgPrice") or 0),
+                "cur_price":    float(p.get("curPrice") or 0),
+                "current_value": float(p.get("currentValue") or 0),
+                "cash_pnl":     float(p.get("cashPnl") or 0),
+                # ...
+                "percent_pnl":  float(p.get("percentPnl") or 0) / 100.0,
+```
+
+For our **custodial deposit wallets** (POLY_1271 relayer-funded proxy funders — §5), the Data API
+`avgPrice` is unreliable and frequently `0`:
+- **Indexing lag** — freshly-opened positions surface with `avgPrice = 0` before the indexer back-fills
+  the fill price (the code already *knows* this — see the comment at `_build_pnl`,
+  `api/routers/telegram.py` L952–954: *"avg_price momentarily 0 → it reports the whole position value
+  as profit"*).
+- **Proxy attribution** — fills routed through the 1271 proxy are not always attributed with a blended
+  `avgPrice` on the funder address the way a plain EOA trade is.
+
+When `avgPrice = 0`: `avg` renders `0.000`, and the API's own `percentPnl` is `0` (it cannot compute a
+return with no cost basis) → `(+0%)`. **The bug is not that the price was lost — it is that the read
+path throws away the DB copy we already have and trusts a source that returns 0.**
+
+**Math-safety latent bug.** `_build_positions` currently consumes the *pre-computed* `percent_pnl`, so
+it does not divide by zero today. But the moment we compute the return locally from the entry price
+(the fix), `pct = (cur - entry) / entry` divides by zero when `entry == 0`. `_build_pnl` already dodges
+this defensively (`if avg > 0.001`) — the fix must apply the **same guard** in `_build_positions`.
+
+### 16.2 Fix strategy — DB is the source of truth for entry price
+
+Three coordinated changes; **no new migration** (the `entry_price` column already exists — migration 008).
+
+**A. New read helper — `get_entry_prices_by_token(user_id)` (`core/db/queries.py`).**
+Return `{token_id: entry_price}` for the user's open (`status in ('confirmed','executing')`,
+`redeemed_at IS NULL`) `copy_trades`. Mirror `get_open_trades_cost` (L618) exactly, but select
+`token_id, entry_price` and keep the **latest non-zero** entry per token (guards partial-fill dupes):
+
+```python
+def get_entry_prices_by_token(user_id: int) -> dict:
+    """{token_id: entry_price} for open (confirmed/executing, unredeemed) copy_trades.
+    Local cost-basis fallback for the /positions view when the Data-API avgPrice is 0."""
+    sb = get_supabase()
+    res = (
+        sb.table("copy_trades")
+        .select("token_id, entry_price, created_at")
+        .eq("user_id", user_id)
+        .in_("status", ["confirmed", "executing"])
+        .is_("redeemed_at", "null")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    out: dict = {}
+    for row in (res.data or []):
+        tid = row.get("token_id")
+        ep = float(row.get("entry_price") or 0)
+        if tid and ep > 0 and tid not in out:   # first (newest) non-zero wins
+            out[tid] = ep
+    return out
+```
+
+> **CRITICAL — export it.** Add `get_entry_prices_by_token` to **both** the
+> `from core.db.queries import (...)` block **and** `__all__` in `core/db/__init__.py`. This is the
+> exact drift that caused **Blueprint 12 Part A** (`get_open_trade_by_token` missing from exports) —
+> do not repeat it. If the BP9 boot self-check `_check_core_imports()` exists, add the name there too.
+
+**B. Overlay DB entry price in the read path (`api/routers/telegram.py`).**
+In `_build_positions` (and reuse the same map in `_build_pnl`), fetch the map once and pick the
+**effective entry** per position — prefer a valid on-chain blended `avgPrice`, fall back to our DB copy:
+
+```python
+# once, before the loop:
+from core.db import get_entry_prices_by_token
+db_entry = get_entry_prices_by_token(db_user["id"])
+
+# per position:
+api_avg = float(p.get("avg_price") or 0)
+entry   = api_avg if api_avg > 0 else db_entry.get(p["token_id"], 0.0)
+```
+
+Rationale for the precedence (`API-if-nonzero, else DB`): once the indexer catches up, `avgPrice` is
+the *blended* truth across partial fills / add-ons; our single-row `entry_price` is only the first
+fill. So we trust the API when it is populated and use the DB purely as the **zero-gap fallback** that
+kills the `0.000` display. (If a market is later found where the API blends *worse* than our ledger,
+revisit — but do not silently override a valid non-zero API avg.)
+
+**C. Compute PnL locally with a divide-by-zero guard (single source of math truth).**
+Replace the direct `pct = p["percent_pnl"]` / `pnl = p["cash_pnl"]` reads with a guarded local compute,
+so display, %, and $ all derive from the same `entry`:
+
+```python
+if entry > 0:
+    pnl = shares * (cur - entry)
+    pct = (cur - entry) / entry
+else:
+    # No cost basis anywhere — happens for legacy pre-BP1 rows (verified in §16.7,
+    # ids 674–690: entry_price AND shares both NULL). Show a dash, never 0%/NaN.
+    pnl = float(p.get("cash_pnl") or 0)
+    pct = None
+```
+
+Render `pct` as `"—"` when `None` (never `+0%`, never `ZeroDivisionError`, never `inf/NaN`). Keep the
+`avg:.3f` in the row using `entry` so the arrow reads `0.875 → 0.910` instead of `0.000 → 0.910`.
+
+### 16.3 Files touched (no migration)
+
+| File | Change |
+|---|---|
+| `core/db/queries.py` | **+** `get_entry_prices_by_token(user_id)` (new helper, §16.2 A) |
+| `core/db/__init__.py` | **+** re-export the helper in the import block **and** `__all__` (BP12-A guard) |
+| `api/routers/telegram.py` | `_build_positions` + `_build_pnl`: overlay DB entry, guarded local PnL (§16.2 B/C) |
+| `worker/tasks/execute_copy.py` | **hardening only** — enforce `entry_price > 0` invariant on write (§16.4) |
+
+### 16.4 Write-path hardening (defense-in-depth, secondary)
+
+`entry_price` is written today, but nothing guarantees it is non-zero, and if it ever is, the fallback
+in §16.2 silently degrades back to `0.000`. Add a cheap invariant in `execute_copy_trade` right before
+the `insert_copy_trade` at L475:
+
+- `entry_price` is derived from `book["best_ask"]` and falls back to `signal["price"]`. If **both** are
+  `0`/missing, either **skip** (`reason="no_entry_price"`) or persist the best available signal price —
+  never insert a `0` cost basis. Log `log.warning("entry_price_zero_guard", ...)` when it triggers so a
+  regression in the order-book path is visible, not silent.
+
+**Model drift note (cosmetic, flag don't chase):** `core/db/models.py::CopyTrade` still declares
+`fill_price` and has **no** `entry_price` column (models are "schema reference only", §2.1, and are not
+used at runtime — writes go through raw dicts to Supabase). Update the SQLAlchemy model to match the
+live schema (`entry_price`, `shares`, `condition_id`, `token_id`, `outcome_index`, `neg_risk`,
+`result`, `realized_pnl`, `resolved_at`, `redeemed_at`, `redeem_tx`, `exit_tx`) so the reference stops
+lying — but this does not affect the runtime fix.
+
+### 16.5 Acceptance criteria
+
+1. For a position opened at `0.875`, `/positions` shows `… @ 0.875 → {cur} · {icon} {pnl:+.2f}$ ({pct:+.0%})`
+   with the **real** entry and a non-zero, correctly-signed % — even immediately after entry while the
+   Data-API `avgPrice` is still `0`.
+2. A position with **no** DB entry and a `0` API avg renders `—` for the %, **never** `+0%` and never
+   raises `ZeroDivisionError`.
+3. `python -c "from core.db import get_entry_prices_by_token"` succeeds (export wired, BP12-A guard).
+4. `_build_pnl` unrealized total uses the same effective entry (no phantom "whole value = profit" when
+   `avgPrice=0`).
+5. No new migration required; `copy_trades.entry_price` (migration 008) is unchanged.
+
+### 16.6 DB verification commands (run BEFORE coding to confirm the hypothesis)
+
+The store is **Supabase Postgres** (§2.1) — use `psql` with the project's pooler/direct connection
+string (Supabase Dashboard → Project Settings → Database → Connection string), or the supabase-client
+one-liner below (works with the `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` already in `.env`).
+
+```bash
+# --- Option A: psql against Supabase Postgres -------------------------------
+# Paste your connection string (Session pooler / Direct). NEVER commit it.
+export PGURL='postgresql://postgres.<ref>:<PASSWORD>@aws-0-<region>.pooler.supabase.com:5432/postgres'
+
+# 1) Distribution of entry_price on OPEN trades — is it really zeros/nulls?
+psql "$PGURL" -c "
+  select
+    count(*)                                   as open_trades,
+    count(*) filter (where entry_price is null) as null_entry,
+    count(*) filter (where entry_price = 0)     as zero_entry,
+    count(*) filter (where entry_price > 0)     as good_entry,
+    min(entry_price), max(entry_price)
+  from copy_trades
+  where status in ('confirmed','executing') and redeemed_at is null;
+"
+
+# 2) Eyeball the most recent open rows — compare stored entry_price vs size_usdc/shares.
+psql "$PGURL" -c "
+  select id, user_id, left(token_id,14) as token, status,
+         entry_price, shares, size_usdc, created_at
+  from copy_trades
+  where redeemed_at is null
+  order by created_at desc
+  limit 20;
+"
+
+# 3) Cross-check: are the notified trades the ones showing 0.000?  (entry_price=0 but shares>0)
+psql "$PGURL" -c "
+  select count(*) as zero_priced_open_positions
+  from copy_trades
+  where status in ('confirmed','executing')
+    and redeemed_at is null
+    and coalesce(entry_price,0) = 0;
+"
+```
+
+```bash
+# --- Option B: no psql? use the supabase client already configured in .env --
+# Reads SUPABASE_URL + SUPABASE_SERVICE_KEY from the environment / .env.
+python - <<'PY'
+from core.db.session import get_supabase
+sb = get_supabase()
+rows = (sb.table("copy_trades")
+        .select("id,user_id,token_id,status,entry_price,shares,size_usdc,created_at")
+        .is_("redeemed_at","null")
+        .order("created_at", desc=True)
+        .limit(50).execute().data or [])
+open_rows = [r for r in rows if r["status"] in ("confirmed","executing")]
+zero = [r for r in open_rows if not r.get("entry_price")]
+print(f"open (confirmed/executing, unredeemed): {len(open_rows)}")
+print(f"  with entry_price 0/NULL: {len(zero)}")
+print(f"  with entry_price > 0   : {len(open_rows)-len(zero)}")
+for r in open_rows[:15]:
+    print(f"  id={r['id']:>5} tok={str(r['token_id'])[:12]:<12} "
+          f"entry={r.get('entry_price')!s:<8} shares={r.get('shares')!s:<8} "
+          f"size=${r.get('size_usdc')}")
+PY
+```
+
+**How to read the result:**
+- **`entry_price > 0` in the DB (good_entry ≫ 0) while `/positions` shows `0.000`** → confirms the
+  read-path/JOIN diagnosis (§16.1): the data is fine, the view ignores it. Fix = §16.2 B/C only.
+- **`entry_price` is `0`/`NULL` in the DB (zero_entry/null_entry ≫ 0)** → the write path is *also*
+  degrading; apply the §16.4 write guard **in addition to** the read-path fix.
+
+### 16.7 Verification result — prod, 2026-07-01 ✅ HYPOTHESIS CONFIRMED
+
+Ran Option B against prod (`docker compose exec -T worker python …`). Of **25** open
+(`confirmed`/`executing`, unredeemed) `copy_trades`:
+
+| bucket | count | meaning |
+|---|---|---|
+| `entry_price > 0` in DB | **18** | correct cost basis stored (`0.88`, `0.931`, `0.95`, …) yet `/positions` renders `0.000` |
+| `entry_price` NULL in DB | **7** *(8 within a 200-row window)* | **all legacy** — see below |
+
+**Conclusion 1 — read-path is THE bug, and the fix is sufficient.** 18/18 of the *recent* trades
+(ids ≥ 709, created ≥ 2026-06-21) carry a valid `entry_price`, but the on-chain-only `/positions`
+view shows `0.000` for them. The data was never lost — the view throws it away. **§16.2 (B/C) fully
+resolves the active symptom.**
+
+**Conclusion 2 — write-path is NOT currently degrading.** Every NULL-entry row is a **legacy tail**
+created **2026-06-15 → 2026-06-20** (ids 674–690) with **both** `entry_price = NULL` **and**
+`shares = NULL` — i.e. rows written *before* the Blueprint 1 / migration 008 denormalization went
+live. No post-BP1 row is missing its price. Therefore **§16.4 is demoted to defense-in-depth**
+(cheap future insurance), **not** a required part of this fix.
+
+**Consequence for the legacy rows.** Those 8 rows have no cost basis *anywhere* (not in the API,
+not in our DB), so the §16.2-B fallback cannot rescue them — they rely purely on the §16.2-C
+divide-by-zero guard to render `—` (never `+0%`, never a crash) and will age out on resolution.
+This makes the §16.2-C guard **load-bearing**, not merely defensive.
+
+**Incidental finding (out of scope, log for later):** the query revealed **`copy_trades.order_id`
+does not exist** in the live schema, yet `execute_copy_trade` writes it inside a swallowing
+`try/except: pass`:
+
+```505:508:worker/tasks/execute_copy.py
+            sb.table("copy_trades").update({
+                "status":   "placed",
+                "order_id": order_id,
+            }).eq("id", trade_row["id"]).execute()
+```
+
+Because both fields go in one `update`, the missing column makes the **entire** statement fail
+silently → the interim `status='placed'` transition never persists (the row stays `executing` until
+the later `confirmed`/`unfilled` update, which omits `order_id`, succeeds). Not part of Blueprint 16;
+file as a follow-up (either add an `order_id text` column via migration, or drop the field from the
+write). Flagging so it is not lost.

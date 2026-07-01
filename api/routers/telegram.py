@@ -859,6 +859,43 @@ def _live_positions(wallet: str | None) -> list[dict]:
         return []
 
 
+def _db_entry_prices(db_user: dict) -> dict:
+    """BP16: {token_id: entry_price} from our copy_trades ledger (fallback cost basis).
+
+    Fails open (empty dict) so the positions view degrades to the on-chain avg
+    rather than erroring if the DB read fails."""
+    try:
+        from core.db import get_entry_prices_by_token
+        uid = db_user.get("id")
+        return get_entry_prices_by_token(uid) if uid is not None else {}
+    except Exception:
+        return {}
+
+
+def _effective_entry(p: dict, db_entry: dict) -> float:
+    """BP16: prefer the Data-API blended avg when populated, else our DB entry_price.
+
+    Once the indexer catches up, avgPrice is the blended truth across partial fills;
+    our single-row entry_price is the reliable zero-gap fallback that kills the
+    "@ 0.000" display for freshly-opened positions."""
+    api_avg = float(p.get("avg_price") or 0)
+    if api_avg > 0:
+        return api_avg
+    return float(db_entry.get(p.get("token_id"), 0.0) or 0.0)
+
+
+def _position_pnl(p: dict, entry: float) -> tuple[float, float | None]:
+    """BP16: PnL ($, %) from a single effective entry, guarded against divide-by-zero.
+
+    Returns (pnl_usd, pct) where pct is None when no cost basis exists anywhere
+    (legacy pre-BP1 rows) — callers render "—" instead of a misleading +0%."""
+    cur = float(p.get("cur_price") or 0)
+    shares = float(p.get("shares") or 0)
+    if entry > 0:
+        return shares * (cur - entry), (cur - entry) / entry
+    return float(p.get("cash_pnl") or 0), None
+
+
 def _build_positions(db_user: dict, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, InlineKeyboardMarkup]:
     """Render live positions (real P&L from data-api) with per-position close buttons."""
     wallet = _trading_wallet(db_user)
@@ -875,6 +912,11 @@ def _build_positions(db_user: dict, context: ContextTypes.DEFAULT_TYPE) -> tuple
             InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="menu")]]),
         )
 
+    # BP16: the Data-API avgPrice is 0 for freshly-opened positions on our proxy
+    # wallets. Overlay our own stored entry_price (copy_trades) as the zero-gap
+    # fallback so entry price and % PnL never render as 0.000 / +0%.
+    db_entry = _db_entry_prices(db_user)
+
     lines = [f"📊 <b>Активные позиции</b> ({len(positions)})\n"]
     buttons: list[list[InlineKeyboardButton]] = []
     total_value = 0.0
@@ -884,19 +926,21 @@ def _build_positions(db_user: dict, context: ContextTypes.DEFAULT_TYPE) -> tuple
         title = (p.get("title") or "—")[:40]
         outcome = p.get("outcome") or "—"
         shares = p["shares"]
-        avg = p["avg_price"]
         cur = p["cur_price"]
-        pnl = p["cash_pnl"]
-        pct = p["percent_pnl"]
+        # BP16: prefer a valid on-chain blended avg, fall back to our DB entry.
+        entry = _effective_entry(p, db_entry)
+        pnl, pct = _position_pnl(p, entry)
         total_value += p["current_value"]
         total_pnl += pnl
         icon = "📈" if pnl >= 0 else "📉"
         tag = " · ✅ к выводу" if p.get("redeemable") else ""
         url = event_url(p.get("event_slug"))
         title_html = f"<a href=\"{url}\">{title}</a>" if url else f"<b>{title}</b>"
+        entry_str = f"{entry:.3f}" if entry > 0 else "—"
+        pct_str = f"{pct:+.0%}" if pct is not None else "—"
         lines.append(
             f"{i+1}. {title_html} · {outcome}{tag}\n"
-            f"   {shares:.0f} шт @ {avg:.3f} → {cur:.3f} · {icon} <b>{pnl:+.2f}$</b> ({pct:+.0%})"
+            f"   {shares:.0f} шт @ {entry_str} → {cur:.3f} · {icon} <b>{pnl:+.2f}$</b> ({pct_str})"
         )
         buttons.append([InlineKeyboardButton(f"❌ Закрыть #{i+1}", callback_data=f"close_{i}")])
 
@@ -949,16 +993,18 @@ def _build_pnl(db_user: dict, period: str = "day") -> str:
     losses = sum(1 for c in period_closed if c["realized_pnl"] < 0)
 
     invested = sum(p["current_value"] for p in open_pos)
-    # Compute unrealized P&L robustly from shares × (cur − avg). The API's cashPnl
+    # Compute unrealized P&L robustly from shares × (cur − entry). The API's cashPnl
     # is unreliable on freshly-opened positions (avg_price momentarily 0 → it reports
-    # the whole position value as "profit"). Skip positions without a valid avg price.
+    # the whole position value as "profit"). BP16: fall back to our stored entry_price
+    # when the on-chain avg is 0, and skip positions with no cost basis anywhere.
+    db_entry = _db_entry_prices(db_user)
     unrealized = 0.0
     for p in open_pos:
-        avg = float(p.get("avg_price") or 0)
+        entry = _effective_entry(p, db_entry)
         cur = float(p.get("cur_price") or 0)
         shares = float(p.get("shares") or 0)
-        if avg > 0.001:
-            unrealized += shares * (cur - avg)
+        if entry > 0.001:
+            unrealized += shares * (cur - entry)
 
     r_icon = "📈" if realized >= 0 else "📉"
     u_icon = "📈" if unrealized >= 0 else "📉"

@@ -640,6 +640,37 @@ def get_open_trades_cost(user_id: int) -> dict:
     return result
 
 
+def get_entry_prices_by_token(user_id: int) -> dict:
+    """Return {token_id: entry_price} for open (confirmed/executing, unredeemed) copy_trades.
+
+    Blueprint 16: local cost-basis fallback for the /positions view. The Polymarket
+    Data API returns avgPrice=0 for freshly-opened positions on our POLY_1271 proxy
+    wallets (indexing lag / proxy attribution), so the on-chain read alone renders
+    "@ 0.000" and "+0%". Our copy_trades row already stores the real entry_price
+    (Blueprint 1, migration 008); this helper surfaces it keyed by token.
+
+    Only non-zero entry prices are returned. When multiple rows exist for a token
+    (partial fills / add-ons), the newest non-zero entry wins.
+    """
+    sb = get_supabase()
+    res = (
+        sb.table("copy_trades")
+        .select("token_id, entry_price, created_at")
+        .eq("user_id", user_id)
+        .in_("status", ["confirmed", "executing"])
+        .is_("redeemed_at", "null")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    out: dict = {}
+    for row in (res.data or []):
+        tid = row.get("token_id")
+        ep = float(row.get("entry_price") or 0)
+        if tid and ep > 0 and tid not in out:  # first (newest) non-zero wins
+            out[tid] = ep
+    return out
+
+
 def get_realized_baseline(user_id: int) -> float | None:
     """Return the realized_baseline stored for a user (None if not yet set)."""
     sb = get_supabase()

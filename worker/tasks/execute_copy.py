@@ -472,6 +472,16 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         outcome_name = str(signal.get("outcome") or "").strip().lower()
         outcome_index = 0 if outcome_name.startswith("yes") else 1
 
+    # BP16.4: entry_price invariant (defense-in-depth). entry_price is the fresh
+    # order-book best_ask with a fallback to the signal price; if BOTH are missing
+    # we must NOT persist a 0 cost basis (it breaks the /positions view and % PnL).
+    if entry_price <= 0:
+        entry_price = float(signal.get("price") or 0)
+    if entry_price <= 0:
+        log.warning("entry_price_zero_guard", user_id=user_id,
+                    market=(cond or "")[:14], token=token_id[:18])
+        return {"skipped": True, "reason": "no_entry_price"}
+
     trade_row = insert_copy_trade({
         "user_id":        user["id"],
         "signal_id":      signal_id,
