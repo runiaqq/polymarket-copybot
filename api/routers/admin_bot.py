@@ -400,7 +400,8 @@ def _fmt_history_row(t: dict) -> str:
     oc     = sig.get("outcome") or ("YES" if t.get("outcome_index") == 0 else "NO")
     entry  = float(t.get("entry_price") or 0)
     shares = float(t.get("shares") or 0)
-    pnl    = float(t.get("realized_pnl") or 0)
+    # COALESCE: realized_pnl for modern rows, pnl_usdc fallback for pre-008 legacy rows.
+    pnl    = float(t.get("realized_pnl") or t.get("pnl_usdc") or 0)
     result = (t.get("result") or "").lower()
 
     if result == "win":

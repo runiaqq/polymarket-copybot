@@ -771,18 +771,22 @@ def get_pnl_summary(user_id: int) -> dict:
     """Realized-PnL rollup for the admin dashboard: today (UTC calendar day),
     trailing 7 days, and all-time — plus the settled-trade count.
 
-    Uses the same 'realized_pnl IS NOT NULL AND resolved_at IS NOT NULL' terminal
-    predicate as get_daily_realized_pnl so the risk breaker and the admin card never
-    disagree on what 'settled' means.
+    Filter: redeemed_at IS NOT NULL (most inclusive terminal predicate — covers both
+    modern rows with resolved_at set and legacy rows settled before migration 008 which
+    only have redeemed_at). PnL value: COALESCE(realized_pnl, pnl_usdc, 0) so pre-008
+    rows that only populated pnl_usdc are still counted correctly.
+
+    Timestamp bucketing uses resolved_at when available, falling back to redeemed_at
+    (both are set to the same moment by mark_trade_settled; older rows may only have
+    redeemed_at).
     """
     from datetime import timedelta
     sb = get_supabase()
     res = (
         sb.table("copy_trades")
-        .select("realized_pnl, resolved_at")
+        .select("realized_pnl, pnl_usdc, resolved_at, redeemed_at")
         .eq("user_id", user_id)
-        .not_.is_("realized_pnl", "null")
-        .not_.is_("resolved_at", "null")
+        .not_.is_("redeemed_at", "null")
         .execute()
     )
     now = datetime.now(timezone.utc)
@@ -791,8 +795,10 @@ def get_pnl_summary(user_id: int) -> dict:
     today = week = all_time = 0.0
     n = 0
     for r in (res.data or []):
-        pnl = float(r.get("realized_pnl") or 0)
-        ts = _parse_ts(r.get("resolved_at"))
+        # Use realized_pnl when present; fall back to pnl_usdc for pre-008 rows.
+        pnl = float(r.get("realized_pnl") or r.get("pnl_usdc") or 0)
+        # Use resolved_at for bucketing; fall back to redeemed_at for legacy rows.
+        ts = _parse_ts(r.get("resolved_at") or r.get("redeemed_at"))
         all_time += pnl
         n += 1
         if ts and ts >= day0:
@@ -813,11 +819,11 @@ def get_user_trade_history(user_id: int, limit: int = 5, offset: int = 0) -> lis
         sb.table("copy_trades")
         .select(
             "id, signal_id, entry_price, shares, size_usdc, result, realized_pnl, "
-            "outcome_index, resolved_at, created_at, status"
+            "pnl_usdc, outcome_index, resolved_at, redeemed_at, created_at, status"
         )
         .eq("user_id", user_id)
-        .not_.is_("resolved_at", "null")
-        .order("resolved_at", desc=True)
+        .not_.is_("redeemed_at", "null")
+        .order("redeemed_at", desc=True)
         .range(offset, offset + limit - 1)
         .execute()
     )
