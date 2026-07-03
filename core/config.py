@@ -180,6 +180,12 @@ class Settings(BaseSettings):
     # pUSD on the deposit wallet (gasless via relayer). When ON, the bot credits
     # winnings automatically; when OFF, the user must claim on Polymarket manually.
     auto_redeem_enabled: bool = True
+    # Blueprint 20 A1: short-lived lease for the redeem dedup key (seconds).
+    # Treat as an in-flight guard, NOT a permanent "done" marker — the real
+    # terminal state is copy_trades.redeemed_at IS NOT NULL (the DB ledger).
+    # 900 s = 15 min: long enough to prevent double-dispatch within one cycle,
+    # short enough to auto-retry if the task failed or was skipped.
+    redeem_lease_sec: int = 900
 
     # ── Legacy donor-copy / REST-scan knobs (optional) ──────────────────────────
     whale_min_usdc: float = 5000.0

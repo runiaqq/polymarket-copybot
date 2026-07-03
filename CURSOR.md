@@ -351,6 +351,34 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   `stop_no_cost_basis_alert` (default `True`). No DB migration required — `entry_price`,
   `size_usdc`, `shares`, `signal_id` already exist (migration 008).
 
+- **[BP20] Redeem-Hang Self-Healing + Win-Notification UX** (2026-07-03):
+  Fixed four prod defects; **20.A is money-critical** (real winnings were stuck on-chain
+  for up to 7 days due to a stale Redis dedup key, never self-healing):
+  **A1 — Short lease TTL**: `once:redeem:{uid}:{cond}` now uses `redeem_lease_sec=900 s`
+  (15 min) instead of the 7-day default. The key is also **cleared** (`clear_once`) in
+  `redeem_position` failure/skip paths and inside `reconcile_settlements` A3 so the
+  reconciler re-attempts on the next cycle instead of waiting a week.
+  **A2 — trade_id always passed**: `sync_positions` now calls `get_open_trade_by_condition`
+  before dispatching `redeem_position` to pass the real `trade_id` + `entry_cost` (via the
+  BP19 5-tier resolver). The `mark_trade_settled` ledger update that was silently skipped
+  for the `sync_positions` redeem path now runs on every successful on-chain redeem.
+  **A3 — ledger-desync drain**: `reconcile_settlements` detects `won && shares_on_chain==0`
+  (tokens already redeemed on-chain, ledger never settled) and calls `mark_trade_settled`
+  directly without dispatching a second redeem, clearing the stale key and notifying the user.
+  **A4 — loud logs**: every silent `continue` in the redeem/reconcile win branch is replaced
+  with throttled `reconcile_redeem_blocked` / `redeem_skipped_reason` / `reconcile_user_not_found`
+  log lines so a stuck claim is visible within minutes.
+  **B — Outcome fallback**: centralized `resolve_outcome_name(outcome, outcome_index,
+  condition_id, signal_id)` in `core/polymarket.py` with 5-tier chain (API → signal DB →
+  Gamma outcomes[idx] → Gamma groupItemTitle → Yes/No); applied in all `_emit_*` notifiers
+  and `redeem_position`.
+  **C — Word-boundary truncation**: `smart_truncate(text, limit=50)` in `core/polymarket.py`
+  replaces all scattered `[:N]` hard-slices on title strings throughout notifications.
+  **D — Net PnL**: "Выигрыш зачислен" now shows `🏆 Net PnL: +$X.XX$ (выплата − вход)` using
+  the BP19 cost-basis; renders `—` when `entry_cost` is unknown (legacy rows).
+  New helpers: `clear_once` in `core/cache.py`; `get_open_trade_by_condition` in
+  `core/db/queries.py`; `redeem_lease_sec=900` in `core/config.py`. No new DB migration.
+
 ---
 
 ## 4. Known Bugs & Missing Features
@@ -4375,3 +4403,230 @@ monitor produced **zero** stop/mark lines for those tokens (silent skip) while t
 marked; Step 3 shows *live* that `avg_price=0` while `entry_price>0` for this custodial wallet. Together
 they prove the leak is the **Data-API cost-basis source (Finding B)**, independent of `sizing_mode`
 (Finding A) — exactly the fix in §19.2.
+
+---
+
+## Blueprint 20 — Redeem-Hang Self-Healing + Win-Notification UX (outcome/title/Net-PnL) ✅ IMPLEMENTED 2026-07-03
+
+> Four prod defects captured 2026-07-03. **20.A is money-critical** (real winnings stuck on-chain,
+> unclaimed for up to 7 days); 20.B/C/D are win-notification UX. BP9's money-safety invariant worked
+> (no fake credit), but the claim pipeline **stalls and never self-heals** — §5 fail-closed +
+> idempotency apply to the fixes.
+
+### 20.0 Symptoms (prod, Nexa AI)
+
+1. **Claim hang.** "⏳ Выигрыш определён, зачисление задерживается" (`_emit_win_retry_failed`) stays
+   forever; winnings are never credited.
+2. **Missing outcome.** Notifications show `🎯 Исход: —` (empty on markets like "Any Other Score").
+3. **Truncated titles.** Event names cut mid-word in lists/alerts.
+4. **No Net PnL.** The win notice shows only the credited amount, not profit (payout − entry cost).
+
+### 20.1 Root-cause analysis — 20.A (the redeem hang) — CONFIRMED on prod
+
+The claim is **not** failing on-chain (no gas/revert/RPC). A 48h grep for
+`redeem_failed|did not confirm|Traceback|retry` returned **nothing**. The redeem simply **never
+re-runs**, for two compounding reasons:
+
+**A1 — Stale 7-day dedup key, never cleared on failure/skip.** `notify_once` defaults to a **7-day** TTL:
+
+```29:35:core/cache.py
+def notify_once(key: str, ttl: int = 7 * 86400) -> bool:
+    """Return True only the first time `key` is seen (Redis SETNX with TTL)."""
+    try:
+        return bool(_client().set(f"once:{key}", "1", nx=True, ex=ttl))
+    except Exception:
+        # Fail-open: a dead Redis means the worker is degraded anyway.
+        return True
+```
+
+Both redeem paths set `once:redeem:{uid}:{cond}` at **dispatch time** and gate re-dispatch on it:
+
+```965:966:worker/tasks/manage_positions.py
+                if not notify_once(f"redeem:{uid}:{cond}"):
+                    continue  # already dispatched
+```
+
+```110:110:worker/tasks/manage_positions.py
+                    redeem_claimed = _notify_once(f"redeem:{uid}:{condition_id}")
+```
+
+The key is set once and **never deleted when the redeem fails, is skipped, or the tokens are still
+held**. So after the *first* attempt, `reconcile_settlements` L965 hits `notify_once(...) == False` →
+**silent `continue`** (no log, `processed` never increments) for the full 7 days. This is exactly the
+observed `checked=67 processed=0` on every cycle with zero redeem/win/loss log lines.
+
+**A2 — Redeem dispatched WITHOUT `trade_id`, so the ledger can never be marked settled.** The
+`sync_positions` redeemable branch omits `trade_id`/`entry_cost`:
+
+```120:126:worker/tasks/manage_positions.py
+                    if redeem_claimed:
+                        redeem_position.delay(
+                            uid, token_id, condition_id,
+                            bool(p.get("neg_risk", False)), p.get("outcome"),
+                            p.get("title"), p.get("event_slug"),
+                            p.get("outcome_index"),
+                        )
+```
+
+But `mark_trade_settled` inside `redeem_position` is guarded by `if trade_id:`:
+
+```761:769:worker/tasks/manage_positions.py
+        if trade_id:
+            try:
+                from core.db import mark_trade_settled
+                gross = shares_bal if shares_bal > 0 else credited
+                pnl = gross - float(entry_cost or 0)
+                mark_trade_settled(trade_id, result="win",
+                                   realized_pnl=pnl, redeem_tx=redeem_tx)
+            except Exception:
+                log.warning("mark_trade_settled_failed", trade_id=trade_id)
+```
+
+So when the redeem is dispatched from `sync_positions`, even a **successful** on-chain redeem (tokens
+burned) leaves `copy_trades` at `status=confirmed, redeemed_at=null` → the trade stays "outstanding"
+forever, the user gets no "зачислено", and PnL is never booked. (Note: `redeem_winnings`
+skip returns — `no_token_balance` / `collateral_unmatched`, `core/relayer.py` L245/262/265 — also just
+`log.info("redeem_skipped")` and return, clearing nothing.)
+
+**Prod evidence (user 4 / `@sto1ner`, 15 outstanding):**
+
+| Category | Trades | `resolved` | `payout` | on-chain `shares` | `redeem_key_ttl` | Diagnosis |
+|---|---|---|---|---|---|---|
+| Open (correct) | 809,808,807,806,805,801 | False | 0 | > 0 | `-2` (no key) | genuinely unresolved — waiting |
+| **WON, stuck** | **799,791,777** | True | 1 | **7.35 / 5.26 / 5.26** | ~5.4–6.5 d | **winnings held, redeem blocked by stale key (A1)** |
+| WON, ledger desync | 796,795,788,785,783,773 | True | 1 | **0.0** | ~6.2 d | tokens already redeemed on-chain, ledger never settled (A2) |
+
+≈ **17.9 shares (~$17.90)** of confirmed winnings for a single user are sitting unclaimed with ~6 days
+left on the blocking key; six more are redeemed-but-unbooked.
+
+### 20.2 Design — 20.A: make the redeem pipeline self-healing & idempotent
+
+**Fix A1 — dedup TTL + failure-clear (short, self-expiring lease, not a 7-day lock).**
+Treat the redeem key as an **in-flight lease**, not a permanent "done" marker:
+- Set it with a **short TTL** (`redeem_lease_sec`, proposed **900s**) at dispatch — long enough to
+  prevent double-dispatch within a cycle, short enough to auto-retry soon after a failure.
+- **Clear it** (`_client().delete("once:redeem:{uid}:{cond}")`) in `redeem_position`'s failure and skip
+  paths (the `except` before `self.retry`, and every `redeem_skipped` return) so the next
+  `reconcile_settlements` cycle re-attempts instead of waiting a week. Add a `clear_once(key)` helper to
+  `core/cache.py`.
+- The **success** terminal state is `copy_trades.redeemed_at IS NOT NULL` (the ledger), **not** the
+  Redis key — so `get_outstanding_copy_trades` (which filters `redeemed_at IS NULL`) is the real dedup
+  and the Redis lease only prevents intra-window stampedes.
+
+**Fix A2 — always pass `trade_id` + a real `entry_cost`, and make marking mandatory.**
+- `sync_positions` redeemable dispatch (L121) must pass `trade_id` and `entry_cost` — look up the open
+  `copy_trades` row for `(uid, condition_id)` (reuse the same lookup `reconcile` uses at L975/L1004) so
+  the success path can mark it. Never dispatch a redeem that can't be reconciled.
+- Compute `entry_cost` via the **Blueprint 19 cost-basis resolver** (DB `entry_price × shares`, with the
+  BP19 fallback chain) rather than the zero-prone Data-API — this also feeds 20.D (Net PnL).
+
+**Fix A3 — reconcile the "already redeemed on-chain" case (shares == 0 winners).**
+In `reconcile_settlements`, when a trade is `resolved && won` but the on-chain `ctf_token_balance == 0`
+(tokens already gone), do **not** dispatch a redeem (there is nothing to claim). Instead
+`mark_trade_settled(result="win", realized_pnl = proceeds − entry_cost)` directly, where `proceeds` is
+the pre-redeem `shares` (from `copy_trades.shares`, or `size_usdc/entry_price`), and send the win
+notification once. This drains the six ledger-desync rows and books their PnL. Clear the stale key.
+
+**Fix A4 — stop skipping silently.** Every early `continue` in the reconcile win branch and every
+`redeem_skipped` return must emit a distinct throttled log (`reconcile_redeem_blocked`,
+`redeem_skipped_reason`) so a stuck claim is visible within minutes, not discovered by a user complaint.
+
+**One-time prod cleanup (ops runbook, not code):** delete the stale keys so recovery is immediate rather
+than waiting ~6 days: `redis-cli --scan --pattern 'once:redeem:*' | xargs redis-cli del` (safe — the
+ledger `redeemed_at` is the real dedup; worst case a redeemed trade re-dispatches and
+`redeem_winnings` returns `no_token_balance`, now handled by A3/A4). Run **after** deploying A1–A4.
+
+### 20.3 Root cause & design — 20.B: outcome fallback (`Исход: —`)
+
+Outcome comes straight from the Data-API position and is empty for grouped/scalar markets:
+
+```436:436:core/polymarket.py
+                "outcome":      p.get("outcome", ""),
+```
+
+**Fix — a central `resolve_outcome_name(...)` helper**, applied in every `_emit_*` notifier, with a
+fallback chain: (1) API `outcome`; (2) `trade_signals.outcome` via `signal_id` (we persisted it at
+entry — `execute_copy` L496); (3) the market's `outcomes[outcome_index]` from Gamma; (4)
+`groupItemTitle` for grouped markets ("Any Other Score" etc.); (5) last-resort binary default
+`Yes/No` from `outcome_index`. Only fall to `—` when all fail.
+
+### 20.4 Root cause & design — 20.C: full titles + word-boundary truncation
+
+Two issues: notifiers hard-slice `[:50]`/`[:40]`/`[:48]` (mid-word cut), and the positions Data-API
+`title` can be partial. **Fix:** (1) source the **full** title from `trade_signals.title` (the complete
+question stored at signal time, `execute_copy` L466) or the Gamma `question`, not the positions feed;
+(2) add one `smart_truncate(text, limit)` helper (cut on the last word boundary ≤ limit, append `…`)
+and replace the scattered `[:N]` slices in `_notify_closed`, `_emit_win`, `_emit_loss`,
+`_emit_win_pending`, `_emit_win_retry_failed`, and `redeem_position`'s notify.
+
+### 20.5 Root cause & design — 20.D: Net PnL in the win notification
+
+The win notice shows only the credited amount:
+
+```771:779:worker/tasks/manage_positions.py
+        _notify(
+            user["telegram_id"],
+            f"💸 <b>Выигрыш зачислен</b>\n\n"
+            f"📌 {(title or '—')[:50]}\n"
+            f"🎯 Исход: <b>{outcome or '—'}</b>\n"
+            f"➕ Зачислено: <b>+${credited:.2f} pUSD</b>\n"
+            f"💼 Торговый баланс: <b>${bal_after:.2f} pUSD</b>"
+            f"{_event_link(event_slug)}",
+        )
+```
+
+`entry_cost` is already a parameter but is (a) not passed by `sync_positions` (20.A2) and (b) never
+displayed. **Fix:** resolve `entry_cost` via the **Blueprint 19** cost-basis resolver (never the API
+avg), compute `net_pnl = gross − entry_cost` (gross = `shares_bal` × $1.00), and add a line:
+
+```text
+💸 Выигрыш зачислен
+📌 <full event title, word-safe>
+🎯 Исход: <resolved outcome>
+➕ Выплата: +$12.35
+🏆 Net PnL: +$4.60  (выплата $12.35 − вход $7.75)
+💼 Торговый баланс: $42.18 pUSD
+```
+
+Guard the unknown-cost-basis case (legacy rows, BP16/BP19): if `entry_cost` is unresolved, render
+`Net PnL: —` — never a wrong/negative-looking number.
+
+### 20.6 Files touched
+
+| File | Change |
+|---|---|
+| `core/cache.py` | **+** `clear_once(key)` helper (DELETE `once:{key}`); document the lease vs. terminal-state distinction |
+| `worker/tasks/manage_positions.py` | A1: short `redeem_lease_sec` TTL on the redeem key + clear on failure/skip; A2: `sync_positions` passes `trade_id`+`entry_cost` (BP19 resolver); A3: reconcile `shares==0 && won` → `mark_trade_settled` directly (no dispatch); A4: loud `reconcile_redeem_blocked`/`redeem_skipped_reason` logs; 20.B/C/D in the `_emit_*` + `redeem_position` notify |
+| `core/polymarket.py` | **+** `resolve_outcome_name(...)` (20.B) and a Gamma title/outcomes fetch by condition/slug; **+** `smart_truncate(text, limit)` (20.C) |
+| `core/db/queries.py` | reuse BP19 cost-basis resolver for `entry_cost`; helper to fetch open `(uid, cond)` row (`trade_id`, `shares`, `entry_price`, `signal.title/outcome`) for 20.A2/20.B/20.D; export (BP12-A guard) |
+| `core/config.py` | **+** `redeem_lease_sec = 900` |
+
+**No new migration.** Every column used (`entry_price`, `shares`, `size_usdc`, `signal_id`, `result`,
+`realized_pnl`, `redeemed_at`) already exists (migration 008); `trade_signals.title/outcome` exist.
+
+### 20.7 Acceptance criteria
+
+1. A resolved win with tokens still held (e.g. trade 799, 7.35 shares) is **redeemed within one
+   reconcile cycle** even after a prior failed attempt — the redeem key is a ≤15-min lease, cleared on
+   failure, and re-armed automatically.
+2. A resolved win already redeemed on-chain (`shares==0`, e.g. trade 796) is **marked settled**
+   (`result='win'`, `realized_pnl` booked, `redeemed_at` set) by reconcile **without** dispatching a
+   redeem, leaves the outstanding set, and notifies the user once.
+3. No redeem is ever dispatched without a `trade_id`; on success `mark_trade_settled` always runs.
+4. A stuck/blocked claim emits a throttled `reconcile_redeem_blocked` / `redeem_skipped_reason` log —
+   never a silent `continue`.
+5. Win/loss/pending notifications show a **resolved outcome** (never `—` when the signal or Gamma has
+   it) and a **full, word-boundary-truncated** title (no mid-word cut).
+6. The "Выигрыш зачислен" message shows **Net PnL = payout − entry cost** (BP19 cost basis), or `—`
+   when the cost basis is genuinely unknown.
+7. After the one-time key purge + deploy, `reconcile_settlements` `processed` > 0 while winners drain,
+   and the outstanding count falls to only genuinely-unresolved trades.
+
+### 20.8 Evidence pass (already executed — 2026-07-03) ✅ CONFIRMED
+
+- 48h grep: **no** `redeem_failed`/`did not confirm`/`Traceback`/`retry` → not an on-chain failure.
+- `redis-cli --scan 'once:redeem:*'`: dozens of keys with **~5–6.9 day** TTLs (7-day default), incl.
+  keys for resolved winners still holding tokens.
+- Live probe (user 4): 3 resolved winners with `shares>0` blocked by live redeem keys (money stuck) and
+  6 resolved winners with `shares==0` still `confirmed/unredeemed` (ledger desync). Directly validates
+  §20.1 A1 (stale key) + A2 (dispatch-without-`trade_id`) → fixes §20.2 A1–A4.

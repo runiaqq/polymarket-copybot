@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 import structlog
 
-from core.cache import claim, notify_once
+from core.cache import claim, clear_once, notify_once
 from core.config import settings
 from worker.celery_app import celery_app
 
@@ -112,17 +112,55 @@ def sync_positions() -> dict:
                 pnl = p.get("cash_pnl", 0)
                 won = cur >= 0.5
 
+                # BP20 Fix A2: look up the DB trade once so we can pass trade_id
+                # + entry_cost into redeem_position (never dispatch blind).
+                _rp_trade_id: int | None = None
+                _rp_entry_cost: float | None = None
+                _rp_signal_id: int | None = None
+                try:
+                    from core.db import get_open_trade_by_condition as _gotc
+                    _rt = _gotc(uid, condition_id)
+                    if _rt:
+                        _rp_trade_id = _rt.get("id")
+                        _rp_signal_id = _rt.get("signal_id")
+                        _ep = float(_rt.get("entry_price") or 0)
+                        _sh = float(_rt.get("shares") or 0)
+                        _sz = float(_rt.get("size_usdc") or 0)
+                        if _ep > 0 and _sh > 0:
+                            _rp_entry_cost = round(_ep * _sh, 4)
+                        elif _sz > 0:
+                            _rp_entry_cost = _sz
+                except Exception:
+                    log.warning("sync_redeemable_trade_lookup_failed",
+                                user_id=uid, cond=condition_id[:14])
+
+                if won and _rp_trade_id is None:
+                    log.warning("sync_redeemable_no_trade_id",
+                                user_id=uid, cond=condition_id[:14],
+                                note="redeem will still dispatch; mark_trade_settled may be skipped")
+
+                # BP20 Fix B: resolve outcome name from multi-tier fallback.
+                from core.polymarket import resolve_outcome_name, smart_truncate
+                _resolved_outcome = resolve_outcome_name(
+                    p.get("outcome"), p.get("outcome_index"),
+                    condition_id, _rp_signal_id,
+                )
+
                 if won and settings.auto_redeem_enabled:
                     # BP9 Layer 3: claim the redeem slot first so we know whether
                     # a concurrent process (reconcile_settlements) is already
                     # handling this — if so, skip the pending message entirely to
                     # avoid an out-of-order "processing…" after "зачислено".
-                    redeem_claimed = _notify_once(f"redeem:{uid}:{condition_id}")
+                    # BP20 Fix A1: short lease (redeem_lease_sec), not 7-day lock.
+                    redeem_claimed = notify_once(
+                        f"redeem:{uid}:{condition_id}",
+                        ttl=settings.redeem_lease_sec,
+                    )
                     if _notify_once(f"settle:{uid}:{condition_id}"):
                         if redeem_claimed:
                             # We own the redeem — send the pending message.
                             # Final "✅ Выигрыш зачислен" comes from redeem_position.
-                            _emit_win_pending(tg, p.get("title"), p.get("outcome"),
+                            _emit_win_pending(tg, p.get("title"), _resolved_outcome,
                                              event_slug=p.get("event_slug"))
                         # else: another process already dispatched and may have
                         # sent the final notification — stay silent.
@@ -130,21 +168,23 @@ def sync_positions() -> dict:
                     if redeem_claimed:
                         redeem_position.delay(
                             uid, token_id, condition_id,
-                            bool(p.get("neg_risk", False)), p.get("outcome"),
+                            bool(p.get("neg_risk", False)), _resolved_outcome,
                             p.get("title"), p.get("event_slug"),
                             p.get("outcome_index"),
+                            trade_id=_rp_trade_id,
+                            entry_cost=_rp_entry_cost,
                         )
                         actions += 1
                 elif won:
                     # auto_redeem disabled: send the terminal win notification
                     # with a manual-claim instruction (no on-chain tx expected).
                     if _notify_once(f"settle:{uid}:{condition_id}"):
-                        _emit_win(tg, p.get("title"), p.get("outcome"), pnl,
+                        _emit_win(tg, p.get("title"), _resolved_outcome, pnl,
                                   claimable=True, event_slug=p.get("event_slug"))
                         actions += 1
                 else:
                     if _notify_once(f"settle:{uid}:{condition_id}"):
-                        _emit_loss(tg, p.get("title"), p.get("outcome"), pnl,
+                        _emit_loss(tg, p.get("title"), _resolved_outcome, pnl,
                                    event_slug=p.get("event_slug"))
                         actions += 1
                 continue
@@ -410,22 +450,26 @@ def sync_positions() -> dict:
                 # BP9 Layer 3: this branch caused the prod bug (sent "выиграно"
                 # with no corresponding redeem dispatch).  Same guard logic as the
                 # redeemable branch: claim redeem slot first, then send pending.
-                redeem_claimed = _notify_once(f"redeem:{uid}:{cond_id}")
+                # BP20 Fix A1: short lease TTL, not a 7-day lock.
+                redeem_claimed = notify_once(
+                    f"redeem:{uid}:{cond_id}",
+                    ttl=settings.redeem_lease_sec,
+                )
                 if _notify_once(f"settle:{uid}:{cond_id}"):
                     if redeem_claimed:
                         _emit_win_pending(tg, c.get("title"), c.get("outcome"),
                                          event_slug=c.get("event_slug"))
                     actions += 1
                 if redeem_claimed:
-                    # Try to look up ledger fields and dispatch the redeem.
-                    # Falls back to backfill_legacy_redemptions for legacy rows
-                    # with NULL token_id (those have no ledger entry).
+                    # BP20 Fix A2: look up DB trade for trade_id + entry_cost.
+                    _cl_trade_id = None
+                    _cl_entry_cost = None
                     try:
                         from core.db import get_supabase as _gsb
                         _sb = _gsb()
                         _tr = (
                             _sb.table("copy_trades")
-                            .select("id,token_id,neg_risk,outcome_index")
+                            .select("id,token_id,neg_risk,outcome_index,entry_price,shares,size_usdc")
                             .eq("user_id", uid)
                             .eq("condition_id", cond_id)
                             .eq("status", "confirmed")
@@ -435,11 +479,21 @@ def sync_positions() -> dict:
                         )
                         _row = (_tr.data or [None])[0]
                         if _row and _row.get("token_id"):
+                            _cl_trade_id = _row.get("id")
+                            _ep = float(_row.get("entry_price") or 0)
+                            _sh = float(_row.get("shares") or 0)
+                            _sz = float(_row.get("size_usdc") or 0)
+                            if _ep > 0 and _sh > 0:
+                                _cl_entry_cost = round(_ep * _sh, 4)
+                            elif _sz > 0:
+                                _cl_entry_cost = _sz
                             redeem_position.delay(
                                 uid, _row["token_id"], cond_id,
                                 bool(_row.get("neg_risk", False)),
                                 c.get("outcome"), c.get("title"), c.get("event_slug"),
                                 _row.get("outcome_index"),
+                                trade_id=_cl_trade_id,
+                                entry_cost=_cl_entry_cost,
                             )
                             actions += 1
                     except Exception:
@@ -516,7 +570,8 @@ def close_position(self, user_id: int, token_id: str, reason: str = "manual") ->
         return {"skipped": True, "reason": "no_position"}
 
     condition_id = position.get("condition_id", "")
-    title = (position.get("title") or "—")[:50]
+    from core.polymarket import smart_truncate
+    title = smart_truncate(position.get("title"))
     outcome = position.get("outcome") or "—"
     cur_price = float(position.get("cur_price") or 0)
 
@@ -707,29 +762,42 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
         if shares_bal < settings.claim_dust_min_shares:
             log.info("redeem_skip_dust", user_id=user_id, token=token_id[:18],
                      shares=round(shares_bal, 6))
+            # BP20 Fix A1: clear the lease key so the next reconcile cycle can
+            # re-attempt rather than waiting for the 7-day default TTL.
+            clear_once(f"redeem:{user_id}:{condition_id}")
             return {"skipped": True, "reason": "dust_below_min"}
     except Exception:
         log.warning("redeem_dust_check_failed", user_id=user_id, token=token_id[:18])
 
-    # Blueprint 6 (3): hydrate title from trade_signals when called from the
-    # on-chain reconciler path (which passes title=None).
-    if not title and trade_id:
+    # Blueprint 6 (3) + BP20.B: hydrate title and outcome from trade_signals.
+    # Also capture signal_id for the outcome fallback chain (resolve_outcome_name).
+    _signal_id: int | None = None
+    if trade_id:
         try:
             tr = (sb.table("copy_trades")
                   .select("signal_id")
                   .eq("id", trade_id)
                   .maybe_single()
                   .execute())
-            if tr.data and tr.data.get("signal_id"):
+            _signal_id = (tr.data or {}).get("signal_id")
+            if _signal_id:
                 sig = (sb.table("trade_signals")
-                       .select("title")
-                       .eq("id", tr.data["signal_id"])
+                       .select("title, outcome")
+                       .eq("id", _signal_id)
                        .maybe_single()
                        .execute())
                 if sig.data:
-                    title = sig.data.get("title") or title
+                    if not title:
+                        title = sig.data.get("title") or title
+                    if not outcome:
+                        outcome = sig.data.get("outcome") or outcome
         except Exception:
             pass
+
+    # BP20 Fix B: resolve outcome name via 5-tier fallback chain so we
+    # never display '—' when the signal or Gamma has the answer.
+    from core.polymarket import resolve_outcome_name, smart_truncate
+    resolved_outcome = resolve_outcome_name(outcome, outcome_index, condition_id, _signal_id)
 
     # Prefer the API's outcomeIndex; fall back to the name (0 = "Yes", 1 = "No").
     if outcome_index is None:
@@ -740,7 +808,11 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
         r = redeem_winnings(user["wallet_private_key_enc"], condition_id,
                             bool(neg_risk), outcome_index, token_id)
         if r.get("skipped"):
-            log.info("redeem_skipped", user_id=user_id, reason=r.get("reason"))
+            # BP20 Fix A1: clear the lease so reconcile can re-attempt next cycle.
+            clear_once(f"redeem:{user_id}:{condition_id}")
+            log.warning("redeem_skipped_reason", user_id=user_id,
+                        condition_id=condition_id[:14], reason=r.get("reason"),
+                        note="lease cleared; will retry on next reconcile cycle")
             return r
         import time as _t
         _t.sleep(5)
@@ -768,12 +840,27 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
             except Exception:
                 log.warning("mark_trade_settled_failed", trade_id=trade_id)
 
+        # BP20 Fix D: compute Net PnL = gross payout − entry cost for display.
+        gross_display = shares_bal if shares_bal > 0 else credited
+        _entry_cost_val = float(entry_cost or 0)
+        if _entry_cost_val > 0:
+            _net_pnl = gross_display - _entry_cost_val
+            pnl_line = (
+                f"\n🏆 Net PnL: <b>{_net_pnl:+.2f}$</b> "
+                f"(выплата ${gross_display:.2f} − вход ${_entry_cost_val:.2f}$)"
+            )
+        else:
+            pnl_line = "\n🏆 Net PnL: <b>—</b>"
+
+        # BP20 Fix C: word-boundary title truncation.
+        # BP20 Fix B: resolved_outcome (never '—' when the signal/Gamma has it).
         _notify(
             user["telegram_id"],
             f"💸 <b>Выигрыш зачислен</b>\n\n"
-            f"📌 {(title or '—')[:50]}\n"
-            f"🎯 Исход: <b>{outcome or '—'}</b>\n"
-            f"➕ Зачислено: <b>+${credited:.2f} pUSD</b>\n"
+            f"📌 {smart_truncate(title)}\n"
+            f"🎯 Исход: <b>{resolved_outcome}</b>\n"
+            f"➕ Выплата: <b>+${credited:.2f} pUSD</b>"
+            f"{pnl_line}\n"
             f"💼 Торговый баланс: <b>${bal_after:.2f} pUSD</b>"
             f"{_event_link(event_slug)}",
         )
@@ -782,13 +869,16 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
         return {"redeemed": True, "credited": credited}
     except Exception as exc:
         log.exception("redeem_failed", user_id=user_id, token=token_id[:14])
+        # BP20 Fix A1: clear the lease on failure so the next reconcile cycle
+        # can re-attempt without waiting for the TTL to expire.
+        clear_once(f"redeem:{user_id}:{condition_id}")
         # BP9 Layer 3: on final retry exhaustion, tell the user their credit is
         # delayed rather than leaving them with only the pending message.
         if self.request.retries >= self.max_retries:
             try:
                 tg_id = user.get("telegram_id")
                 if tg_id:
-                    _emit_win_retry_failed(tg_id, title, outcome, event_slug)
+                    _emit_win_retry_failed(tg_id, title, resolved_outcome, event_slug)
             except Exception:
                 pass
         raise self.retry(exc=exc)
@@ -826,11 +916,12 @@ def _notify_closed(telegram_id: int, position: dict, reason: str,
         "delta_drop_stop": "📉 Дельта-дроп стоп (-30%)",
         "manual":          "✋ Вручную",
     }
+    from core.polymarket import smart_truncate
     pnl = position.get("cash_pnl", 0)
     pct = max(-1.0, min(10.0, position.get("percent_pnl", 0)))
     icon = "📈" if pnl >= 0 else "📉"
     outcome = position.get("outcome") or "—"
-    title = (position.get("title") or "—")[:50]
+    title = smart_truncate(position.get("title"))
     bal_line = f"\n💼 Торговый баланс: <b>${remaining:.2f} pUSD</b>" if remaining is not None else ""
     _notify(
         telegram_id,
@@ -845,6 +936,7 @@ def _notify_closed(telegram_id: int, position: dict, reason: str,
 
 def _emit_win(telegram_id: int, title: str | None, outcome: str | None,
               pnl: float, claimable: bool = False, event_slug: str | None = None) -> None:
+    from core.polymarket import smart_truncate
     note = ""
     if claimable:
         note = (
@@ -855,7 +947,7 @@ def _emit_win(telegram_id: int, title: str | None, outcome: str | None,
     _notify(
         telegram_id,
         f"🏆 <b>Событие выиграно!</b>\n\n"
-        f"📌 {(title or '—')[:50]}\n"
+        f"📌 {smart_truncate(title)}\n"
         f"🎯 Исход: <b>{outcome or '—'}</b>\n"
         f"📈 Результат: <b>{pnl:+.2f}$</b>"
         f"{_event_link(event_slug)}{note}",
@@ -864,10 +956,11 @@ def _emit_win(telegram_id: int, title: str | None, outcome: str | None,
 
 def _emit_loss(telegram_id: int, title: str | None, outcome: str | None,
                pnl: float, event_slug: str | None = None) -> None:
+    from core.polymarket import smart_truncate
     _notify(
         telegram_id,
         f"💔 <b>Событие проиграно</b>\n\n"
-        f"📌 {(title or '—')[:50]}\n"
+        f"📌 {smart_truncate(title)}\n"
         f"🎯 Исход: <b>{outcome or '—'}</b>\n"
         f"📉 Результат: <b>{pnl:+.2f}$</b>"
         f"{_event_link(event_slug)}",
@@ -882,10 +975,11 @@ def _emit_win_pending(telegram_id: int, title: str | None, outcome: str | None,
     on-chain tx + pUSD balance change are confirmed.  Never call _emit_win from a
     branch that also dispatches auto-redeem — this is the replacement.
     """
+    from core.polymarket import smart_truncate
     _notify(
         telegram_id,
         f"🏁 <b>Событие выиграно — оформляю зачисление</b>\n\n"
-        f"📌 {(title or '—')[:50]}\n"
+        f"📌 {smart_truncate(title)}\n"
         f"🎯 Исход: <b>{outcome or '—'}</b>\n"
         f"⏳ Средства будут зачислены после подтверждения on-chain транзакции."
         f"{_event_link(event_slug)}",
@@ -895,10 +989,11 @@ def _emit_win_pending(telegram_id: int, title: str | None, outcome: str | None,
 def _emit_win_retry_failed(telegram_id: int, title: str | None, outcome: str | None,
                            event_slug: str | None = None) -> None:
     """BP9 Layer 3 — sent when redeem_position exhausts all retries without success."""
+    from core.polymarket import smart_truncate
     _notify(
         telegram_id,
         f"⏳ <b>Выигрыш определён, зачисление задерживается</b>\n\n"
-        f"📌 {(title or '—')[:50]}\n"
+        f"📌 {smart_truncate(title)}\n"
         f"🎯 Исход: <b>{outcome or '—'}</b>\n"
         f"Повторяем попытку автоматически. Если баланс не изменится в течение "
         f"нескольких минут — обратись в поддержку."
@@ -956,14 +1051,19 @@ def reconcile_settlements() -> dict:
                 )
                 if _notify_once(f"settle:{uid}:{cond}"):
                     _resolve_user_for_notification(sb, uid, cond, won=False,
-                                                   entry_cost=entry_cost)
+                                                   entry_cost=entry_cost,
+                                                   outcome_index=int(outcome_idx))
                 log.info("reconcile_loss", user_id=uid, cond=cond[:14],
                          cost=round(entry_cost, 2))
             else:
                 # Win: dispatch the existing idempotent redeem_position task.
-                # mark_trade_settled is called inside _on_redeem_done after tx confirmed.
-                if not notify_once(f"redeem:{uid}:{cond}"):
-                    continue  # already dispatched
+                # mark_trade_settled is called inside redeem_position after tx confirmed.
+                # BP20 Fix A1: short lease (redeem_lease_sec), not a 7-day lock.
+                if not notify_once(f"redeem:{uid}:{cond}", ttl=settings.redeem_lease_sec):
+                    log.warning("reconcile_redeem_blocked",
+                                user_id=uid, cond=cond[:14],
+                                note="redeem key still live; will retry when lease expires")
+                    continue
 
                 # Blueprint 6: terminal guard — if close_position already exited
                 # this trade (status='closed'), skip redemption entirely.
@@ -975,30 +1075,67 @@ def reconcile_settlements() -> dict:
                 res = sb.table("users").select("*").eq("id", uid).maybe_single().execute()
                 user = res.data if res else None
                 if not user:
+                    log.warning("reconcile_user_not_found", user_id=uid, cond=cond[:14])
                     continue
 
-                # Blueprint 6: dust guard — check on-chain ERC-1155 balance before
-                # dispatching.  Prevents empty "$0.01 win" notifications for dust
-                # left by close_position's 2-dp truncation.
+                # Blueprint 6 + BP20 Fix A3: check on-chain ERC-1155 balance.
+                # Case A  — shares > 0: tokens still held, dispatch normal redeem.
+                # Case B  — shares == 0 (dust/zero): tokens already gone on-chain
+                #           (ledger-desync rows).  Mark settled directly — no
+                #           dispatch needed; nothing to claim.
                 dw = user.get("deposit_wallet_address")
+                shares_on_chain: float = 0.0
+                dust_check_ok = False
                 if dw:
                     try:
                         from core.relayer import ctf_token_balance
                         raw_bal = ctf_token_balance(dw, token_id)
-                        shares_bal = raw_bal / 1_000_000
-                        if shares_bal < settings.claim_dust_min_shares:
-                            log.info("reconcile_skip_dust", user_id=uid, cond=cond[:14],
-                                     shares=round(shares_bal, 6))
+                        shares_on_chain = raw_bal / 1_000_000
+                        dust_check_ok = True
+                        if shares_on_chain < settings.claim_dust_min_shares:
+                            # BP20 Fix A3: tokens already redeemed on-chain.
+                            # Settle the ledger row and notify the user once.
+                            _proceeds = float(trade.get("shares") or 0)
+                            if _proceeds == 0:
+                                _ep = float(trade.get("entry_price") or 0)
+                                _sz = float(trade.get("size_usdc") or 0)
+                                _proceeds = _sz / _ep if _ep > 0 else _sz
+                            _net_pnl = _proceeds - entry_cost
+                            mark_trade_settled(trade["id"], result="win",
+                                               realized_pnl=_net_pnl)
+                            clear_once(f"redeem:{uid}:{cond}")
+                            if _notify_once(f"settle:{uid}:{cond}"):
+                                _resolve_user_for_notification(
+                                    sb, uid, cond, won=True,
+                                    entry_cost=_net_pnl, pending=False,
+                                    outcome_index=int(outcome_idx),
+                                )
+                            log.info("reconcile_settled_already_redeemed",
+                                     user_id=uid, cond=cond[:14],
+                                     shares_on_chain=round(shares_on_chain, 6),
+                                     proceeds=round(_proceeds, 4),
+                                     net_pnl=round(_net_pnl, 4))
+                            processed += 1
                             continue
                     except Exception:
-                        log.warning("reconcile_dust_check_failed", user_id=uid)
+                        log.warning("reconcile_dust_check_failed", user_id=uid,
+                                    cond=cond[:14])
+                else:
+                    log.warning("reconcile_no_deposit_wallet", user_id=uid,
+                                cond=cond[:14])
+
+                if not dust_check_ok:
+                    log.warning("reconcile_skipped_no_balance_check", user_id=uid,
+                                cond=cond[:14],
+                                note="proceeding with dispatch despite failed balance check")
 
                 # BP9 Layer 3: send pending notification before dispatching so the
                 # user knows resolution was detected (final "зачислено" comes from
                 # redeem_position after the on-chain tx confirms).
                 if _notify_once(f"settle:{uid}:{cond}"):
                     _resolve_user_for_notification(
-                        sb, uid, cond, won=True, entry_cost=entry_cost, pending=True
+                        sb, uid, cond, won=True, entry_cost=entry_cost,
+                        pending=True, outcome_index=int(outcome_idx),
                     )
 
                 redeem_position.delay(
@@ -1010,7 +1147,8 @@ def reconcile_settlements() -> dict:
                     trade_id=trade["id"],
                     entry_cost=entry_cost,
                 )
-                log.info("reconcile_win_dispatched", user_id=uid, cond=cond[:14])
+                log.info("reconcile_win_dispatched", user_id=uid, cond=cond[:14],
+                         trade_id=trade["id"], entry_cost=round(entry_cost, 4))
 
             processed += 1
         except Exception:
@@ -1167,7 +1305,8 @@ def backfill_legacy_redemptions() -> dict:
 
 def _resolve_user_for_notification(sb, uid: int, cond: str,
                                    won: bool, entry_cost: float,
-                                   pending: bool = False) -> None:
+                                   pending: bool = False,
+                                   outcome_index: int | None = None) -> None:
     """Load the user record and send a win/loss notification.
 
     Blueprint 6: hydrates title/outcome from trade_signals via the copy_trades
@@ -1176,6 +1315,9 @@ def _resolve_user_for_notification(sb, uid: int, cond: str,
     BP9 Layer 3: when pending=True and won=True, sends _emit_win_pending instead
     of the terminal _emit_win, so the final "зачислено" is reserved for
     redeem_position after the on-chain tx confirms.
+
+    BP20 Fix B: resolves the outcome via the 5-tier fallback chain so '—' never
+    appears when the signal or Gamma has the name.
     """
     try:
         res = sb.table("users").select("telegram_id").eq("id", uid).maybe_single().execute()
@@ -1184,8 +1326,10 @@ def _resolve_user_for_notification(sb, uid: int, cond: str,
             return
         tg = user["telegram_id"]
 
-        # Hydrate title from the copy_trades → trade_signals join.
+        # Hydrate title and outcome from the copy_trades → trade_signals join.
         title: str | None = None
+        signal_outcome: str | None = None
+        signal_id: int | None = None
         try:
             tr = (sb.table("copy_trades")
                   .select("signal_id")
@@ -1195,22 +1339,30 @@ def _resolve_user_for_notification(sb, uid: int, cond: str,
                   .limit(1)
                   .execute())
             if tr.data and tr.data[0].get("signal_id"):
+                signal_id = tr.data[0]["signal_id"]
                 sig = (sb.table("trade_signals")
-                       .select("title")
-                       .eq("id", tr.data[0]["signal_id"])
+                       .select("title, outcome")
+                       .eq("id", signal_id)
                        .maybe_single()
                        .execute())
                 if sig.data:
                     title = sig.data.get("title")
+                    signal_outcome = sig.data.get("outcome")
         except Exception:
             pass
 
+        # BP20 Fix B: resolve outcome via 5-tier chain.
+        from core.polymarket import resolve_outcome_name
+        resolved_outcome = resolve_outcome_name(
+            signal_outcome, outcome_index, cond, signal_id
+        )
+
         if won and pending:
-            _emit_win_pending(tg, title, None)
+            _emit_win_pending(tg, title, resolved_outcome)
         elif won:
-            _emit_win(tg, title, None, entry_cost)
+            _emit_win(tg, title, resolved_outcome, entry_cost)
         else:
-            _emit_loss(tg, title, None, -entry_cost)
+            _emit_loss(tg, title, resolved_outcome, -entry_cost)
     except Exception:
         log.warning("resolve_user_notify_failed", user_id=uid)
 

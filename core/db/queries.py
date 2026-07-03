@@ -554,6 +554,30 @@ def get_open_trade_by_token(user_id: int, token_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
+def get_open_trade_by_condition(user_id: int, condition_id: str) -> dict | None:
+    """Find the newest confirmed-and-unredeemed copy_trade for a condition.
+
+    Blueprint 20 Fix A2: called by sync_positions before dispatching
+    redeem_position so trade_id and entry_cost are always passed through.
+    Returns id, entry_price, shares, size_usdc, signal_id — all fields needed
+    for the BP19 cost-basis resolver and the BP20.B outcome fallback.
+    """
+    sb = get_supabase()
+    res = (
+        sb.table("copy_trades")
+        .select("id, entry_price, shares, size_usdc, signal_id")
+        .eq("user_id", user_id)
+        .eq("condition_id", condition_id)
+        .eq("status", "confirmed")
+        .is_("redeemed_at", "null")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
 def mark_trade_closed(trade_id: int, realized_pnl: float,
                       exit_tx: str | None = None) -> None:
     """Mark a copy_trade row as closed by a token-sale exit (terminal state).

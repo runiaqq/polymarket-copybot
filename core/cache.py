@@ -27,12 +27,32 @@ def _client():
 
 
 def notify_once(key: str, ttl: int = 7 * 86400) -> bool:
-    """Return True only the first time `key` is seen (Redis SETNX with TTL)."""
+    """Return True only the first time `key` is seen (Redis SETNX with TTL).
+
+    Default TTL is 7 days for permanent "done" markers (e.g. settle:*).
+    For short-lived in-flight leases (e.g. redeem:*) pass a short TTL such as
+    settings.redeem_lease_sec (900 s) — the real terminal state is the DB ledger.
+    """
     try:
         return bool(_client().set(f"once:{key}", "1", nx=True, ex=ttl))
     except Exception:
         # Fail-open: a dead Redis means the worker is degraded anyway.
         return True
+
+
+def clear_once(key: str) -> None:
+    """Delete the `once:{key}` lease so it can be re-claimed.
+
+    Blueprint 20 A1: used to release a short-lived redeem lease after a failure
+    or skip so the next reconcile cycle can re-attempt instead of waiting for the
+    TTL to expire.  Safe to call even when the key doesn't exist.
+    The permanent terminal state is copy_trades.redeemed_at IS NOT NULL (the DB
+    ledger), NOT this Redis key — clearing the key is never a double-spend risk.
+    """
+    try:
+        _client().delete(f"once:{key}")
+    except Exception:
+        pass
 
 
 def claim(key: str, ttl: int = 7 * 86400) -> None:

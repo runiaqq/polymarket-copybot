@@ -37,6 +37,108 @@ def event_url(event_slug: str | None) -> str | None:
     """Public Polymarket event page URL for a given event slug."""
     return f"{EVENT_URL_BASE}{event_slug}" if event_slug else None
 
+
+def smart_truncate(text: str | None, limit: int = 50) -> str:
+    """Truncate *text* to at most *limit* characters at the last word boundary.
+
+    Blueprint 20.C: replaces scattered [:N] hard-slices throughout the
+    notification templates.  Rules:
+    - Returns '—' for None / empty.
+    - Returns the full string when it fits within *limit*.
+    - Cuts at the last space at or before *limit* and appends '…' (U+2026).
+    - Falls back to a hard cut at *limit* when no space is found (e.g. one
+      very long token).
+    """
+    if not text:
+        return "—"
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    cut = text.rfind(" ", 0, limit)
+    if cut <= 0:
+        cut = limit
+    return text[:cut].rstrip() + "…"
+
+
+def resolve_outcome_name(
+    outcome: str | None,
+    outcome_index: int | None = None,
+    condition_id: str | None = None,
+    signal_id: int | None = None,
+) -> str:
+    """Central outcome resolver with a five-tier fallback chain.
+
+    Blueprint 20.B: fixes 'Исход: —' notifications on grouped / scalar
+    markets where the Data API returns an empty ``outcome`` field.
+
+    Tier 1 — API outcome (direct, already normalised at call site).
+    Tier 2 — trade_signals.outcome stored at copy-entry time.
+    Tier 3 — Gamma market outcomes[outcome_index].
+    Tier 4 — Gamma groupItemTitle (e.g. "Any Other Score").
+    Tier 5 — binary default from outcome_index (0=Yes, 1=No).
+    Last resort — '—'.
+    """
+    # Tier 1
+    if outcome and outcome.strip():
+        return outcome.strip()
+
+    # Tier 2 — trade_signals.outcome via signal_id
+    if signal_id:
+        try:
+            from core.db.session import get_supabase
+            sb = get_supabase()
+            sig = (
+                sb.table("trade_signals")
+                .select("outcome")
+                .eq("id", signal_id)
+                .maybe_single()
+                .execute()
+            )
+            sig_out = ((sig.data or {}).get("outcome") or "").strip()
+            if sig_out:
+                return sig_out
+        except Exception:
+            pass
+
+    # Tier 3 & 4 — Gamma market data
+    if condition_id:
+        try:
+            resp = httpx.get(
+                GAMMA_MARKETS_URL,
+                params={"conditionId": condition_id},
+                timeout=8.0,
+                headers=_HEADERS,
+            )
+            resp.raise_for_status()
+            markets = resp.json()
+            if isinstance(markets, list) and markets:
+                m = markets[0]
+                # Tier 4 — groupItemTitle (grouped/scalar markets like "Any Other Score")
+                group_title = (m.get("groupItemTitle") or "").strip()
+                if group_title:
+                    return group_title
+                # Tier 3 — outcomes[outcome_index]
+                if outcome_index is not None:
+                    raw_out = m.get("outcomes") or "[]"
+                    try:
+                        outs = (
+                            json.loads(raw_out)
+                            if isinstance(raw_out, str)
+                            else (raw_out or [])
+                        )
+                        if outcome_index < len(outs) and str(outs[outcome_index]).strip():
+                            return str(outs[outcome_index]).strip()
+                    except Exception:
+                        pass
+        except Exception:
+            log.warning("resolve_outcome_gamma_failed", condition_id=(condition_id or "")[:14])
+
+    # Tier 5 — binary default
+    if outcome_index is not None:
+        return "Yes" if int(outcome_index) == 0 else "No"
+
+    return "—"
+
 # ── Fast-markets cache ──────────────────────────────────────────────────────────
 # condition_id -> market metadata dict
 _fast_markets: dict[str, dict] = {}
