@@ -327,6 +327,30 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   "принято до 00:00 UTC". Two new DB helpers (`get_risk_override_until`,
   `set_risk_override_until`) exported from `core/db`.
 
+- **[BP19] Global Stop-Loss Invariant — DB-first effective-entry resolver** (2026-07-03):
+  Closed the **Stop-Loss Leak**: `sync_positions` previously read cost basis exclusively from
+  the Data-API `avg_price` which is `0` for POLY_1271 proxy wallets (indexing lag), causing
+  the `entry_px > 0` Delta-Drop guard to silently skip every poll — positions rode to
+  resolution without being stopped. **5-tier fallback chain** implemented in
+  `worker/tasks/manage_positions.py` (`_db_entry_prices` fetched once per user per cycle via
+  `get_entry_prices_by_token`):
+  **Tier 1** — `copy_trades.entry_price` (DB, our true fill cost — preferred for risk path);
+  **Tier 2** — Data-API `avg_price` (only when Tier 1 is 0/NULL);
+  **Tier 3** — `size_usdc / shares` (ledger-derived, when both are present);
+  **Tier 4** — `trade_signals.price` (VWAP entry from the originating signal, via new
+  `get_signal_price` helper in `core/db/queries.py`);
+  **Tier 5** — hard floor `0.01` + `log.error("stop_no_cost_basis", …)` — a skipped stop
+  is **never silent again**.
+  `position_mark` log ungated (now fires for every position regardless of API avg) and
+  extended with `entry_source` field showing which tier resolved the value.
+  Fix 3 (defence-in-depth): `stop_mid_floor_enabled` fires `hard_stop` when `mid <
+  hard_stop_abs_price` even before `best_bid` reaches the floor; hollow-book positions
+  (`best_bid == 0`) emit `stop_unsellable_hollow_book` (throttled via `notify_once`) for ops
+  visibility. Three new config knobs added to `core/config.py`:
+  `stop_use_db_entry` (default `True`), `stop_mid_floor_enabled` (default `True`),
+  `stop_no_cost_basis_alert` (default `True`). No DB migration required — `entry_price`,
+  `size_usdc`, `shares`, `signal_id` already exist (migration 008).
+
 ---
 
 ## 4. Known Bugs & Missing Features
@@ -4045,3 +4069,309 @@ PY
 **Expected:** EOA pUSD/USDC ≈ 0 (only POL), deposit-wallet pUSD > 0, `withdrawable_usdc` > 0, and
 `open copy_trades` > 0 — confirming §18.1 (the card reads the EOA; the money and positions are on the
 deposit wallet / in the ledger). Fix = §18.2 + §18.3 + §18.5; no migration.
+
+---
+
+## Blueprint 19 — Global Stop-Loss Invariant & Fixed-Sizing Leak ✅ IMPLEMENTED (2026-07-03)
+
+> **Class of bug:** a **risk-path** instance of the exact **Blueprint 16 wrong-source** defect. The
+> stop-loss monitor reads its cost basis from the Polymarket **Data-API `avg_price`** — the same field
+> BP16 proved returns **`0`** for our custodial POLY_1271 proxy wallets. When it is `0`, a `> 0` guard
+> **silently skips the entire Delta-Drop stop**, so the position rides to resolution. BP16 fixed this for
+> the *display* path but the fix was **never wired into the money-losing risk path.** This is a
+> **stop-loss leak that costs real money**, not a cosmetic bug — §5 fail-closed applies.
+
+### 19.0 Symptom (prod, user @sto1ner / id 891787021)
+
+Trade-history rows where the **−30% Delta-Drop stop (Blueprint 17) never fired**:
+
+| Entry | Exit | Drawdown | Should have stopped at |
+|---|---|---|---|
+| 0.54 | 0.17 | ~68% | ~0.38 (−30%) |
+| 0.66 | 0.00 | 100% | ~0.46 (−30%) |
+| 0.88 | 0.55 | ~37% | ~0.62 (−30%) |
+
+The admin's own account (`SIZING_MODE=kelly`) stops correctly; this user is on `SIZING_MODE=fixed`,
+which produced the **plausible-but-wrong** hypothesis that the monitor filters by sizing mode.
+
+### 19.1 Root-cause analysis — TWO findings
+
+**Finding A — the sizing-mode hypothesis is REFUTED (spurious correlation).**
+There is **no `sizing_mode` branch anywhere in the monitor path**:
+- `get_active_subscribers()` (`core/db/queries.py` L54–86) filters on `sub_tier`, `sub_expires_at`,
+  `copy_paused_until`, and (auto-copy) `copy_active`/`wallet_address` — **never** `sizing_mode`.
+- `sync_positions` iterates every returned subscriber identically and the stop block is explicitly
+  annotated as sizing-agnostic:
+
+```150:150:worker/tasks/manage_positions.py
+            # BP13.3 invariant: stop is sizing-agnostic; never branch on sizing_mode.
+```
+
+`sizing_mode` (per-user, migration 011) affects **entry sizing only** (`execute_copy`, §2.3 / BP13.1);
+it is invisible to `sync_positions`. Kelly vs Fixed working differently is a **coincidence of indexer
+timing** (see Finding B) — not causation.
+
+**Finding B — the real leak: stop-loss uses the Data-API `avg_price` (BP16's known-zero source), and a `> 0` guard skips silently.**
+The monitor takes its cost basis straight from the on-chain Data-API position:
+
+```198:199:worker/tasks/manage_positions.py
+            # Cost-basis entry price from Data-API avg_price.
+            entry_px = float(p.get("avg_price") or 0)
+```
+
+The **entire** Delta-Drop evaluation is then gated on that value being non-zero:
+
+```234:235:worker/tasks/manage_positions.py
+            if entry_px > 0 and price_ref > 0:
+                drop_pct = 1.0 - price_ref / entry_px
+```
+
+Per **Blueprint 16 §16.1 (verified in §16.7)**, `avgPrice` from the Data API is **`0` for freshly-opened
+positions on POLY_1271 proxy wallets** (indexing lag + proxy attribution). When `entry_px == 0`:
+- `if entry_px > 0` is **False** → Delta-Drop is **skipped every poll**, with **no log line** (this is
+  the silent leak — `position_mark` at L208 is *also* gated on `entry_px > 0`, so there is literally no
+  trace the position was ever evaluated).
+- The **only** remaining net is the absolute `hard_stop`, which itself has a guard that leaks:
+
+```280:283:worker/tasks/manage_positions.py
+            if best_bid > 0 and best_bid < settings.hard_stop_abs_price:
+                log.info("hard_stop_triggered",
+                         user_id=uid, token=token_id[:14],
+                         cur_price=best_bid, threshold=settings.hard_stop_abs_price)
+```
+
+This explains the table exactly:
+- **0.54 → 0.17** and **0.88 → 0.55**: mid stayed **above** `hard_stop_abs_price` (0.07), and Delta-Drop
+  was dead (`entry_px=0`) → **nothing fired**; the loss only crystallised at resolution/manual close.
+- **0.66 → 0.00**: rode all the way down; once the book went **hollow (`best_bid == 0`)**, even
+  `hard_stop` is vetoed by its own `best_bid > 0` guard → **no exit possible** → settled at $0.
+
+**Why the admin (Kelly) was protected and this user (Fixed) was not — the real differentiator.** It is
+*not* the sizing mode. It is **whether the Data-API had back-filled `avgPrice` by the time the monitor
+polled** — a function of indexing lag, market liquidity, and fill timing. The admin's positions happened
+to have a non-zero `avgPrice` (guard passed → stop worked); this user's were still `0` at evaluation
+time (guard failed → stop skipped). The BP16 evidence pass already proved **18/25** open positions carry
+a good `entry_price` in our DB while the on-chain `avgPrice` reads `0` — i.e. **the correct cost basis
+was sitting in `copy_trades` the whole time; the monitor just never looked at it.**
+
+**Finding C — the fix ingredient already exists but is unused on the risk path.**
+BP16 shipped `get_entry_prices_by_token(user_id)` (`core/db/queries.py` L663–691) and the `/positions`
+view uses it (`_db_entry_prices`). `manage_positions.py` does **not** import or use it — the only
+`entry_price`/`avg_price` reference in the whole monitor is the raw L199 read above.
+
+### 19.2 Design — stop-loss as a GLOBAL, data-resilient invariant
+
+The stop must be **(1)** independent of sizing mode (already structurally true — keep it that way, never
+add a `sizing_mode` branch), and **(2)** resilient to a missing/zero on-chain cost basis via a
+deterministic fallback chain, and **(3)** never able to fail *silently* again.
+
+**Fix 1 — Effective-entry resolver with a fallback chain (the core fix).**
+Introduce a single cost-basis resolver used by the stop, mirroring BP16 but **DB-first** (the risk path
+should trust *our own recorded fill*, not an indexer that is provably zero/late):
+
+```text
+effective_entry(uid, token, api_avg_price):
+    1. DB copy_trades.entry_price        (get_entry_prices_by_token — our true fill cost)   ← preferred
+    2. Data-API avg_price                (only if DB is 0/NULL and api_avg_price > 0)
+    3. size_usdc / shares                (derive from the ledger row when both are present)
+    4. trade_signals.price               (via signal_id — the VWAP entry the signal carried)
+    5. None                              → cannot compute Delta-Drop; log LOUD + rely on Fix 3 floor
+```
+
+> **Precedence rationale (differs from BP16 on purpose).** BP16 chose *API-if-nonzero, else DB* for a
+> *display* because the API blends partial fills. For a **stop-loss** we want the deterministic,
+> tamper-proof number we actually paid — our `entry_price` — so the trigger can never be moved by
+> indexer noise. Both are near-identical in practice; DB-first is the safer risk default.
+
+Batch it once per user per cycle (one query, same shape as BP16): call
+`get_entry_prices_by_token(uid)` at the top of the per-user loop and look up `token_id` inside the
+position loop — do **not** query per position.
+
+**Fix 2 — Never skip silently: LOUD logging on missing cost basis.**
+The defining property of this incident is that the leak left **no trace**. Add an explicit branch: when
+`effective_entry` is `None`, emit `log.warning("stop_no_cost_basis", user_id, token, api_avg=…, cur=…)`
+every poll (throttle via `notify_once`/Redis if noisy). A skipped stop must be **observable** so the next
+leak is caught in minutes, not weeks. Also drop the `entry_px > 0` gate on `position_mark` so a position
+is marked (with `entry=None`/`source=…`) even when the API avg is 0.
+
+**Fix 3 — Cost-basis-independent catastrophic floor (defense-in-depth).**
+`hard_stop` is the only sizing- and entry-independent net; keep it, and harden its two leaks:
+- It fires on `best_bid < hard_stop_abs_price` **only while `best_bid > 0`**. That guard is *correct*
+  (you cannot market-sell into an empty book), but the **hollow-book → rides-to-$0** case must be made
+  **visible**: when `best_bid == 0` on an aged position, log `stop_unsellable_hollow_book` so ops can see
+  a position that is un-exitable (its loss is already locked; nothing to do but wait for resolution).
+- Consider a second absolute floor keyed on the **mid** (`price_ref < hard_stop_abs_price`) so a
+  collapsing-but-not-yet-hollow book is caught even if the exact `best_bid` guard is borderline.
+
+**Fix 4 — Keep the BP17 hardening intact.** All four BP17 layers (mid, spread veto, entry-bid,
+persistence/debounce) sit *inside* the `if entry_px > 0` block, so today they never even run when
+`entry_px=0`. Once Fix 1 supplies a real entry, BP17 resumes protecting against the spread-trap
+false-positive. The two blueprints compose: **BP17 stops false stops; BP19 stops missed stops.** Layer 3
+(`entry_bid`) already degrades gracefully to `layer3_ok=True` when `entry_bid` is NULL (L240–248) — no
+change needed there.
+
+### 19.3 Config knobs (add to `core/config.py`)
+
+| Setting | Proposed default | Meaning |
+|---|---|---|
+| `stop_use_db_entry` | `True` | resolve cost basis DB-first (Fix 1); `False` = legacy API-only |
+| `stop_mid_floor_enabled` | `True` | also fire `hard_stop` when the **mid** < `hard_stop_abs_price` (Fix 3) |
+| `stop_no_cost_basis_alert` | `True` | emit `stop_no_cost_basis` warnings when entry is unresolved |
+
+No new *threshold* is introduced — `delta_drop_stop_pct` (0.30) and `hard_stop_abs_price` (0.07) are
+unchanged. The fix is about **feeding the existing math a correct, always-present input.**
+
+### 19.4 Files touched
+
+| File | Change |
+|---|---|
+| `worker/tasks/manage_positions.py` | Replace the L199 `avg_price`-only read with the `effective_entry` resolver (Fix 1); fetch `get_entry_prices_by_token(uid)` once per user; add `stop_no_cost_basis` + `stop_unsellable_hollow_book` logs (Fix 2/3); ungate `position_mark`; optional mid-floor hard_stop (Fix 3) |
+| `core/db/queries.py` | `get_open_trade_by_token` (or a small new helper) to also return `size_usdc`, `shares`, and the signal's `price` for fallback tiers 3–4; **or** a dedicated `get_cost_basis(uid, token)` that returns the resolved entry with a `source` label |
+| `core/db/__init__.py` | re-export any new helper (import block **and** `__all__` — BP12-A guard) |
+| `core/config.py` | add the three knobs in §19.3 |
+
+**No migration required** — `entry_price` (008), `shares`/`size_usdc` (008), `signal_id`→`trade_signals.price`
+all already exist. This is a read-path rewire, not a schema change.
+
+### 19.5 Acceptance criteria
+
+1. A position bought at `0.54` whose **DB `entry_price` is 0.54** but whose Data-API `avg_price` is `0`
+   **is stopped** at ~`0.38` (−30%, subject to BP17 spread/persistence layers) — the stop no longer
+   depends on the on-chain avg being populated.
+2. When cost basis is unresolvable from **all** tiers, the monitor emits `stop_no_cost_basis` **every
+   evaluation** (throttled) — a skipped stop is never silent again.
+3. A hollow-book (`best_bid == 0`) aged position logs `stop_unsellable_hollow_book` (visibility), and
+   `hard_stop` still fires the instant a bid ≥ tick reappears below `0.07`.
+4. **No code path branches on `sizing_mode`** in `sync_positions`/`close_position`; Kelly and Fixed users
+   are byte-for-byte identical through the stop logic (grep proof in acceptance).
+5. BP17's spread veto + persistence still suppress the false-positive spread-trap once a real entry is
+   supplied (BP19 does not reintroduce BP17's bug).
+6. `python -c "from core.db import get_entry_prices_by_token"` (and any new helper) succeeds.
+
+### 19.6 Evidence pass — bash/SQL to prove the diagnosis on prod
+
+> **Runtime is Docker Compose** (`app-worker-1` runs `sync_positions`; `app-api-1` the bots) — **not
+> pm2** (confirmed in BP17 §17.11). Use `docker compose logs`. A pm2 fallback is included last in case a
+> host still runs the legacy process manager. Structlog events are emitted under Celery's
+> `WARNING/MainProcess` wrapper but the inner `[info]` events (`position_mark`, `delta_drop_triggered`,
+> `hard_stop_triggered`, …) are intact and greppable.
+
+**Step 0 — resolve the internal `user_id`, the user's `sizing_mode`, and the offending ledger rows.**
+This alone proves Finding B if `entry_price` is populated in the DB while the trade shows a big loss with
+no stop.
+
+```bash
+docker compose exec -T worker python - <<'PY'
+from core.db.session import get_supabase
+sb = get_supabase()
+u = (sb.table("users")
+     .select("id,telegram_id,username,sizing_mode,wallet_address,deposit_wallet_address")
+     .eq("telegram_id", 891787021).maybe_single().execute().data)
+print("USER:", u)
+uid = u["id"]
+rows = (sb.table("copy_trades")
+        .select("id,token_id,entry_price,entry_bid,shares,size_usdc,status,result,"
+                "realized_pnl,resolved_at,created_at,signal_id")
+        .eq("user_id", uid).order("created_at", desc=True).limit(80).execute().data or [])
+print(f"\nsizing_mode={u.get('sizing_mode')}  |  {len(rows)} recent trades for uid={uid}:")
+for r in rows:
+    print(f"  id={r['id']:>5} tok={str(r['token_id'])[:14]:<14} "
+          f"entry={str(r.get('entry_price')):<7} shares={str(r.get('shares')):<7} "
+          f"size=${str(r.get('size_usdc')):<6} status={r['status']:<9} "
+          f"result={str(r.get('result')):<7} pnl={str(r.get('realized_pnl')):<8} "
+          f"resolved={str(r.get('resolved_at'))[:10]}")
+PY
+```
+
+*Read it:* if the big-loss rows (entry ≈ 0.54 / 0.66 / 0.88) have **`entry_price` populated** in the DB,
+the cost basis was never lost — the monitor simply didn't use it. Note the `token_id` (first 14 chars)
+of each offender for Steps 1–2. Confirm `sizing_mode` is `fixed` (context only — not causal).
+
+**Step 1 — did the monitor EVER evaluate these tokens? (the smoking gun).**
+`position_mark` and every Delta-Drop log are gated on `entry_px > 0`. **Absence** of any monitor line for
+a token whose DB `entry_price` is populated = the silent-skip leak (Finding B).
+
+```bash
+# Substitute the 14-char token prefixes from Step 0.
+for TOK in <tok14_a> <tok14_b> <tok14_c>; do
+  echo "===== token $TOK ====="
+  docker compose logs --since 720h worker 2>&1 | grep -F "$TOK" \
+    | grep -E "position_mark|delta_drop_confirming|delta_drop_triggered|stop_skipped_wide_spread|hard_stop_triggered" \
+    || echo "  NO monitor lines for this token — stop path never ran (entry_px was 0)."
+done
+```
+
+**Step 2 — any stop/close activity at all for this user? (compare against the admin).**
+Use the internal `uid` from Step 0 (logs key on `user_id=<uid>`, not the telegram id).
+
+```bash
+UID=<uid_from_step0>
+docker compose logs --since 720h worker 2>&1 \
+  | grep -E "user_id=$UID\b|user_id=$UID'" \
+  | grep -E "delta_drop_triggered|hard_stop_triggered|delta_drop_confirming|stop_skipped_wide_spread|close_position" \
+  | tail -60
+# Contrast with the admin's uid (Kelly, stops working) to show the difference is
+# presence/absence of a usable entry, not the sizing mode:
+ADMIN_UID=<admin_uid>
+docker compose logs --since 720h worker 2>&1 | grep -E "user_id=$ADMIN_UID\b" \
+  | grep -E "position_mark|delta_drop_triggered" | tail -30
+```
+
+**Step 3 — LIVE proof of the `avg_price==0` vs `entry_price>0` divergence** (run on any *still-open*
+position of the user; this is the single most direct confirmation).
+
+```bash
+docker compose exec -T worker python - <<'PY'
+from core.db.session import get_supabase
+from core.db import get_entry_prices_by_token
+from core.polymarket import get_positions
+sb = get_supabase()
+u = (sb.table("users").select("id,deposit_wallet_address")
+     .eq("telegram_id", 891787021).maybe_single().execute().data)
+uid, dw = u["id"], u["deposit_wallet_address"]
+db_entry = get_entry_prices_by_token(uid)
+print("DB entry_price by token:", {k[:14]: v for k, v in db_entry.items()})
+for p in get_positions(dw):
+    if p["shares"] <= 0:
+        continue
+    tok = p["token_id"]; api = float(p.get("avg_price") or 0)
+    print(f"tok={tok[:14]} API_avg={api:<7} cur={p.get('cur_price')} "
+          f"DB_entry={db_entry.get(tok)}  ->  stop entry_px={api} "
+          f"{'(ZERO => Delta-Drop SKIPPED)' if api == 0 else ''}")
+PY
+```
+
+*Expected:* one or more rows with `API_avg=0` while `DB_entry` is a real price → the guard at
+`manage_positions.py` L234 was False → Delta-Drop skipped. This is Finding B, live.
+
+**Step 4 (optional) — SQL variant via `psql`** (if a Postgres connection string is available; never
+commit it):
+
+```bash
+export PGURL='postgresql://postgres.<ref>:<PWD>@aws-0-<region>.pooler.supabase.com:5432/postgres'
+psql "$PGURL" -c "
+  select ct.id, left(ct.token_id,14) as token, ct.entry_price, ct.shares, ct.size_usdc,
+         ct.status, ct.result, ct.realized_pnl, ct.resolved_at, ts.price as signal_price
+  from copy_trades ct
+  join users u on u.id = ct.user_id
+  left join trade_signals ts on ts.id = ct.signal_id
+  where u.telegram_id = 891787021
+  order by ct.created_at desc
+  limit 80;
+"
+```
+
+**pm2 fallback (legacy hosts only):**
+
+```bash
+for TOK in <tok14_a> <tok14_b> <tok14_c>; do
+  grep -F "$TOK" ~/.pm2/logs/worker-out.log \
+    | grep -E "position_mark|delta_drop|hard_stop" || echo "no monitor lines for $TOK";
+done
+```
+
+**How this confirms Blueprint 19:** Step 0 shows the DB held a valid `entry_price`; Steps 1–2 show the
+monitor produced **zero** stop/mark lines for those tokens (silent skip) while the admin's tokens *were*
+marked; Step 3 shows *live* that `avg_price=0` while `entry_price>0` for this custodial wallet. Together
+they prove the leak is the **Data-API cost-basis source (Finding B)**, independent of `sizing_mode`
+(Finding A) — exactly the fix in §19.2.

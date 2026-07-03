@@ -88,6 +88,16 @@ def sync_positions() -> dict:
             log.warning("positions_fetch_failed", user_id=uid)
             positions = None
 
+        # BP19 Fix 1: fetch DB cost-basis once per user, reuse per position.
+        # Avoids N+1 queries and is consistent across the whole poll cycle.
+        _db_entry_prices: dict = {}
+        if settings.stop_use_db_entry:
+            try:
+                from core.db import get_entry_prices_by_token as _gep
+                _db_entry_prices = _gep(uid)
+            except Exception:
+                pass  # degraded gracefully — tier 1 will miss, tiers 2–5 cover
+
         for p in (positions or []):
             if p["shares"] <= 0:
                 continue
@@ -195,8 +205,73 @@ def sync_positions() -> dict:
             except Exception:
                 best_bid = float(p.get("cur_price") or p.get("best_bid") or 0)
 
-            # Cost-basis entry price from Data-API avg_price.
-            entry_px = float(p.get("avg_price") or 0)
+            # ── BP19: 5-tier effective-entry resolver — DB-first cost basis ────────
+            # The Data-API avg_price is 0 for freshly-opened positions on POLY_1271
+            # proxy wallets (indexing lag).  When entry_px==0 the delta-drop guard
+            # silently skips — that is the Stop-Loss Leak this fix closes.
+            #
+            # Precedence (DB-first for risk path, differs from BP16 display path):
+            #   1. copy_trades.entry_price  — our true fill cost (most trusted)
+            #   2. Data-API avg_price       — only when DB is 0/NULL
+            #   3. size_usdc / shares       — ledger-derived when both present
+            #   4. trade_signals.price      — VWAP entry from the originating signal
+            #   5. Hard floor 0.01          — absolute last resort; triggers LOUD log
+            #      so a skipped stop is NEVER silent again (§19.2 Fix 2 invariant).
+            entry_px: float = 0.0
+            _entry_source: str = "none"
+
+            # Tier 1 — DB copy_trades.entry_price (preferred for risk path)
+            if settings.stop_use_db_entry:
+                _t1 = _db_entry_prices.get(token_id, 0.0)
+                if _t1 > 0:
+                    entry_px = _t1
+                    _entry_source = "db"
+
+            # Tier 2 — Data-API avg_price (fallback when DB is empty)
+            if entry_px == 0:
+                _t2 = float(p.get("avg_price") or 0)
+                if _t2 > 0:
+                    entry_px = _t2
+                    _entry_source = "api"
+
+            # Tier 3 — size_usdc / shares (ledger-derived)
+            if entry_px == 0:
+                try:
+                    _t3_sz = float((db_trade or {}).get("size_usdc") or 0)
+                    _t3_sh = float(p.get("shares") or 0)
+                    if _t3_sz > 0 and _t3_sh > 0:
+                        entry_px = _t3_sz / _t3_sh
+                        _entry_source = "derived"
+                except Exception:
+                    pass
+
+            # Tier 4 — trade_signals.price via signal_id
+            if entry_px == 0:
+                try:
+                    _t4_sid = (db_trade or {}).get("signal_id")
+                    if _t4_sid:
+                        from core.db import get_signal_price as _gsp
+                        _t4_px = _gsp(_t4_sid)
+                        if _t4_px and _t4_px > 0:
+                            entry_px = _t4_px
+                            _entry_source = "signal"
+                except Exception:
+                    pass
+
+            # Tier 5 — absolute floor: unresolvable cost basis
+            if entry_px == 0:
+                if settings.stop_no_cost_basis_alert:
+                    log.error(
+                        "stop_no_cost_basis",
+                        user_id=uid,
+                        token=token_id[:14],
+                        api_avg=float(p.get("avg_price") or 0),
+                        best_bid=round(best_bid, 4),
+                        db_has_trade=bool(db_trade),
+                        db_entry_prices_count=len(_db_entry_prices),
+                    )
+                entry_px = 0.01   # hard floor — stop math runs; never silently skips
+                _entry_source = "floor"
 
             # ── Layer 1: use mid price when both sides are present ──────────
             if settings.delta_drop_use_mid and best_bid > 0 and best_ask > 0:
@@ -205,10 +280,13 @@ def sync_positions() -> dict:
                 price_ref = best_bid  # fallback: Layer 1 disabled or ask missing
 
             # ── Mark logging ────────────────────────────────────────────────
-            if settings.log_position_marks and entry_px > 0 and price_ref > 0:
+            # BP19: ungated — entry_px is always >= 0.01 after the resolver,
+            # so _entry_source shows which tier supplied the value (or "floor").
+            if settings.log_position_marks and price_ref > 0:
                 log.info("position_mark",
                          user_id=uid, token=token_id[:14],
-                         entry=entry_px, best_bid=round(best_bid, 4),
+                         entry=entry_px, entry_source=_entry_source,
+                         best_bid=round(best_bid, 4),
                          best_ask=round(best_ask, 4), mid=round(price_ref, 4),
                          drop=round(1.0 - price_ref / entry_px, 3),
                          hours=round(hours, 2) if hours is not None else None)
@@ -277,13 +355,41 @@ def sync_positions() -> dict:
                     _drop_ticks.pop(fkey, None)
 
             # ── Hard-stop floor: residual safety net when book is near-zero ─
+            # BP19 Fix 3: also check the mid price when stop_mid_floor_enabled so
+            # a collapsing-but-not-yet-hollow book is caught before best_bid hits 0.
+            _hard_stop_mid = (
+                settings.stop_mid_floor_enabled
+                and price_ref > 0
+                and price_ref < settings.hard_stop_abs_price
+                and ckey not in _closing
+            )
             if best_bid > 0 and best_bid < settings.hard_stop_abs_price:
                 log.info("hard_stop_triggered",
                          user_id=uid, token=token_id[:14],
+                         trigger="bid",
                          cur_price=best_bid, threshold=settings.hard_stop_abs_price)
                 _closing.add(ckey)
                 close_position.delay(uid, token_id, "hard_stop")
                 actions += 1
+            elif _hard_stop_mid:
+                log.info("hard_stop_triggered",
+                         user_id=uid, token=token_id[:14],
+                         trigger="mid_floor",
+                         mid=round(price_ref, 4), threshold=settings.hard_stop_abs_price)
+                _closing.add(ckey)
+                close_position.delay(uid, token_id, "hard_stop")
+                actions += 1
+            elif best_bid == 0 and age_sec >= settings.delta_drop_min_hold_sec:
+                # BP19 Fix 3: hollow book — position is un-exitable; loss already
+                # locked.  Log visibility so ops can monitor; nothing to act on
+                # until a bid ≥ tick reappears.
+                if _notify_once(f"hollow:{uid}:{token_id}"):
+                    log.warning(
+                        "stop_unsellable_hollow_book",
+                        user_id=uid, token=token_id[:14],
+                        age_hours=round(age_sec / 3600, 2),
+                        entry=entry_px, entry_source=_entry_source,
+                    )
 
         # ── Closed positions: resolution win/loss notices ───────────────────────
         try:

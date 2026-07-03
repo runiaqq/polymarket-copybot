@@ -159,6 +159,14 @@ class Settings(BaseSettings):
     # Emit one position_mark log line per open position per sync cycle.
     # Use to calibrate delta_drop_stop_pct from real drawdown after ~2 weeks.
     log_position_marks: bool = True
+
+    # ── Blueprint 19 — DB-first stop-loss cost-basis resolver ────────────────────
+    # Resolve cost basis DB-first (Fix 1); False = legacy API-only (display-path) behaviour.
+    stop_use_db_entry: bool = True
+    # Also fire hard_stop when mid price < hard_stop_abs_price (defence-in-depth, Fix 3).
+    stop_mid_floor_enabled: bool = True
+    # Emit stop_no_cost_basis ERROR when entry is unresolvable from all tiers (Fix 2).
+    stop_no_cost_basis_alert: bool = True
     # Wider slippage when exiting (books thin out near resolution).
     exit_slippage_pct: float = 0.03
     # Portfolio cap: max simultaneous open positions per user.

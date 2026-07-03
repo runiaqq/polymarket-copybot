@@ -691,6 +691,28 @@ def get_entry_prices_by_token(user_id: int) -> dict:
     return out
 
 
+def get_signal_price(signal_id: int) -> float | None:
+    """Return trade_signals.price for a given signal_id.
+
+    Blueprint 19 Tier-4 cost-basis fallback: when copy_trades.entry_price is
+    NULL/0 and the Data-API avg_price is 0, the VWAP entry price stored on the
+    originating signal is the last deterministic source before the hard floor.
+    Returns None when the signal doesn't exist or its price is 0.
+    """
+    if not signal_id:
+        return None
+    sb = get_supabase()
+    res = (
+        sb.table("trade_signals")
+        .select("price")
+        .eq("id", signal_id)
+        .maybe_single()
+        .execute()
+    )
+    px = float((res.data or {}).get("price") or 0)
+    return px if px > 0 else None
+
+
 def get_realized_baseline(user_id: int) -> float | None:
     """Return the realized_baseline stored for a user (None if not yet set)."""
     sb = get_supabase()
