@@ -43,6 +43,7 @@ from core.db import (
     set_subscription,
 )
 from core.polygon import get_balances, withdrawable_usdc
+from core.polymarket import get_closed_positions
 from core.leaderboard import (
     fmt_money,
     profile_url,
@@ -341,11 +342,36 @@ def _user_view(tid: int, u: dict) -> tuple[str, InlineKeyboardMarkup]:
     except Exception:
         open_pos = 0
 
-    # PnL summary: realized only, three windows.
-    try:
-        pnl = get_pnl_summary(db_uid) if db_uid else {"today": 0.0, "week": 0.0, "all_time": 0.0, "settled": 0}
-    except Exception:
-        pnl = {"today": 0.0, "week": 0.0, "all_time": 0.0, "settled": 0}
+    # PnL: read from Polymarket Data API (same source as user bot /pnl command) so
+    # the admin card and the user's own stats always agree. Falls back to DB on error.
+    trading_wallet = u.get("deposit_wallet_address") or eoa
+    pnl: dict = {"today": 0.0, "week": 0.0, "all_time": 0.0, "settled": 0}
+    if trading_wallet:
+        try:
+            import time as _t
+            closed = get_closed_positions(trading_wallet)
+            now_unix   = _t.time()
+            day0_unix  = datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).timestamp()
+            week0_unix = now_unix - 7 * 86400
+            p_today = p_week = p_all = 0.0
+            for c in closed:
+                rpnl = float(c.get("realized_pnl") or 0)
+                ts   = int(c.get("timestamp") or 0)
+                p_all += rpnl
+                if ts >= day0_unix:
+                    p_today += rpnl
+                if ts >= week0_unix:
+                    p_week  += rpnl
+            pnl = {"today": p_today, "week": p_week,
+                   "all_time": p_all, "settled": len(closed)}
+        except Exception:
+            # Fallback to DB if Polymarket API is unavailable.
+            try:
+                pnl = get_pnl_summary(db_uid) if db_uid else pnl
+            except Exception:
+                pass
 
     dl = _days_left(u.get("sub_expires_at"))
     nick = f"@{u['username']}" if u.get("username") else "—"
