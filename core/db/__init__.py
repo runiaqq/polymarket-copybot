@@ -1,5 +1,6 @@
 from core.db.queries import (
     add_admin,
+    count_open_positions,
     create_access_code,
     create_admin_code,
     get_active_donor_addresses,
@@ -11,6 +12,7 @@ from core.db.queries import (
     get_open_trade_by_token,
     get_open_trades_cost,
     get_outstanding_copy_trades,
+    get_pnl_summary,
     get_realized_baseline,
     get_risk_override_until,
     get_risk_state,
@@ -20,6 +22,7 @@ from core.db.queries import (
     get_user_equity_hwm,
     get_user_open_positions,
     get_user_pnl_stats,
+    get_user_trade_history,
     has_terminal_trade,
     insert_copy_trade,
     insert_trade_signal,
@@ -54,6 +57,7 @@ from core.db.session import get_supabase
 
 __all__ = [
     "get_supabase",
+    "count_open_positions",
     "get_active_donor_addresses",
     "get_active_subscribers",
     "get_daily_realized_pnl",
@@ -63,6 +67,7 @@ __all__ = [
     "get_open_trade_by_token",
     "get_open_trades_cost",
     "get_outstanding_copy_trades",
+    "get_pnl_summary",
     "get_realized_baseline",
     "get_risk_override_until",
     "get_risk_state",
@@ -73,6 +78,7 @@ __all__ = [
     "get_user_equity_hwm",
     "get_user_open_positions",
     "get_user_pnl_stats",
+    "get_user_trade_history",
     "has_terminal_trade",
     "insert_copy_trade",
     "insert_trade_signal",

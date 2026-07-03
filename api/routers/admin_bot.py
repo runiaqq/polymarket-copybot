@@ -25,10 +25,13 @@ from core.config import settings
 from core.db import (
     add_admin,
     add_tracked_wallet,
+    count_open_positions,
     create_access_code,
     create_admin_code,
+    get_pnl_summary,
     get_user_by_telegram_id,
     get_user_by_username,
+    get_user_trade_history,
     is_admin,
     is_super_admin,
     list_active_subscribers_detail,
@@ -39,6 +42,7 @@ from core.db import (
     remove_admin,
     set_subscription,
 )
+from core.polygon import get_balances, withdrawable_usdc
 from core.leaderboard import (
     fmt_money,
     profile_url,
@@ -300,45 +304,153 @@ async def cmd_subs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")  # type: ignore[union-attr]
 
 
+def _pnl_fmt(v: float) -> str:
+    """Format a PnL value with a sign and a green/red icon."""
+    icon = "🟢" if v >= 0 else "🔴"
+    sign = "+" if v >= 0 else "−"
+    return f"{icon} {sign}${abs(v):.2f}"
+
+
+def _user_view(tid: int, u: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the admin /user dashboard text + inline keyboard.
+
+    Pure (no I/O beyond the balance/PnL/count reads) so both cmd_user and the
+    'back' callback can call it. Blueprint 18: reads V2 deposit wallet balance via
+    withdrawable_usdc, counts positions from copy_trades (not on-chain EOA).
+    """
+    eoa = u.get("wallet_address")
+
+    # Balance: withdrawable_usdc covers deposit-wallet pUSD + all EOA USDC variants.
+    try:
+        avail = withdrawable_usdc(u)
+    except Exception:
+        avail = 0.0
+
+    # POL (gas) genuinely lives on the EOA — keep as separate on-chain read.
+    try:
+        pol = get_balances(eoa).get("matic", 0.0) if eoa else 0.0
+    except Exception:
+        pol = 0.0
+
+    bal_txt = f"${avail:.2f} доступно · ⛽️ POL {pol:.3f}"
+
+    # Open positions: DB count, not on-chain (avoids fake-0 from EOA read).
+    db_uid = u.get("id")
+    try:
+        open_pos = count_open_positions(db_uid) if db_uid else 0
+    except Exception:
+        open_pos = 0
+
+    # PnL summary: realized only, three windows.
+    try:
+        pnl = get_pnl_summary(db_uid) if db_uid else {"today": 0.0, "week": 0.0, "all_time": 0.0, "settled": 0}
+    except Exception:
+        pnl = {"today": 0.0, "week": 0.0, "all_time": 0.0, "settled": 0}
+
+    dl = _days_left(u.get("sub_expires_at"))
+    nick = f"@{u['username']}" if u.get("username") else "—"
+
+    text = (
+        f"👤 <b>Пользователь</b>\n\n"
+        f"Ник: {nick}\nID: <code>{tid}</code>\n"
+        f"Подписка: <b>{dl if dl is not None else '—'} дн</b> (до {(u.get('sub_expires_at') or '—')[:10]})\n"
+        f"Копирование: {'🟢 вкл' if u.get('copy_active') else '⏸ выкл'}\n"
+        f"Макс. позиция: <b>${float(u.get('max_position_usdc') or 0):.0f}</b>\n"
+        f"Кошелёк зарегистрирован: {'✓' if u.get('wallet_registered') else '✗'}\n\n"
+        f"💰 Баланс: {bal_txt}\n"
+        f"📊 Открытых позиций: {open_pos}\n\n"
+        f"📈 <b>PnL</b>\n"
+        f"📅 Сегодня:   {_pnl_fmt(pnl['today'])}\n"
+        f"🗓 7 дней:    {_pnl_fmt(pnl['week'])}\n"
+        f"🏆 За всё:    {_pnl_fmt(pnl['all_time'])}   ({pnl['settled']} сделок)\n\n"
+        f"<code>{eoa or '—'}</code>"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📜 Последние 5 сделок", callback_data=f"uh:{tid}:0")],
+    ])
+    return text, kb
+
+
 async def cmd_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tg = update.effective_user
     if not tg or not is_admin(tg.id):
         await _deny(update)
         return
     if not context.args:
-        await update.message.reply_text("Использование: <code>/user &lt;@ник|id&gt;</code>", parse_mode="HTML")  # type: ignore[union-attr]
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Использование: <code>/user &lt;@ник|id&gt;</code>", parse_mode="HTML")
         return
     tid, u = _resolve(context.args[0])
     if not u:
         await update.message.reply_text("Пользователь не найден.")  # type: ignore[union-attr]
         return
-
-    addr = u.get("wallet_address")
-    bal_txt, pos_txt = "—", "—"
-    if addr:
-        try:
-            from core.polymarket import get_positions
-            from core.polygon import get_balances
-            b = get_balances(addr)
-            bal_txt = f"pUSD ${b.get('pusd', 0):.2f} · USDC.e ${b.get('usdc_e', 0):.2f} · POL {b.get('matic', 0):.3f}"
-            pos_txt = str(sum(1 for p in get_positions(addr) if p["shares"] > 0))
-        except Exception:
-            pass
-
-    dl = _days_left(u.get("sub_expires_at"))
-    nick = f"@{u['username']}" if u.get("username") else "—"
+    text, kb = _user_view(tid, u)
     await update.message.reply_text(  # type: ignore[union-attr]
-        f"👤 <b>Пользователь</b>\n\n"
-        f"Ник: {nick}\nID: <code>{tid}</code>\n"
-        f"Подписка: <b>{dl if dl is not None else '—'} дн</b> (до {(u.get('sub_expires_at') or '—')[:10]})\n"
-        f"Копирование: {'🟢 вкл' if u.get('copy_active') else '⏸ выкл'}\n"
-        f"Макс. позиция: <b>${float(u.get('max_position_usdc') or 0):.0f}</b>\n"
-        f"Кошелёк зарегистрирован: {'✓' if u.get('wallet_registered') else '✗'}\n"
-        f"Баланс: {bal_txt}\n"
-        f"Открытых позиций: {pos_txt}\n"
-        f"<code>{addr or '—'}</code>",
-        parse_mode="HTML", disable_web_page_preview=True,
+        text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+
+
+def _fmt_history_row(t: dict) -> str:
+    """Render one settled copy_trade as a compact text line for the history view.
+
+    Derives exit price from result/shares — guards against divide-by-zero for legacy
+    rows where shares is NULL (Blueprint 16 §16.7).
+    """
+    sig    = t.get("trade_signals") or {}
+    title  = (sig.get("title") or "—")[:32]
+    oc     = sig.get("outcome") or ("YES" if t.get("outcome_index") == 0 else "NO")
+    entry  = float(t.get("entry_price") or 0)
+    shares = float(t.get("shares") or 0)
+    pnl    = float(t.get("realized_pnl") or 0)
+    result = (t.get("result") or "").lower()
+
+    if result == "win":
+        exit_px: float | None = 1.0
+    elif result in ("lose", "loss"):
+        exit_px = 0.0
+    elif shares > 0:
+        exit_px = entry + pnl / shares
+    else:
+        exit_px = None  # divide-by-zero guard for legacy rows with shares=NULL
+
+    icon    = "🟢" if pnl >= 0 else "🔴"
+    exit_s  = f"{exit_px:.2f}" if exit_px is not None else "—"
+    entry_s = f"{entry:.2f}" if entry > 0 else "—"
+    return (
+        f"{icon} <b>{title}</b> · {oc}\n"
+        f"   вход {entry_s} → выход {exit_s} · PnL {pnl:+.2f}$"
     )
+
+
+def _history_view(tid: int, offset: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Build trade history text + pagination keyboard for the admin history view."""
+    u = get_user_by_telegram_id(tid)
+    back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 К пользователю", callback_data=f"uc:{tid}")]])
+    if not u:
+        return "Пользователь не найден.", back_kb
+
+    nick   = f"@{u['username']}" if u.get("username") else f"id{tid}"
+    trades = get_user_trade_history(u["id"], 5, offset)
+
+    header = f"(с позиции {offset + 1})" if offset > 0 else "(показаны последние записи)"
+    lines  = [f"📜 <b>История сделок · {nick}</b>", header, ""]
+
+    if not trades:
+        lines.append("Нет завершённых сделок.")
+    else:
+        for t in trades:
+            lines.append(_fmt_history_row(t))
+
+    rows: list[list[InlineKeyboardButton]] = []
+    nav: list[InlineKeyboardButton] = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"uh:{tid}:{max(0, offset - 5)}"))
+    if len(trades) == 5:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"uh:{tid}:{offset + 5}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 К пользователю", callback_data=f"uc:{tid}")])
+
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
 # ── Interactive wallet browser (top whales + tracked list) ────────────────────
@@ -582,6 +694,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             remove_tracked_wallet(addr)
             toast = "🗑 Убран"
             text, kb = _detail_view(addr, origin)
+        elif data.startswith("uh:"):
+            _, tid_s, off_s = data.split(":", 2)
+            text, kb = _history_view(int(tid_s), int(off_s))
+        elif data.startswith("uc:"):
+            back_tid = int(data[3:])
+            back_u = get_user_by_telegram_id(back_tid)
+            if back_u:
+                text, kb = _user_view(back_tid, back_u)
+            else:
+                text, kb = "Пользователь не найден.", InlineKeyboardMarkup([])
         else:
             await q.answer()
             return

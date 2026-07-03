@@ -2992,9 +2992,10 @@ columns that don't exist yet.
 2. Copy-paste the contents of each new `migrations/00X_*.sql` file and click **Run**.
 3. Apply in order: `008` → `009` → `010` → …
 
-**Migrations applied as of the last deploy (2026-06-22):** 001–010. Apply 011, 012, 013, **014** before the next deploy.
+**Migrations applied as of the last deploy (2026-07-02):** 001–014 (all applied in prod).
 Migration **014** (`is_signal_only`, `subscription_notified_expired`) backs the production Signal-Only Mode +
-Subscription Enforcer (BP14) and MUST be applied before deploying that code.
+Subscription Enforcer (BP14); verified live on 2026-07-02 (columns present, enforcer end-to-end healthy).
+Any future migration (015+) must be applied in the Supabase SQL Editor **before** restarting the worker.
 
 ### 7.5 Useful diagnostic commands
 
@@ -3613,3 +3614,434 @@ branch) is confirmed as the correct fix.**
 feeding 17.B**: false stops crystallised losses → tripped the daily-loss breaker → the broken
 override couldn't clear it → user locked out. Shipping 17.A materially reduces how often 17.B is even
 reached; ship both, but 17.A is the higher-leverage fix.
+
+---
+
+## Blueprint 18 — Admin `/user` Dashboard Upgrade ✅ IMPLEMENTED 2026-07-03
+
+> **Fix applied 2026-07-03.** V2 deposit-wallet tracking and paginated trade history shipped in
+> commit `feat: upgrade admin /user command with V2 wallet tracking, PnL metrics, and paginated
+> transaction history (Blueprint 18)`.
+>
+> **What was fixed:**
+> - `cmd_user` now reads balances via `withdrawable_usdc(db_user)` (deposit-wallet pUSD + EOA USDC)
+>   instead of the EOA directly — eliminates the "fake $0" balance display.
+> - Open positions count pulled from `copy_trades` DB (`count_open_positions`) instead of the
+>   on-chain EOA call that returned `0` for V2 users.
+> - New `📈 PnL` block shows Daily / Weekly / All-Time realized PnL via `get_pnl_summary()`.
+> - Inline button `📜 Последние 5 сделок` opens paginated settled-trade history (`uh:` callback).
+> - `🔙 К пользователю` re-renders the dashboard via reusable `_user_view()` factory (`uc:` callback).
+> - Divide-by-zero guard for legacy rows with `shares=NULL` (Blueprint 16 §16.7).
+> - New helpers exported: `count_open_positions`, `get_pnl_summary`, `get_user_trade_history`
+>   in `core/db/queries.py` and `core/db/__init__.py`.
+
+> **Class of bug:** same *wrong-wallet / read-path* family as Blueprint 12-B and Blueprint 16 — the
+> data exists, the admin view reads it from the wrong source. **No user money moves in this blueprint**
+> (admin-bot, read-only display). But the numbers it shows drive support decisions, so "fake $0" is a
+> trust/operational bug, not cosmetic.
+
+### 18.0 Symptom (prod, admin bot `/user`)
+
+`/user @sto1ner` renders a card where **every on-chain number is zero** even though the user has real
+funds and open positions:
+
+```text
+Баланс: pUSD $0.00 · USDC.e $0.00 · POL 4.843
+Открытых позиций: 0
+```
+
+(`POL 4.843` is correct because gas *does* sit on the EOA — which is the tell: only the EOA is being
+read.) The user has collateral and live trades; the admin sees nothing.
+
+### 18.1 Root-cause analysis — the admin reads the EOA, not the deposit wallet
+
+`cmd_user` queries `users.wallet_address` (the **EOA**) for **both** balances and positions:
+
+```316:324:api/routers/admin_bot.py
+    addr = u.get("wallet_address")
+    bal_txt, pos_txt = "—", "—"
+    if addr:
+        try:
+            from core.polymarket import get_positions
+            from core.polygon import get_balances
+            b = get_balances(addr)
+            bal_txt = f"pUSD ${b.get('pusd', 0):.2f} · USDC.e ${b.get('usdc_e', 0):.2f} · POL {b.get('matic', 0):.3f}"
+            pos_txt = str(sum(1 for p in get_positions(addr) if p["shares"] > 0))
+```
+
+But per **§2.4**, in Polymarket V2 the user trades through a deterministic **deposit wallet**
+(`users.deposit_wallet_address`, an ERC-1967 proxy). Collateral is **swept EOA → deposit wallet**, and
+orders are POLY_1271-signed with the **deposit wallet as `funder`**. Therefore:
+
+- **Trading pUSD collateral lives on the deposit wallet**, not the EOA → `get_balances(EOA).pusd == 0`.
+- **On-chain positions are attributed to the deposit wallet** → `get_positions(EOA)` is empty → `0`.
+- Only leftover gas (POL) and un-swept deposits remain on the EOA → that is why `POL` is the one
+  non-zero field.
+
+The main bot already knows this: `_trading_wallet()` returns `deposit_wallet_address or wallet_address`
+(`api/routers/telegram.py` L835–838), and `withdrawable_usdc()` sums **deposit-wallet pUSD + EOA USDC
+variants** (`core/polygon.py` L394–416, Blueprint 12-B). The admin bot was simply never migrated to the
+V2 wallet model — it is still reading the pre-deposit-wallet EOA.
+
+**Two independent defects, same cause:**
+1. **Balance = fake $0** → must read `withdrawable_usdc(db_user)` (the established single source of
+   truth), not `get_balances(EOA)`.
+2. **Open positions = fake 0** → the on-chain call is against the wrong wallet *and* is an unnecessary
+   Data-API round-trip. Count from **our own `copy_trades` ledger** instead — authoritative, cheap, and
+   already the definition the copy-engine uses for the `max_open_positions` guard (§2.2).
+
+### 18.2 Fix Data Fetching (kill the fake zeros)
+
+**A. Balance — use `withdrawable_usdc` (single source of truth).**
+Replace the EOA `get_balances` call with the same helper the withdrawal path uses, so the admin sees
+exactly the number the user can act on. Keep `POL` (gas) as a separate on-chain read on the EOA (gas
+genuinely lives there and admins need it to diagnose stuck withdrawals/redemptions).
+
+```python
+from core.polygon import withdrawable_usdc, get_balances
+
+avail = withdrawable_usdc(u)                     # deposit pUSD + EOA (pusd+usdc_e+usdc)
+eoa   = u.get("wallet_address")
+pol   = get_balances(eoa).get("matic", 0.0) if eoa else 0.0
+bal_txt = f"${avail:.2f} доступно · ⛽️ POL {pol:.3f}"
+```
+
+> Optional richer breakdown (nice-to-have, not required): show `trading pUSD` (deposit-wallet pUSD) and
+> `free EOA USDC` separately by calling `get_balances(dw)` / `get_balances(eoa)` directly. But the
+> **headline number MUST be `withdrawable_usdc`** so the admin card, the user's wallet screen, and the
+> withdrawal "Доступно" all agree (the consistency goal from BP12-B §"Consistency cleanup").
+
+**B. Open positions — count from `copy_trades`, not on-chain.**
+Add a query helper that counts open (unresolved, unredeemed) rows — the same predicate as
+`get_open_trades_cost` (queries.py L638) and `get_open_trade_by_token` (L534):
+
+```python
+def count_open_positions(user_id: int) -> int:
+    """Count of the user's currently-open copy_trades (confirmed/executing, unredeemed).
+
+    Authoritative, DB-sourced position count for the admin dashboard — mirrors the
+    predicate the copy-engine uses for the max_open_positions guard (§2.2). Avoids the
+    unreliable on-chain Data-API call against the EOA that returned a fake 0.
+    """
+    sb = get_supabase()
+    res = (
+        sb.table("copy_trades")
+        .select("id", count="exact")
+        .eq("user_id", user_id)
+        .in_("status", ["confirmed", "executing"])
+        .is_("redeemed_at", "null")
+        .execute()
+    )
+    return int(res.count or 0)
+```
+
+> **CRITICAL — export it** (BP12-A guard): add `count_open_positions` to **both** the
+> `from core.db.queries import (...)` block **and** `__all__` in `core/db/__init__.py`. Same for every
+> new helper below. This is the exact drift that caused the BP12 close-handler crash — do not repeat it.
+
+> **Design note — display parity with the user's `/positions`.** The DB count is the source of truth
+> for the *number*. If the admin later wants a per-position live view, source it from
+> `_trading_wallet(u)` (deposit wallet) exactly like the user bot, **never** the EOA. For this blueprint
+> the count is sufficient and avoids a network dependency in the admin card.
+
+### 18.3 PnL Aggregation (Daily / Weekly / All-Time)
+
+**Source of truth:** `copy_trades.realized_pnl`, booked on terminal transition — resolution redeem
+(Blueprint 1) or token-sale close (Blueprint 6, `mark_trade_closed` L557). A row counts toward realized
+PnL iff `realized_pnl IS NOT NULL AND resolved_at IS NOT NULL` (identical to the existing
+`get_daily_realized_pnl`, L515, so the daily-loss breaker and the admin card stay consistent).
+
+**Window semantics (UTC):**
+- 📅 **Daily** — settled since **00:00 UTC today** (calendar day; intuitive "today" for an admin).
+- 🗓 **Weekly** — settled in the **trailing 7×24 h**.
+- 🏆 **All-Time** — every settled row for the user.
+
+> Note the deliberate difference from `get_daily_realized_pnl` (which is a **trailing 24 h** window used
+> by the risk breaker). For an *admin display* "PnL за сегодня" reads more naturally as the calendar day.
+> If you prefer strict reuse, call `get_daily_realized_pnl(uid)` for the Daily figure and document it as
+> trailing-24h — but do **not** silently mix the two definitions.
+
+**Canonical SQL (one round-trip, `FILTER` aggregates):**
+
+```sql
+SELECT
+  COALESCE(SUM(realized_pnl) FILTER (
+      WHERE resolved_at >= date_trunc('day', now() AT TIME ZONE 'utc')), 0) AS pnl_today,
+  COALESCE(SUM(realized_pnl) FILTER (
+      WHERE resolved_at >= (now() AT TIME ZONE 'utc') - interval '7 days'), 0) AS pnl_week,
+  COALESCE(SUM(realized_pnl), 0)                                             AS pnl_all,
+  COUNT(*)                                                                   AS settled_trades
+FROM copy_trades
+WHERE user_id = :uid
+  AND realized_pnl IS NOT NULL
+  AND resolved_at  IS NOT NULL;
+```
+
+**Runtime implementation (supabase client — the actual runtime path, §2.1).** The supabase client does
+not do `FILTER` aggregates, so fetch the settled rows once and bucket in Python (one query, small
+result set — a user has tens–hundreds of settled trades, not millions):
+
+```python
+def get_pnl_summary(user_id: int) -> dict:
+    """Realized-PnL rollup for the admin dashboard: today (UTC calendar day),
+    trailing 7 days, and all-time — plus the settled-trade count.
+
+    Uses the same 'realized_pnl IS NOT NULL AND resolved_at IS NOT NULL' terminal
+    predicate as get_daily_realized_pnl so the risk breaker and the admin card never
+    disagree on what 'settled' means.
+    """
+    from datetime import datetime, timedelta, timezone
+    sb = get_supabase()
+    res = (
+        sb.table("copy_trades")
+        .select("realized_pnl, resolved_at")
+        .eq("user_id", user_id)
+        .not_.is_("realized_pnl", "null")
+        .not_.is_("resolved_at", "null")
+        .execute()
+    )
+    now = datetime.now(timezone.utc)
+    day0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week0 = now - timedelta(days=7)
+    today = week = all_time = 0.0
+    n = 0
+    for r in (res.data or []):
+        pnl = float(r.get("realized_pnl") or 0)
+        ts = _parse_ts(r.get("resolved_at"))        # tz-aware UTC parse helper
+        all_time += pnl
+        n += 1
+        if ts and ts >= day0:
+            today += pnl
+        if ts and ts >= week0:
+            week += pnl
+    return {"today": today, "week": week, "all_time": all_time, "settled": n}
+```
+
+> **Optional performance migration (only if needed):** a partial index
+> `create index if not exists ix_copy_trades_user_resolved on copy_trades (user_id, resolved_at) where resolved_at is not null;`
+> (→ `migrations/017_copy_trades_resolved_idx.sql`). Not required at current row counts; add it if the
+> admin bot ever scans large users. **No schema/column change is needed for Blueprint 18** — every field
+> already exists (migration 008).
+
+> **Unrealized PnL (open positions) — explicitly out of scope for the card headline.** The three PnL
+> metrics above are **realized** only. Live/unrealized PnL of open positions is already visible in the
+> user bot's `/positions` (Blueprint 16) and depends on live marks; if an admin wants it later, compute
+> it from `_trading_wallet(u)` positions × current price, but keep it off the primary card to avoid a
+> network call and a flickering number.
+
+### 18.4 UI Redesign — `/user` card + inline history
+
+**A. Refactor `cmd_user` into a reusable view factory.** The card must be re-renderable from a callback
+(the "back" button from the history view returns to it), so extract the body into:
+
+```python
+def _user_view(tid: int, u: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the admin /user dashboard text + inline keyboard. Pure (no I/O beyond
+    the balance/PnL/count reads) so both cmd_user and the callback can call it."""
+```
+
+`cmd_user` then does `_resolve(arg)` → `_user_view(tid, u)` → `reply_text(text, reply_markup=kb)`.
+
+**B. New message template** (adds the PnL block; fixes the balance/position lines):
+
+```text
+👤 Пользователь
+
+Ник: @sto1ner
+ID: 891787021
+Подписка: 4 дн (до 2026-07-07)
+Копирование: 🟢 вкл
+Макс. позиция: $10
+Кошелёк зарегистрирован: ✓
+
+💰 Баланс: $42.18 доступно · ⛽️ POL 4.843
+📊 Открытых позиций: 3
+
+📈 PnL
+📅 Сегодня:   +$3.10
+🗓 7 дней:    −$1.45
+🏆 За всё:    +$28.90   (147 сделок)
+
+0xa9108131f342e3C749CBbB6fAc4fB609BF831D20
+```
+
+Formatting rules: sign every PnL with `+`/`−` and a red/green cue if desired
+(`🟢`/`🔴`), `${abs:.2f}`; render `$0.00` when settled==0 (never `—` for PnL — zero is a real answer).
+Keep the wallet address on its own line as `<code>` (tap-to-copy) as today.
+
+**C. Inline keyboard under the card:**
+
+```python
+kb = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📜 Последние 5 сделок", callback_data=f"uh:{tid}:0")],
+])
+```
+
+`callback_data` is `uh:<telegram_id>:<offset>` — well under Telegram's 64-byte cap (e.g.
+`uh:891787021:0`). We encode the target user in the callback because callbacks are stateless (the admin
+who tapped ≠ the subject user). Guard: only `is_admin(tg.id)` may use it (the existing `on_callback`
+gate already enforces this — L555–558).
+
+### 18.5 Trade-history view (`📜 Последние 5 сделок` + pagination)
+
+**A. New query helper** — most-recent terminal trades, paginated, with the market title joined from
+`trade_signals` (title lives on the signal, not on `copy_trades` — see execute_copy L464–466):
+
+```python
+def get_user_trade_history(user_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
+    """Most-recent settled/closed copy_trades for the admin history view, newest first.
+
+    Embeds the source signal's title/outcome/event via the signal_id FK so the row can
+    show a human ticker. Falls back gracefully if the embed is unavailable.
+    """
+    sb = get_supabase()
+    res = (
+        sb.table("copy_trades")
+        .select(
+            "id, entry_price, shares, size_usdc, result, realized_pnl, "
+            "outcome_index, resolved_at, created_at, status, "
+            "trade_signals(title, outcome, event_slug)"          # FK embed
+        )
+        .eq("user_id", user_id)
+        .not_.is_("resolved_at", "null")                          # terminal only
+        .order("resolved_at", desc=True)
+        .range(offset, offset + limit - 1)                        # supabase pagination
+        .execute()
+    )
+    return res.data or []
+```
+
+> If the `trade_signals(...)` FK embed is not wired in the Supabase schema, fall back to a second
+> batched lookup: collect `signal_id`s and `select id, title, outcome from trade_signals in (...)`, then
+> map. Keep the embed as the primary path (one round-trip).
+
+**B. Row rendering — Тикер · Исход · Вход · Выход · PnL.** There is **no `exit_price` column** on
+`copy_trades` (verified in §6.4). Derive the exit for display:
+
+- `result='win'` → resolution paid **1.00**; `result='lose'`/`'loss'` → **0.00** (binary payout, §1).
+- `result='closed'` (token-sale exit, Blueprint 6) → no stored sale price; derive
+  `exit ≈ entry_price + realized_pnl / shares` when `shares > 0`, else show `—`. **Guard the divide by
+  zero** (legacy rows have `shares=NULL`, see BP16 §16.7).
+- Outcome label: `"YES" if outcome_index == 0 else "NO"` (fallback to the embedded
+  `trade_signals.outcome` string when present).
+
+```python
+def _fmt_history_row(t: dict) -> str:
+    sig   = t.get("trade_signals") or {}
+    title = (sig.get("title") or "—")[:32]
+    oc    = sig.get("outcome") or ("YES" if t.get("outcome_index") == 0 else "NO")
+    entry = float(t.get("entry_price") or 0)
+    shares = float(t.get("shares") or 0)
+    pnl   = float(t.get("realized_pnl") or 0)
+    result = (t.get("result") or "").lower()
+    if result == "win":
+        exit_px = 1.0
+    elif result in ("lose", "loss"):
+        exit_px = 0.0
+    elif shares > 0:
+        exit_px = entry + pnl / shares
+    else:
+        exit_px = None
+    icon    = "🟢" if pnl >= 0 else "🔴"
+    exit_s  = f"{exit_px:.2f}" if exit_px is not None else "—"
+    entry_s = f"{entry:.2f}" if entry > 0 else "—"
+    return (f"{icon} <b>{title}</b> · {oc}\n"
+            f"   вход {entry_s} → выход {exit_s} · PnL {pnl:+.2f}$")
+```
+
+**C. History message + pagination keyboard** (callback `uh:<tid>:<offset>`, page size 5):
+
+```text
+📜 История сделок · @sto1ner
+(показаны 1–5 из последних)
+
+🟢 Trump wins Iowa · YES
+   вход 0.88 → выход 1.00 · PnL +2.40$
+🔴 Fed cuts in July · NO
+   вход 0.62 → выход 0.00 · PnL −3.10$
+...
+```
+
+```python
+rows = []
+nav = []
+if offset > 0:
+    nav.append(InlineKeyboardButton("◀️", callback_data=f"uh:{tid}:{max(0, offset - 5)}"))
+if len(trades) == 5:                       # a full page ⇒ there may be more
+    nav.append(InlineKeyboardButton("▶️", callback_data=f"uh:{tid}:{offset + 5}"))
+if nav:
+    rows.append(nav)
+rows.append([InlineKeyboardButton("🔙 К пользователю", callback_data=f"uc:{tid}")])
+kb = InlineKeyboardMarkup(rows)
+```
+
+**D. Callback wiring** — add two branches to `on_callback` (`admin_bot.py` L559+), mirroring the existing
+`tp:`/`mp:` dispatch style, and re-using the message-edit + "not modified" swallow already there:
+
+```python
+elif data.startswith("uh:"):
+    _, tid_s, off_s = data.split(":", 2)
+    text, kb = _history_view(int(tid_s), int(off_s))
+elif data.startswith("uc:"):
+    tid = int(data[3:])
+    u = get_user_by_telegram_id(tid)
+    text, kb = _user_view(tid, u) if u else ("Пользователь не найден.", None)
+```
+
+`_history_view(tid, offset)` resolves the user (`get_user_by_telegram_id`), calls
+`get_user_trade_history(u["id"], 5, offset)`, and renders §18.5-B/C. Empty result → "Нет завершённых
+сделок." with only the 🔙 back button.
+
+### 18.6 Files touched (no migration required)
+
+| File | Change |
+|---|---|
+| `api/routers/admin_bot.py` | Refactor `cmd_user` → `_user_view(tid, u)`; **balance** via `withdrawable_usdc` + EOA `POL` (§18.2-A); **positions** via `count_open_positions` (§18.2-B); add **PnL block** via `get_pnl_summary` (§18.3); attach inline keyboard (§18.4-C); add `_history_view` + `uh:`/`uc:` branches in `on_callback` (§18.5) |
+| `core/db/queries.py` | **+** `count_open_positions(user_id)`, `get_pnl_summary(user_id)`, `get_user_trade_history(user_id, limit, offset)` (+ a `_parse_ts` helper if none exists) |
+| `core/db/__init__.py` | **+** re-export all three helpers in the import block **and** `__all__` (BP12-A guard) |
+| `migrations/017_copy_trades_resolved_idx.sql` | *(optional, perf-only)* partial index `(user_id, resolved_at)` — §18.3 |
+
+No column is added; every field (`realized_pnl`, `resolved_at`, `entry_price`, `shares`, `result`,
+`outcome_index`) already exists from migration 008.
+
+### 18.7 Acceptance criteria
+
+1. For a user with $42.18 withdrawable and 3 open trades, `/user` shows **`💰 Баланс: $42.18 доступно`**
+   and **`📊 Открытых позиций: 3`** — never `$0.00`/`0` when funds/positions exist. The headline balance
+   equals the number shown on the user's own wallet/withdrawal screen (`withdrawable_usdc` parity).
+2. `POL` gas continues to display from the EOA (it is not part of `withdrawable_usdc`).
+3. The card shows Daily / Weekly / All-Time realized PnL, correctly signed, with `$0.00` (not `—`) when a
+   window has no settled trades. All-Time equals the sum of every settled `realized_pnl` for the user.
+4. `📜 Последние 5 сделок` opens a list of the 5 most-recent **settled** trades with Ticker, Outcome,
+   Entry, derived Exit, and PnL; `▶️`/`◀️` paginate in steps of 5; `🔙 К пользователю` re-renders the card.
+5. A `closed` (token-sale) trade with `shares=0`/NULL renders Exit `—` and never raises
+   `ZeroDivisionError` (BP16 §16.7 legacy-row guard).
+6. `python -c "from core.db import count_open_positions, get_pnl_summary, get_user_trade_history"`
+   succeeds (exports wired — BP12-A guard). If the boot self-check name-set exists (`api/main.py` /
+   `worker/celery_app.py`), add the three names there too.
+7. Only admins can trigger the `uh:`/`uc:` callbacks (existing `on_callback` `is_admin` gate).
+8. No new DB column; `/user` makes **at most** the balance reads + 2 small DB queries (count + PnL) and
+   **zero** on-chain position calls.
+
+### 18.8 Evidence pass (run before coding — confirm the wrong-wallet hypothesis)
+
+```bash
+# For the affected user (telegram_id 891787021 from the screenshot): compare EOA vs deposit wallet.
+docker compose exec -T worker python - <<'PY'
+from core.db.session import get_supabase
+from core.polygon import get_balances, withdrawable_usdc
+sb = get_supabase()
+u = sb.table("users").select("*").eq("telegram_id", 891787021).maybe_single().execute().data
+print("EOA        :", u.get("wallet_address"),        get_balances(u.get("wallet_address")))
+print("DepositWlt :", u.get("deposit_wallet_address"), get_balances(u.get("deposit_wallet_address")))
+print("withdrawable_usdc:", withdrawable_usdc(u))
+open_ct = (sb.table("copy_trades").select("id", count="exact")
+           .eq("user_id", u["id"]).in_("status", ["confirmed","executing"])
+           .is_("redeemed_at","null").execute().count)
+print("open copy_trades :", open_ct)
+PY
+```
+
+**Expected:** EOA pUSD/USDC ≈ 0 (only POL), deposit-wallet pUSD > 0, `withdrawable_usdc` > 0, and
+`open copy_trades` > 0 — confirming §18.1 (the card reads the EOA; the money and positions are on the
+deposit wallet / in the ledger). Fix = §18.2 + §18.3 + §18.5; no migration.

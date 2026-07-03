@@ -730,3 +730,96 @@ def has_terminal_trade(user_id: int, condition_id: str) -> bool:
         .execute()
     )
     return bool(res2.data)
+
+
+# ── Blueprint 18: Admin dashboard helpers ─────────────────────────────────────
+
+def _parse_ts(value: str | None) -> "datetime | None":
+    """Parse an ISO-8601 timestamp string from Supabase into a UTC-aware datetime."""
+    if not value:
+        return None
+    try:
+        from dateutil.parser import parse as _dp
+        d = _dp(value)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d
+    except Exception:
+        return None
+
+
+def count_open_positions(user_id: int) -> int:
+    """Count of the user's currently-open copy_trades (confirmed/executing, unredeemed).
+
+    Authoritative, DB-sourced position count for the admin dashboard — mirrors the
+    predicate the copy-engine uses for the max_open_positions guard (§2.2). Avoids the
+    unreliable on-chain Data-API call against the EOA that returned a fake 0.
+    """
+    sb = get_supabase()
+    res = (
+        sb.table("copy_trades")
+        .select("id", count="exact")
+        .eq("user_id", user_id)
+        .in_("status", ["confirmed", "executing"])
+        .is_("redeemed_at", "null")
+        .execute()
+    )
+    return int(res.count or 0)
+
+
+def get_pnl_summary(user_id: int) -> dict:
+    """Realized-PnL rollup for the admin dashboard: today (UTC calendar day),
+    trailing 7 days, and all-time — plus the settled-trade count.
+
+    Uses the same 'realized_pnl IS NOT NULL AND resolved_at IS NOT NULL' terminal
+    predicate as get_daily_realized_pnl so the risk breaker and the admin card never
+    disagree on what 'settled' means.
+    """
+    from datetime import timedelta
+    sb = get_supabase()
+    res = (
+        sb.table("copy_trades")
+        .select("realized_pnl, resolved_at")
+        .eq("user_id", user_id)
+        .not_.is_("realized_pnl", "null")
+        .not_.is_("resolved_at", "null")
+        .execute()
+    )
+    now = datetime.now(timezone.utc)
+    day0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week0 = now - timedelta(days=7)
+    today = week = all_time = 0.0
+    n = 0
+    for r in (res.data or []):
+        pnl = float(r.get("realized_pnl") or 0)
+        ts = _parse_ts(r.get("resolved_at"))
+        all_time += pnl
+        n += 1
+        if ts and ts >= day0:
+            today += pnl
+        if ts and ts >= week0:
+            week += pnl
+    return {"today": today, "week": week, "all_time": all_time, "settled": n}
+
+
+def get_user_trade_history(user_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
+    """Most-recent settled/closed copy_trades for the admin history view, newest first.
+
+    Embeds the source signal's title/outcome/event via the signal_id FK so the row can
+    show a human ticker. Falls back gracefully if the embed is unavailable.
+    """
+    sb = get_supabase()
+    res = (
+        sb.table("copy_trades")
+        .select(
+            "id, entry_price, shares, size_usdc, result, realized_pnl, "
+            "outcome_index, resolved_at, created_at, status, "
+            "trade_signals(title, outcome, event_slug)"
+        )
+        .eq("user_id", user_id)
+        .not_.is_("resolved_at", "null")
+        .order("resolved_at", desc=True)
+        .range(offset, offset + limit - 1)
+        .execute()
+    )
+    return res.data or []
