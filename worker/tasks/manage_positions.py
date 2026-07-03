@@ -15,7 +15,6 @@ Blueprint 4: sync_positions updates equity_hwm per user and triggers the drawdow
   daily-loss circuit breaker.
 """
 
-import asyncio
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -887,16 +886,14 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
 # ── Notifications ────────────────────────────────────────────────────────────
 
 def _notify(telegram_id: int, text: str) -> None:
-    from telegram import Bot
+    import httpx
     from core.config import settings as s
-
-    async def _send() -> None:
-        await Bot(token=s.telegram_bot_token).send_message(
-            chat_id=telegram_id, text=text, parse_mode="HTML"
-        )
-
     try:
-        asyncio.run(_send())
+        httpx.post(
+            f"https://api.telegram.org/bot{s.telegram_bot_token}/sendMessage",
+            json={"chat_id": telegram_id, "text": text, "parse_mode": "HTML"},
+            timeout=10.0,
+        )
     except Exception:
         log.warning("notify_failed", telegram_id=telegram_id)
 
@@ -1371,20 +1368,21 @@ def _resolve_user_for_notification(sb, uid: int, cond: str,
 
 def _notify_with_markup(telegram_id: int, text: str, reply_markup=None) -> None:
     """Send a Telegram message, optionally with an InlineKeyboardMarkup."""
-    from telegram import Bot
+    import httpx
     from core.config import settings as s
-
-    async def _send() -> None:
-        bot = Bot(token=s.telegram_bot_token)
-        await bot.send_message(
-            chat_id=telegram_id,
-            text=text,
-            parse_mode="HTML",
-            reply_markup=reply_markup,
-        )
-
     try:
-        asyncio.run(_send())
+        payload: dict = {
+            "chat_id": telegram_id,
+            "text": text,
+            "parse_mode": "HTML",
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup.to_dict()
+        httpx.post(
+            f"https://api.telegram.org/bot{s.telegram_bot_token}/sendMessage",
+            json=payload,
+            timeout=10.0,
+        )
     except Exception:
         log.exception("notify_with_markup_failed", telegram_id=telegram_id)
 
