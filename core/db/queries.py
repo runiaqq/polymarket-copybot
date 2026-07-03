@@ -805,16 +805,15 @@ def get_pnl_summary(user_id: int) -> dict:
 def get_user_trade_history(user_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
     """Most-recent settled/closed copy_trades for the admin history view, newest first.
 
-    Embeds the source signal's title/outcome/event via the signal_id FK so the row can
-    show a human ticker. Falls back gracefully if the embed is unavailable.
+    Two-step query: fetch trade rows first, then batch-lookup signal titles by signal_id.
+    Avoids relying on Supabase FK-embed syntax which requires an explicit schema relationship.
     """
     sb = get_supabase()
     res = (
         sb.table("copy_trades")
         .select(
-            "id, entry_price, shares, size_usdc, result, realized_pnl, "
-            "outcome_index, resolved_at, created_at, status, "
-            "trade_signals(title, outcome, event_slug)"
+            "id, signal_id, entry_price, shares, size_usdc, result, realized_pnl, "
+            "outcome_index, resolved_at, created_at, status"
         )
         .eq("user_id", user_id)
         .not_.is_("resolved_at", "null")
@@ -822,4 +821,26 @@ def get_user_trade_history(user_id: int, limit: int = 5, offset: int = 0) -> lis
         .range(offset, offset + limit - 1)
         .execute()
     )
-    return res.data or []
+    rows = res.data or []
+    if not rows:
+        return rows
+
+    # Batch-fetch signal metadata and embed into each row (same shape _fmt_history_row expects).
+    signal_ids = [r["signal_id"] for r in rows if r.get("signal_id")]
+    sig_map: dict = {}
+    if signal_ids:
+        try:
+            sig_res = (
+                sb.table("trade_signals")
+                .select("id, title, outcome, event_slug")
+                .in_("id", signal_ids)
+                .execute()
+            )
+            sig_map = {s["id"]: s for s in (sig_res.data or [])}
+        except Exception:
+            pass
+
+    for r in rows:
+        r["trade_signals"] = sig_map.get(r.get("signal_id")) or {}
+
+    return rows
