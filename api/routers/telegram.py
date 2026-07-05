@@ -343,7 +343,7 @@ def _new_user_text(addr: str) -> str:
 def _onboarding_welcome_text() -> str:
     """L0 — First message. Zero money asks, zero deposit address."""
     return (
-        "🧠 <b>Добро пожаловать в Nexa AI!</b>\n\n"
+        "🧠 <b>Добро пожаловать в PolyMind AI!</b>\n\n"
         "Мы копируем сделки проверенных <b>китов Polymarket</b> — трейдеров, которые "
         "годами стабильно зарабатывают на прогнозах. Наш ИИ следит за их крупными "
         "покупками 24/7 и присылает разбор каждой.\n\n"

@@ -1,18 +1,18 @@
-# CURSOR.md — Nexa AI (Polymarket Copy-Trading SaaS)
+# CURSOR.md — PolyMind AI (Polymarket Copy-Trading SaaS)
 
 > **Read this file fully before writing any code.** It is the single source of truth for
 > architecture, current state, and **mandatory** safety rules. This system moves **real user
 > money** on-chain. A wrong edit can drain a subscriber's deposit. When unsure, STOP and ask —
 > do not guess or hallucinate APIs, contract addresses, or DB columns.
 
-Product aliases seen in code: **Nexa AI** (product name), `PolyMind` (user-facing bot copy),
+Product aliases seen in code: **PolyMind AI** (product name), `PolyMind` (user-facing bot copy),
 `Polymarket CopyBot` (FastAPI title). They are the same project.
 
 ---
 
 ## 1. Project Overview
 
-Nexa AI is a **commercial subscription (SaaS) copy-trading bot for [Polymarket](https://polymarket.com)**,
+PolyMind AI is a **commercial subscription (SaaS) copy-trading bot for [Polymarket](https://polymarket.com)**,
 operated entirely through **Telegram**.
 
 **What it does, end to end:**
@@ -2255,7 +2255,7 @@ computed** — Kelly or Fixed. Position size affects only the *dollar* magnitude
 
 ### Blueprint 14 — Kelly edge-degeneracy fix + AI-analysis pipeline redesign ✅ IMPLEMENTED
 
-> **Audit context (2026-06-30, Lead Quant):** two production problems on Nexa AI. 14.A — Kelly
+> **Audit context (2026-06-30, Lead Quant):** two production problems on PolyMind AI. 14.A — Kelly
 > sizing looks fixed (~$6.2 every executed trade) and only ever fires on expensive favorites.
 > 14.B — the LLM risk analysis is internally inconsistent (emoji/verdict/score disagree) and
 > content-free.
@@ -2566,7 +2566,7 @@ paste** into new builders in `telegram.py`.
 **L0 — Welcome / Demo (`_onboarding_welcome_text`)** — replaces `_new_user_text` as the first message:
 
 ```
-🧠 <b>Добро пожаловать в Nexa AI!</b>
+🧠 <b>Добро пожаловать в PolyMind AI!</b>
 
 Мы копируем сделки проверенных <b>китов Polymarket</b> — трейдеров, которые
 годами стабильно зарабатывают на прогнозах. Наш ИИ следит за их крупными
@@ -3098,7 +3098,7 @@ Key variables to verify are set: `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `ENCRYP
 > entry price *is* in our DB — the `/positions` view simply never reads it and trusts an on-chain
 > source that returns `0` for our custodial proxy wallets.
 
-### 16.0 Symptom (prod, Nexa AI)
+### 16.0 Symptom (prod, PolyMind AI)
 
 1. On entry, the trade notification (`_notify` in `worker/tasks/execute_copy.py`) shows the **correct**
    price (e.g. `@ 0.875`) and invested amount (e.g. `$5.60`). ✅
@@ -4413,7 +4413,7 @@ they prove the leak is the **Data-API cost-basis source (Finding B)**, independe
 > (no fake credit), but the claim pipeline **stalls and never self-heals** — §5 fail-closed +
 > idempotency apply to the fixes.
 
-### 20.0 Symptoms (prod, Nexa AI)
+### 20.0 Symptoms (prod, PolyMind AI)
 
 1. **Claim hang.** "⏳ Выигрыш определён, зачисление задерживается" (`_emit_win_retry_failed`) stays
    forever; winnings are never credited.
