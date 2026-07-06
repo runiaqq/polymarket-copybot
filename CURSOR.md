@@ -379,6 +379,52 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   New helpers: `clear_once` in `core/cache.py`; `get_open_trade_by_condition` in
   `core/db/queries.py`; `redeem_lease_sec=900` in `core/config.py`. No new DB migration.
 
+- **[BP21] The Great Leak Plug & Risk Revamp** (2026-07-06): closes the three
+  stop-loss leaks proven on prod for @sto1ner (id 891787021) and decouples position
+  monitoring from the risk pause. **Root-cause context:** BP19 correctly wired the
+  DB-first cost basis (`entry_source=db` on every mark), so the stop *ran* — but it
+  still leaked money through three holes in `worker/tasks/manage_positions.py`.
+  **(A) Stop-net — 3 leaks plugged:**
+  **A1 — Phantom resolved-book guard (Fix 1):** a market whose `end_date` has passed
+  (`hours < 0`) can keep returning a stale one-sided CLOB book (`best_ask==0`,
+  `best_bid≈0.999`) for hours after it actually resolved. The stop math read that as
+  "position up +30..150%" and silently disarmed — this is what let `80327923422237`
+  (−$5.21) and `80084323272370` (−$4.94) ride to a $0 loss. Now, when
+  `phantom_book_guard_enabled` and `hours<0` and `best_ask==0` and
+  `best_bid >= phantom_book_bid_min` (0.90), the stop is skipped for that garbage price
+  (`stop_skipped_phantom_book`, throttled) and the position is left to the
+  redeemable/`reconcile_settlements` settlement path.
+  **A2 — Hard-stop before spread-veto (Fix 2):** the catastrophic `hard_stop` floor
+  block was moved to run **before** the Layer-2 spread veto and now `continue`s on fire.
+  Previously a book collapsing to `best_bid=0.001` was vetoed by the wide-spread guard
+  and never hard-stopped (`66649395439683`, −$4.92). The floor now pierces every spread
+  protection.
+  **A3 — Smart spread-veto bypass (Fix 3):** the veto no longer blocks emergency exits
+  on a real collapse. When `drop_pct >= spread_veto_bypass_drop_mult (2.0) ×
+  delta_drop_stop_pct` **or** `mid < hard_stop_abs_price`, the wide spread is ignored and
+  the stop proceeds (`spread_veto_bypassed`). Rationale: on a genuine crash the spread
+  widens precisely when we must sell.
+  **A4 — Confirm-tick persistence (Fix 4):** a spread-vetoed poll no longer pops
+  `_drop_ticks`. Before, an illiquid fast crash could never accumulate the two
+  consecutive breaching ticks it needed because each intervening veto reset the counter
+  (`11482573122404`, −$6.61). Non-breaching (recovered) polls still reset it.
+  **(B) Monitoring decoupled from pause:** new `get_users_for_monitoring()` in
+  `core/db/queries.py` returns every paying, unexpired subscriber with a deposit wallet,
+  **without** the `copy_paused_until` / `copy_active` filters. `sync_positions` now uses
+  it so a drawdown/daily-loss pause (`paused_drawdown`/`paused_daily_loss`) blocks
+  **only new entries** — open positions of a paused user are still stop-lossed and their
+  wins still redeemed. New entries stay blocked because both `get_active_subscribers`
+  (fan-out gate) and `execute_copy_trade` (L124-140 belt-and-suspenders pause check)
+  are unchanged; `get_active_subscribers` was deliberately **not** loosened, to avoid
+  resurfacing new trades/signals to paused users through the shared fan-out path.
+  Three new config knobs in `core/config.py`: `phantom_book_guard_enabled` (True),
+  `phantom_book_bid_min` (0.90), `spread_veto_bypass_drop_mult` (2.0). New helper
+  `get_users_for_monitoring` re-exported from `core/db/__init__.py` (import block **and**
+  `__all__`, per the BP12-A drift guard). **No DB migration required** — read-path rewire
+  only. The −EV entry root-cause (single-whale consensus on high-priced fast-resolving
+  favorites) is intentionally **out of scope** for this release (no market/price/consensus
+  filter yet).
+
 ---
 
 ## 4. Known Bugs & Missing Features

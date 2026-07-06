@@ -86,6 +86,35 @@ def get_active_subscribers() -> list[dict]:
     ]
 
 
+def get_users_for_monitoring() -> list[dict]:
+    """Blueprint 21: users whose OPEN positions must keep being monitored,
+    stop-lossed and redeemed — INDEPENDENT of any risk pause / copy_active state.
+
+    Unlike get_active_subscribers (the ENTRY / fan-out gate, which excludes
+    copy_paused_until users), this deliberately does NOT filter on
+    copy_paused_until / risk_state / copy_active, so a drawdown or daily-loss
+    pause blocks only *new entries* (still enforced in execute_copy_trade and by
+    get_active_subscribers), never the exit/redeem path on positions the user
+    already holds.  A paused account must still get its stops fired and its wins
+    claimed.
+
+    Scope stays tight: still a paying, unexpired subscription and a deposit
+    wallet (the address sync_positions reads on-chain positions from).  Signal-
+    only users are included — they may carry positions opened before the switch.
+    """
+    sb = get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+    res = (
+        sb.table("users")
+        .select("*")
+        .neq("sub_tier", "free")
+        .gt("sub_expires_at", now)
+        .not_.is_("deposit_wallet_address", "null")
+        .execute()
+    )
+    return res.data or []
+
+
 def get_user_by_telegram_id(telegram_id: int) -> dict | None:
     sb = get_supabase()
     res = (

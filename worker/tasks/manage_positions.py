@@ -61,10 +61,14 @@ def _hours_left(end_date: str | None) -> float | None:
 
 @celery_app.task(name="worker.tasks.sync_positions", queue="periodic")
 def sync_positions() -> dict:
-    from core.db import get_active_subscribers
+    from core.db import get_users_for_monitoring
     from core.polymarket import get_closed_positions, get_order_book, get_positions
 
-    subscribers = get_active_subscribers()
+    # BP21 Step 2: monitor EVERY paying subscriber's open positions — including
+    # drawdown/daily-loss-paused users.  A risk pause must block only new entries
+    # (enforced in execute_copy_trade + get_active_subscribers), never the
+    # stop-loss / redeem path on positions the user already holds.
+    subscribers = get_users_for_monitoring()
     if not subscribers:
         return {"users": 0}
 
@@ -318,6 +322,28 @@ def sync_positions() -> dict:
             else:
                 price_ref = best_bid  # fallback: Layer 1 disabled or ask missing
 
+            # ── BP21 Fix 1: phantom resolved-book guard ─────────────────────
+            # A market whose end_date has already passed (hours < 0) can keep
+            # returning a stale, one-sided CLOB book (best_ask == 0 while
+            # best_bid ≈ 0.999) for hours after it actually resolved.  Trusting it
+            # makes the stop math read "position up +30..150%" and silently disarm
+            # the stop — the exact leak that let 80327923422237 / 80084323272370
+            # ride to a $0 loss.  Ignore that garbage price; the redeemable branch
+            # above and reconcile_settlements settle the position deterministically.
+            if (
+                settings.phantom_book_guard_enabled
+                and hours is not None and hours < 0
+                and best_ask == 0
+                and best_bid >= settings.phantom_book_bid_min
+            ):
+                if _notify_once(f"phantom:{uid}:{token_id}"):
+                    log.warning("stop_skipped_phantom_book",
+                                user_id=uid, token=token_id[:14],
+                                best_bid=round(best_bid, 4),
+                                best_ask=round(best_ask, 4),
+                                hours=round(hours, 2), entry=entry_px)
+                continue
+
             # ── Mark logging ────────────────────────────────────────────────
             # BP19: ungated — entry_px is always >= 0.01 after the resolver,
             # so _entry_source shows which tier supplied the value (or "floor").
@@ -330,27 +356,84 @@ def sync_positions() -> dict:
                          drop=round(1.0 - price_ref / entry_px, 3),
                          hours=round(hours, 2) if hours is not None else None)
 
-            # ── Layer 2: spread veto ────────────────────────────────────────
-            # If the book is too thin (hollow bid) we cannot trust it as a
-            # price signal — skip the stop entirely this cycle.
+            # Pre-compute the drop once — shared by the hard-stop floor, the
+            # smart spread-veto bypass (BP21 Fix 3) and the Delta-Drop eval.
+            drop_pct = (1.0 - price_ref / entry_px) if (entry_px > 0 and price_ref > 0) else None
+
+            # ── BP21 Fix 2: Hard-stop floor runs BEFORE the spread veto ──────
+            # The catastrophic floor must pierce every spread protection.  A book
+            # collapsing to best_bid < hard_stop_abs_price (e.g. 0.001) used to be
+            # vetoed by the wide-spread guard and therefore never hard-stopped.
+            # Evaluate it first; fire the instant a sellable bid sits below the
+            # floor (or the mid does, when stop_mid_floor_enabled).
+            _hard_stop_mid = (
+                settings.stop_mid_floor_enabled
+                and price_ref > 0
+                and price_ref < settings.hard_stop_abs_price
+                and ckey not in _closing
+            )
+            if best_bid > 0 and best_bid < settings.hard_stop_abs_price:
+                log.info("hard_stop_triggered",
+                         user_id=uid, token=token_id[:14],
+                         trigger="bid",
+                         cur_price=best_bid, threshold=settings.hard_stop_abs_price)
+                _drop_ticks.pop(fkey, None)
+                _closing.add(ckey)
+                close_position.delay(uid, token_id, "hard_stop")
+                actions += 1
+                continue
+            elif _hard_stop_mid:
+                log.info("hard_stop_triggered",
+                         user_id=uid, token=token_id[:14],
+                         trigger="mid_floor",
+                         mid=round(price_ref, 4), threshold=settings.hard_stop_abs_price)
+                _drop_ticks.pop(fkey, None)
+                _closing.add(ckey)
+                close_position.delay(uid, token_id, "hard_stop")
+                actions += 1
+                continue
+
+            # ── Layer 2: spread veto — with BP21 Fix 3 smart bypass ─────────
+            # A thin book normally can't be trusted as a price signal, so we skip
+            # the stop.  BUT on a genuine collapse the spread widens precisely when
+            # we MUST sell.  Bypass the veto when the drop is catastrophic
+            # (>= spread_veto_bypass_drop_mult × delta_drop_stop_pct) or the mid is
+            # already under the hard floor.  BP21 Fix 4: a vetoed poll must NOT
+            # reset the confirm-tick counter, or a fast, illiquid crash can never
+            # accumulate the consecutive breaching ticks the stop needs to fire.
             if best_bid > 0 and best_ask > 0:
                 mid_val = (best_bid + best_ask) / 2.0
                 if mid_val > 0:
                     spread_pct = (best_ask - best_bid) / mid_val
                     if spread_pct > settings.max_spread_for_stop_pct:
-                        log.info("stop_skipped_wide_spread",
+                        bypass = (
+                            drop_pct is not None
+                            and (
+                                drop_pct >= settings.spread_veto_bypass_drop_mult
+                                            * settings.delta_drop_stop_pct
+                                or price_ref < settings.hard_stop_abs_price
+                            )
+                        )
+                        if not bypass:
+                            log.info("stop_skipped_wide_spread",
+                                     user_id=uid, token=token_id[:14],
+                                     best_bid=round(best_bid, 4),
+                                     best_ask=round(best_ask, 4),
+                                     spread_pct=round(spread_pct, 3),
+                                     threshold=settings.max_spread_for_stop_pct)
+                            # BP21 Fix 4: DO NOT pop _drop_ticks — preserve the
+                            # confirm-tick streak across a vetoed poll.
+                            continue
+                        log.info("spread_veto_bypassed",
                                  user_id=uid, token=token_id[:14],
                                  best_bid=round(best_bid, 4),
                                  best_ask=round(best_ask, 4),
                                  spread_pct=round(spread_pct, 3),
-                                 threshold=settings.max_spread_for_stop_pct)
-                        _drop_ticks.pop(fkey, None)
-                        continue
+                                 drop=round(drop_pct, 3),
+                                 reason="catastrophic_drop")
 
             # ── Delta-Drop evaluation ───────────────────────────────────────
-            if entry_px > 0 and price_ref > 0:
-                drop_pct = 1.0 - price_ref / entry_px
-
+            if drop_pct is not None:
                 # ── Layer 3: optional entry-bid comparison ──────────────────
                 # If we stored entry_bid at fill time, also require a real move
                 # in the bid itself (bid-vs-bid, immune to ask/bid asymmetry).
@@ -393,35 +476,10 @@ def sync_positions() -> dict:
                     # No breach this poll — reset debounce counter.
                     _drop_ticks.pop(fkey, None)
 
-            # ── Hard-stop floor: residual safety net when book is near-zero ─
-            # BP19 Fix 3: also check the mid price when stop_mid_floor_enabled so
-            # a collapsing-but-not-yet-hollow book is caught before best_bid hits 0.
-            _hard_stop_mid = (
-                settings.stop_mid_floor_enabled
-                and price_ref > 0
-                and price_ref < settings.hard_stop_abs_price
-                and ckey not in _closing
-            )
-            if best_bid > 0 and best_bid < settings.hard_stop_abs_price:
-                log.info("hard_stop_triggered",
-                         user_id=uid, token=token_id[:14],
-                         trigger="bid",
-                         cur_price=best_bid, threshold=settings.hard_stop_abs_price)
-                _closing.add(ckey)
-                close_position.delay(uid, token_id, "hard_stop")
-                actions += 1
-            elif _hard_stop_mid:
-                log.info("hard_stop_triggered",
-                         user_id=uid, token=token_id[:14],
-                         trigger="mid_floor",
-                         mid=round(price_ref, 4), threshold=settings.hard_stop_abs_price)
-                _closing.add(ckey)
-                close_position.delay(uid, token_id, "hard_stop")
-                actions += 1
-            elif best_bid == 0 and age_sec >= settings.delta_drop_min_hold_sec:
-                # BP19 Fix 3: hollow book — position is un-exitable; loss already
-                # locked.  Log visibility so ops can monitor; nothing to act on
-                # until a bid ≥ tick reappears.
+            # ── Hollow book: un-exitable position (best_bid == 0) ───────────
+            # BP19 Fix 3: loss already locked; nothing to act on until a bid ≥ tick
+            # reappears.  Log for ops visibility (throttled).
+            if best_bid == 0 and age_sec >= settings.delta_drop_min_hold_sec:
                 if _notify_once(f"hollow:{uid}:{token_id}"):
                     log.warning(
                         "stop_unsellable_hollow_book",

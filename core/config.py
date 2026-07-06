@@ -167,6 +167,22 @@ class Settings(BaseSettings):
     stop_mid_floor_enabled: bool = True
     # Emit stop_no_cost_basis ERROR when entry is unresolvable from all tiers (Fix 2).
     stop_no_cost_basis_alert: bool = True
+
+    # ── Blueprint 21 — Stop-net leak plugs ───────────────────────────────────────
+    # Fix 1 — Phantom-book guard: a resolved market (end_date passed) can keep
+    # returning a stale one-sided CLOB book (best_ask==0, best_bid≈0.999) for hours.
+    # That fabricates a "position up" signal and silently disarms the stop. When
+    # enabled, the stop is skipped for such phantom books (the redeem/resolution
+    # path handles the position); never trade on that garbage price.
+    phantom_book_guard_enabled: bool = True
+    # A one-sided book on a resolved market is treated as phantom only when the
+    # lone bid is at/above this price (i.e. the "too good to be true" signature).
+    phantom_book_bid_min: float = 0.90
+    # Fix 3 — Smart spread-veto bypass: on a REAL collapse the spread widens as
+    # liquidity flees, but that is exactly when we must sell. Bypass the spread
+    # veto (Layer 2) when the drop is catastrophic — drop_pct >= this multiple of
+    # delta_drop_stop_pct — or when the mid is already below hard_stop_abs_price.
+    spread_veto_bypass_drop_mult: float = 2.0
     # Wider slippage when exiting (books thin out near resolution).
     exit_slippage_pct: float = 0.03
     # Portfolio cap: max simultaneous open positions per user.
