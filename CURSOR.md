@@ -4825,3 +4825,31 @@ deploy, once titles became visible).
 
 **Diagnosis command (server):** `docker compose logs api | grep admin_callback_failed` —
 the swallowed exception (`Can't parse entities…`) is visible there for any past occurrence.
+
+### 22.6 Follow-up fix — "в позициях" overstated by a desynced ledger (2026-07-09)
+
+**Symptom:** the card showed `Открытых позиций: 16 · в позициях ≈ $78.28` for a user whose
+real open exposure was ~$0 (balance $0.01).
+
+**Root cause:** the BP22 positions line was ledger-only (`count_open_positions` +
+`get_open_trades_cost`: `status IN ('confirmed','executing') AND redeemed_at IS NULL`). The
+ledger **overstates** open positions in two known ways:
+1. **BP20 A2/A3 desync** — positions settled/redeemed on-chain whose rows were never marked
+   terminal (reconcile lag or blocked claims);
+2. **stale `executing` rows** — a worker crash between `insert_copy_trade` and the status
+   update leaves `executing` forever; `get_outstanding_copy_trades` filters
+   `status='confirmed'`, so **the reconciler never drains them by design**.
+
+**Fix (live-first, §18.2 design note):** the headline count/value now comes from the **live
+Data-API positions of the deposit wallet** (identical predicate to the user bot's
+`_live_positions`/`_is_dead_loss`: `shares > 0`, minus resolved-lost dust), valued at
+`current_value`. The ledger is only the fallback when the Data API is down (labelled
+`(леджер — Data API недоступен)`). When `ledger_count > live_n` the card appends
+`⚠️ В леджере N незакрытых записей ($X) — reconcile отстаёт` — the desync is now an ops
+signal on the card instead of a lie in the headline number.
+
+**Ops note:** a persistent ⚠️ line means stuck ledger rows. Inspect them with:
+`copy_trades where user_id=<uid> and redeemed_at is null and status in ('confirmed','executing')`
+— `executing` rows older than ~1h are crash orphans (safe to mark `failed` manually);
+`confirmed` rows on resolved markets mean `reconcile_settlements` is blocked — check
+`reconcile_redeem_blocked` / `redeem_skipped_reason` logs (BP20 A4).

@@ -345,21 +345,56 @@ def _user_view(tid: int, u: dict) -> tuple[str, InlineKeyboardMarkup]:
 
     bal_txt = f"{avail_txt} · ⛽️ POL {pol_txt}"
 
-    # Open positions: DB count + cost-basis sum, not on-chain (avoids fake-0 from
-    # EOA read). Cost basis matches the equity convention (§4 conventions / BP8).
+    # Open positions — BP22.6: live-first. The headline count/value comes from the
+    # LIVE Data-API positions of the DEPOSIT WALLET (the exact source the user's
+    # own /positions uses; never the EOA — §18.2 design note). The copy_trades
+    # ledger is only the fallback, because it can desync (BP20 A2/A3: settled
+    # on-chain but never marked; crashed 'executing' rows the reconciler never
+    # touches) and then overstates "в позициях". When the ledger disagrees with
+    # the live view, an explicit ⚠️ line surfaces the desync instead of hiding it.
     db_uid = u.get("id")
-    open_pos = 0
-    open_cost = 0.0
+    ledger_count = 0
+    ledger_cost = 0.0
     if db_uid:
         try:
-            open_pos = count_open_positions(db_uid)
+            ledger_count = count_open_positions(db_uid)
         except Exception:
             log.warning("admin_open_count_failed", user_id=db_uid)
         try:
-            open_cost = sum(get_open_trades_cost(db_uid).values())
+            ledger_cost = sum(get_open_trades_cost(db_uid).values())
         except Exception:
             log.warning("admin_open_cost_failed", user_id=db_uid)
-    pos_txt = str(open_pos) + (f" · в позициях ≈ <b>${open_cost:.2f}</b>" if open_cost > 0 else "")
+
+    live_n: int | None = None
+    live_val = 0.0
+    dw = u.get("deposit_wallet_address") or eoa
+    if dw:
+        try:
+            from core.polymarket import get_positions
+            # Same predicate as the user bot's _live_positions/_is_dead_loss:
+            # real exposure only (shares > 0, minus resolved-and-lost dust).
+            live = [
+                p for p in get_positions(dw)
+                if p["shares"] > 0
+                and not (p.get("redeemable") and float(p.get("cur_price") or 0) < 0.05)
+            ]
+            live_n = len(live)
+            live_val = sum(float(p.get("current_value") or 0) for p in live)
+        except Exception:
+            log.warning("admin_live_positions_failed", user_id=db_uid)
+
+    if live_n is not None:
+        pos_txt = f"{live_n} · в позициях ≈ <b>${live_val:.2f}</b>"
+        if ledger_count > live_n:
+            pos_txt += (
+                f"\n⚠️ В леджере {ledger_count} незакрытых записей"
+                f" (${ledger_cost:.2f}) — reconcile отстаёт"
+            )
+    else:
+        pos_txt = (
+            f"{ledger_count} · в позициях ≈ <b>${ledger_cost:.2f}</b>"
+            f" <i>(леджер — Data API недоступен)</i>"
+        )
 
     # PnL: DB ledger first (same realized_pnl the risk breakers use, so the admin
     # card and the risk engine never disagree). Data API only when the ledger has
