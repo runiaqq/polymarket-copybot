@@ -471,6 +471,9 @@ def get_outstanding_copy_trades() -> list[dict]:
         .eq("status", "confirmed")
         .is_("redeemed_at", "null")
         .not_.is_("condition_id", "null")
+        # BP22.7: FIFO — oldest rows first, so the backlog drains oldest-first
+        # now that reconcile dispatches at most one redeem per user per cycle.
+        .order("id")
         .execute()
     )
     return res.data or []

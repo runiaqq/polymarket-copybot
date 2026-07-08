@@ -860,6 +860,16 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
     if outcome_index is None:
         outcome_index = 0 if str(outcome or "").strip().lower().startswith("yes") else 1
     outcome_index = int(outcome_index)
+
+    # BP22.7: per-wallet in-flight mutex. The relayer executes ONE action per
+    # deposit wallet at a time; concurrent redeems for the same wallet collide
+    # on the relayer nonce and all fail. If another redeem is already running
+    # for this wallet, release the condition lease and yield — the next
+    # reconcile cycle re-attempts this condition.
+    if not notify_once(f"redeemwallet:{dw}", ttl=300):
+        clear_once(f"redeem:{user_id}:{condition_id}")
+        log.info("redeem_wallet_busy", user_id=user_id, cond=condition_id[:14])
+        return {"skipped": True, "reason": "wallet_busy"}
     try:
         bal_before = get_balances(dw).get("pusd", 0.0)
         r = redeem_winnings(user["wallet_private_key_enc"], condition_id,
@@ -939,6 +949,10 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
             except Exception:
                 pass
         raise self.retry(exc=exc)
+    finally:
+        # BP22.7: always release the per-wallet mutex (success, skip, failure
+        # and Celery Retry all pass through here) so the next redeem can run.
+        clear_once(f"redeemwallet:{dw}")
 
 
 # ── Notifications ────────────────────────────────────────────────────────────
@@ -1076,6 +1090,12 @@ def reconcile_settlements() -> dict:
 
     sb = get_supabase()
     processed = 0
+    # BP22.7: at most ONE redeem dispatch per user per cycle. The relayer
+    # executes ONE action per deposit wallet at a time (§5); the old code
+    # dispatched every resolved win in one burst (dozens per wallet), so the
+    # parallel redeems collided on the relayer nonce and ALL failed — forever
+    # re-dispatched, never drained (the 43-row 'confirmed' backlog).
+    redeem_dispatched: set[int] = set()
 
     for trade in trades:
         uid = trade["user_id"]
@@ -1111,6 +1131,16 @@ def reconcile_settlements() -> dict:
                 log.info("reconcile_loss", user_id=uid, cond=cond[:14],
                          cost=round(entry_cost, 2))
             else:
+                # BP22.7: defer all but the first win per user this cycle —
+                # serialize redeems per deposit wallet. Release the reconcile
+                # dedup key (300s TTL) so the next 120s cycle can pick this
+                # row up instead of skipping it for an extra cycle.
+                if uid in redeem_dispatched:
+                    clear_once(f"reconcile:{uid}:{cond}")
+                    log.info("reconcile_redeem_deferred", user_id=uid,
+                             cond=cond[:14])
+                    continue
+
                 # Win: dispatch the existing idempotent redeem_position task.
                 # mark_trade_settled is called inside redeem_position after tx confirmed.
                 # BP20 Fix A1: short lease (redeem_lease_sec), not a 7-day lock.
@@ -1202,6 +1232,7 @@ def reconcile_settlements() -> dict:
                     trade_id=trade["id"],
                     entry_cost=entry_cost,
                 )
+                redeem_dispatched.add(uid)
                 log.info("reconcile_win_dispatched", user_id=uid, cond=cond[:14],
                          trade_id=trade["id"], entry_cost=round(entry_cost, 4))
 
@@ -1258,7 +1289,12 @@ def backfill_legacy_redemptions() -> dict:
             log.warning("backfill_positions_failed", user_id=uid)
             positions = []
 
+        # BP22.7: dispatch at most ONE redeem per user per pass — the relayer
+        # serializes actions per deposit wallet, so mass dispatch just collides.
+        user_dispatched = False
         for p in positions:
+            if user_dispatched:
+                break
             if p.get("shares", 0) <= 0:
                 continue
             token_id = p.get("token_id")
@@ -1306,6 +1342,7 @@ def backfill_legacy_redemptions() -> dict:
                     int(outcome_idx),
                 )
                 dispatched += 1
+                user_dispatched = True
                 log.info("backfill_redeemable_dispatched", user_id=uid,
                          cond=condition_id[:14])
                 continue
@@ -1331,6 +1368,7 @@ def backfill_legacy_redemptions() -> dict:
                     int(outcome_idx),
                 )
                 dispatched += 1
+                user_dispatched = True
                 log.info("backfill_onchain_won_dispatched", user_id=uid,
                          cond=condition_id[:14])
             except Exception:

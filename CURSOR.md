@@ -456,6 +456,14 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   `⚠️ ошибка чтения (RPC)` and logs `admin_balance_read_failed`; POL renders `—` on error.
   Migration **017** (`trade_signals.outcome` + partial index
   `(user_id, redeemed_at desc)` on `copy_trades`) must be applied before deploy.
+  **Follow-ups (same day):** 22.5 dead pagination arrow (HTML-escape titles, N+1 lookahead,
+  alert-on-edit-failure); 22.6 live-first "в позициях" with a ledger-desync ⚠️ line;
+  **22.7 💰 redeem stampede** — `reconcile_settlements` mass-dispatched every resolved win
+  at once, the parallel `redeem_winnings` calls collided on the relayer's one-action-per-wallet
+  rule, so WON positions were never redeemed (43-row / ~$222 backlog on one user). Now: max
+  1 redeem dispatch per user per cycle + per-wallet Redis mutex in `redeem_position` +
+  same cap in `backfill_legacy_redemptions` + FIFO drain. See Blueprint 22.7 for details
+  and the legacy NULL-condition-row cleanup SQL. **No new migration.**
 
 ---
 
@@ -4853,3 +4861,55 @@ signal on the card instead of a lie in the headline number.
 — `executing` rows older than ~1h are crash orphans (safe to mark `failed` manually);
 `confirmed` rows on resolved markets mean `reconcile_settlements` is blocked — check
 `reconcile_redeem_blocked` / `redeem_skipped_reason` logs (BP20 A4).
+
+### 22.7 Follow-up fix — redeem stampede: won positions never redeemed (2026-07-09) 💰 MONEY-CRITICAL
+
+**Symptom:** the 22.6 ⚠️ line revealed 43 stale `confirmed` rows for one user (~$222), some
+dating back to June 26. Worker logs showed `reconcile_redeem_blocked … redeem key still live`
+for ~30 conditions on **every** 2-min cycle, for days. Diagnostics confirmed: the markets are
+resolved and WON on-chain, the winning tokens are still held by the deposit wallets — the
+redeems were dispatched over and over but **never completed**. Users' winnings were stuck.
+
+**Root cause — parallel redeems for one wallet always collide.** `reconcile_settlements`
+dispatched `redeem_position` for **every** resolved win in a single burst (~20 tasks for one
+user in 11 s). The worker is a gevent pool (concurrency 100), so all of them ran
+`redeem_winnings` concurrently **against the same deposit wallet**. The relayer executes ONE
+action per deposit wallet at a time and each call fetches its own relayer nonce → concurrent
+calls collide → (nearly) all fail → BP20 A1 clears the lease on failure → the next cycle
+re-dispatches the whole pack → permanent stampede that never drains. The BP20 short lease
+(good on its own) turned a one-shot failure into a perpetual retry storm because the retry
+was always a *mass* retry. Two burst snapshots in the logs showing *different* condition sets
+proved the leases were churning (dispatch → fail → clear → re-dispatch), not sitting idle.
+
+**Fixes (3 layers):**
+1. **`reconcile_settlements` — one redeem dispatch per user per cycle.** A `redeem_dispatched`
+   set defers every subsequent win for that user to the next cycle (releasing the 300s
+   `reconcile:` dedup key so the row isn't skipped an extra cycle; logged as
+   `reconcile_redeem_deferred`, info-level). Drain rate: 1 redeem / 2 min / user → a 40-row
+   backlog clears in ~80 min, serially, exactly how the relayer wants it.
+2. **`redeem_position` — per-wallet in-flight mutex** (`once:redeemwallet:{dw}`, TTL 300 s,
+   released in a `finally`). Covers the other dispatch sources (sync_positions,
+   close_position resolved-detection, backfill) that could still overlap with reconcile. On
+   contention the task releases the condition lease and returns `{"skipped": "wallet_busy"}`
+   — the next reconcile cycle re-attempts.
+3. **`backfill_legacy_redemptions` — same cap** (max 1 dispatch per user per 10-min pass) +
+   `get_outstanding_copy_trades` now orders by `id` so the backlog drains FIFO (oldest first).
+
+**Legacy NULL-condition rows** (pre-migration-008, e.g. ids 675/676/683/685 from June 15–19):
+the reconciler can never process them (`condition_id IS NOT NULL` filter) and
+`backfill_legacy_redemptions` recovers the *funds* but never marks the *rows*, so they inflate
+the open-ledger count forever. One-off cleanup (PnL-neutral — `realized_pnl` stays NULL, and
+`get_pnl_summary` COALESCEs it to 0):
+
+```sql
+update copy_trades
+   set result = 'legacy_unknown', resolved_at = now(), redeemed_at = now()
+ where condition_id is null and redeemed_at is null
+   and status = 'confirmed' and created_at < now() - interval '7 days';
+```
+
+**Watch after deploy:** `reconcile_win_dispatched` should appear once per user per cycle,
+followed by `redeemed` + `redeem_done` (success) or `redeem_failed` (tracebacks now readable,
+one at a time). If redeems STILL fail serially, the relayer path itself is broken — grep
+`docker compose logs --since 1h worker | grep -A5 redeem_failed` and investigate the actual
+exception (nonce/auth/RPC).
