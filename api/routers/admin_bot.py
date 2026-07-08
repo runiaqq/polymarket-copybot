@@ -28,6 +28,7 @@ from core.db import (
     count_open_positions,
     create_access_code,
     create_admin_code,
+    get_open_trades_cost,
     get_pnl_summary,
     get_user_by_telegram_id,
     get_user_by_username,
@@ -318,60 +319,84 @@ def _user_view(tid: int, u: dict) -> tuple[str, InlineKeyboardMarkup]:
     Pure (no I/O beyond the balance/PnL/count reads) so both cmd_user and the
     'back' callback can call it. Blueprint 18: reads V2 deposit wallet balance via
     withdrawable_usdc, counts positions from copy_trades (not on-chain EOA).
+    BP22: PnL is DB-first (copy_trades ledger — source of truth); the Data API is
+    only a fallback for pre-008 legacy users, because its realizedPnl is computed
+    from avgPrice which is 0/late for our POLY_1271 proxy wallets (the BP16/BP19
+    wrong-source class) — that produced the "implausible PnL" admin complaint.
+    Balance/POL RPC failures render an explicit error, never a fake $0.00.
     """
     eoa = u.get("wallet_address")
 
     # Balance: withdrawable_usdc covers deposit-wallet pUSD + all EOA USDC variants.
+    # BP22: a read failure must be visible — a silent 0.0 here was indistinguishable
+    # from a genuinely empty wallet ("неправильный баланс").
     try:
         avail = withdrawable_usdc(u)
+        avail_txt = f"${avail:.2f} доступно"
     except Exception:
-        avail = 0.0
+        log.warning("admin_balance_read_failed", user_id=u.get("id"))
+        avail_txt = "⚠️ ошибка чтения (RPC)"
 
     # POL (gas) genuinely lives on the EOA — keep as separate on-chain read.
     try:
-        pol = get_balances(eoa).get("matic", 0.0) if eoa else 0.0
+        pol_txt = f"{get_balances(eoa).get('matic', 0.0):.3f}" if eoa else "—"
     except Exception:
-        pol = 0.0
+        pol_txt = "—"
 
-    bal_txt = f"${avail:.2f} доступно · ⛽️ POL {pol:.3f}"
+    bal_txt = f"{avail_txt} · ⛽️ POL {pol_txt}"
 
-    # Open positions: DB count, not on-chain (avoids fake-0 from EOA read).
+    # Open positions: DB count + cost-basis sum, not on-chain (avoids fake-0 from
+    # EOA read). Cost basis matches the equity convention (§4 conventions / BP8).
     db_uid = u.get("id")
-    try:
-        open_pos = count_open_positions(db_uid) if db_uid else 0
-    except Exception:
-        open_pos = 0
-
-    # PnL: read from Polymarket Data API (same source as user bot /pnl command) so
-    # the admin card and the user's own stats always agree. Falls back to DB on error.
-    trading_wallet = u.get("deposit_wallet_address") or eoa
-    pnl: dict = {"today": 0.0, "week": 0.0, "all_time": 0.0, "settled": 0}
-    if trading_wallet:
+    open_pos = 0
+    open_cost = 0.0
+    if db_uid:
         try:
-            import time as _t
-            closed = get_closed_positions(trading_wallet)
-            now_unix   = _t.time()
-            day0_unix  = datetime.now(timezone.utc).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).timestamp()
-            week0_unix = now_unix - 7 * 86400
-            p_today = p_week = p_all = 0.0
-            for c in closed:
-                rpnl = float(c.get("realized_pnl") or 0)
-                ts   = int(c.get("timestamp") or 0)
-                p_all += rpnl
-                if ts >= day0_unix:
-                    p_today += rpnl
-                if ts >= week0_unix:
-                    p_week  += rpnl
-            pnl = {"today": p_today, "week": p_week,
-                   "all_time": p_all, "settled": len(closed)}
+            open_pos = count_open_positions(db_uid)
         except Exception:
-            # Fallback to DB if Polymarket API is unavailable.
+            log.warning("admin_open_count_failed", user_id=db_uid)
+        try:
+            open_cost = sum(get_open_trades_cost(db_uid).values())
+        except Exception:
+            log.warning("admin_open_cost_failed", user_id=db_uid)
+    pos_txt = str(open_pos) + (f" · в позициях ≈ <b>${open_cost:.2f}</b>" if open_cost > 0 else "")
+
+    # PnL: DB ledger first (same realized_pnl the risk breakers use, so the admin
+    # card and the risk engine never disagree). Data API only when the ledger has
+    # no settled rows at all (legacy pre-008 users) or the DB read fails.
+    pnl: dict = {"today": 0.0, "week": 0.0, "all_time": 0.0, "settled": 0}
+    pnl_src = "леджер"
+    if db_uid:
+        try:
+            pnl = get_pnl_summary(db_uid)
+        except Exception:
+            log.warning("admin_pnl_ledger_failed", user_id=db_uid)
+    if pnl["settled"] == 0:
+        trading_wallet = u.get("deposit_wallet_address") or eoa
+        if trading_wallet:
             try:
-                pnl = get_pnl_summary(db_uid) if db_uid else pnl
+                import time as _t
+                closed = get_closed_positions(trading_wallet)
+                if closed:
+                    now_unix   = _t.time()
+                    day0_unix  = datetime.now(timezone.utc).replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    ).timestamp()
+                    week0_unix = now_unix - 7 * 86400
+                    p_today = p_week = p_all = 0.0
+                    for c in closed:
+                        rpnl = float(c.get("realized_pnl") or 0)
+                        ts   = int(c.get("timestamp") or 0)
+                        p_all += rpnl
+                        if ts >= day0_unix:
+                            p_today += rpnl
+                        if ts >= week0_unix:
+                            p_week  += rpnl
+                    pnl = {"today": p_today, "week": p_week,
+                           "all_time": p_all, "settled": len(closed)}
+                    pnl_src = "Data API"
             except Exception:
-                pass
+                log.warning("admin_pnl_api_failed", user_id=db_uid)
 
     dl = _days_left(u.get("sub_expires_at"))
     nick = f"@{u['username']}" if u.get("username") else "—"
@@ -384,8 +409,8 @@ def _user_view(tid: int, u: dict) -> tuple[str, InlineKeyboardMarkup]:
         f"Макс. позиция: <b>${float(u.get('max_position_usdc') or 0):.0f}</b>\n"
         f"Кошелёк зарегистрирован: {'✓' if u.get('wallet_registered') else '✗'}\n\n"
         f"💰 Баланс: {bal_txt}\n"
-        f"📊 Открытых позиций: {open_pos}\n\n"
-        f"📈 <b>PnL</b>\n"
+        f"📊 Открытых позиций: {pos_txt}\n\n"
+        f"📈 <b>PnL</b> <i>({pnl_src})</i>\n"
         f"📅 Сегодня:   {_pnl_fmt(pnl['today'])}\n"
         f"🗓 7 дней:    {_pnl_fmt(pnl['week'])}\n"
         f"🏆 За всё:    {_pnl_fmt(pnl['all_time'])}   ({pnl['settled']} сделок)\n\n"
@@ -421,11 +446,14 @@ def _fmt_history_row(t: dict) -> str:
     Derives exit price from result/shares — guards against divide-by-zero for legacy
     rows where shares is NULL (Blueprint 16 §16.7).
     """
+    from core.polymarket import smart_truncate
+
     sig    = t.get("trade_signals") or {}
-    title  = (sig.get("title") or "—")[:32]
+    title  = smart_truncate(sig.get("title"), 40)
     oc     = sig.get("outcome") or ("YES" if t.get("outcome_index") == 0 else "NO")
     entry  = float(t.get("entry_price") or 0)
     shares = float(t.get("shares") or 0)
+    size   = float(t.get("size_usdc") or 0)
     # COALESCE: realized_pnl for modern rows, pnl_usdc fallback for pre-008 legacy rows.
     pnl    = float(t.get("realized_pnl") or t.get("pnl_usdc") or 0)
     result = (t.get("result") or "").lower()
@@ -442,9 +470,11 @@ def _fmt_history_row(t: dict) -> str:
     icon    = "🟢" if pnl >= 0 else "🔴"
     exit_s  = f"{exit_px:.2f}" if exit_px is not None else "—"
     entry_s = f"{entry:.2f}" if entry > 0 else "—"
+    when    = (t.get("resolved_at") or t.get("redeemed_at") or "")[:10]
+    when_s  = f" · {when}" if when else ""
     return (
         f"{icon} <b>{title}</b> · {oc}\n"
-        f"   вход {entry_s} → выход {exit_s} · PnL {pnl:+.2f}$"
+        f"   вход {entry_s} → выход {exit_s} · ${size:.2f} · PnL {pnl:+.2f}${when_s}"
     )
 
 

@@ -270,18 +270,31 @@ def poll_tracked_wallets() -> dict:
                 "consensus":      consensus,
                 "whale_wallet":   addr,
             }
+            # BP22: persist the concrete outcome name on the signal row so the
+            # admin trade history and the BP20 tier-2 outcome fallback can show
+            # WHICH side was bought (previously always NULL for Model B signals).
+            sig_payload = {
+                "market_id":      cond,
+                "title":          signal["title"],
+                "outcome":        outcome or None,
+                "side":           "BUY",
+                "price":          signal["price"],
+                "size_usdc":      signal["size_usdc"],
+                "token_id":       token,
+                "source_tx_hash": signal["source_tx_hash"],
+                "source_wallet":  addr,
+                "consensus":      consensus,
+            }
             try:
-                row = insert_trade_signal({
-                    "market_id":      cond,
-                    "title":          signal["title"],
-                    "side":           "BUY",
-                    "price":          signal["price"],
-                    "size_usdc":      signal["size_usdc"],
-                    "token_id":       token,
-                    "source_tx_hash": signal["source_tx_hash"],
-                    "source_wallet":  addr,
-                    "consensus":      consensus,
-                })
+                try:
+                    row = insert_trade_signal(sig_payload)
+                except Exception:
+                    # Fail-safe (§5): if migration 017 (trade_signals.outcome) is
+                    # not applied yet, retry without it — the money path must
+                    # never go down on a display-only column.
+                    sig_payload.pop("outcome", None)
+                    log.warning("signal_insert_retry_no_outcome", market=cond[:14])
+                    row = insert_trade_signal(sig_payload)
                 signal["signal_id"] = row["id"]
             except Exception:
                 log.exception("tracked_signal_insert_failed", market=cond[:14])

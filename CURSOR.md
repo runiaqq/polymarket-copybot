@@ -425,6 +425,38 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   favorites) is intentionally **out of scope** for this release (no market/price/consensus
   filter yet).
 
+- **[BP22] Admin-bot audit: DB-first PnL, trade-history titles, positions cost, honest balance**
+  (2026-07-09, migration **017**): full audit of `api/routers/admin_bot.py` after the admin
+  reported implausible PnL, invisible trade history, wrong positions amount and wrong balance.
+  Four defects fixed (see full Blueprint 22 at the end of this file):
+  **(A) PnL source inverted back to the ledger.** Commit `e6f56a0` had made the Data-API
+  `/closed-positions` the *primary* PnL source for the admin `/user` card, but its
+  `realizedPnl` is derived from `avgPrice`, which is **0/late for our POLY_1271 proxy
+  wallets** (the proven BP16/BP19 wrong-source class) → wins were reported as the full
+  payout (cost basis 0) → inflated, implausible numbers; `limit=100` also silently capped
+  "за всё время". Now `get_pnl_summary` (the `copy_trades` ledger — the same numbers the
+  risk breakers use) is primary; the Data API only kicks in when the ledger has **zero**
+  settled rows (pre-008 legacy users) or the DB read fails. The card shows the source
+  (`леджер`/`Data API`).
+  **(B) Trade-history titles fixed.** `get_user_trade_history`'s signal lookup selected
+  `event_slug` from `trade_signals` — a column no migration ever created — so PostgREST
+  rejected the whole batch lookup, the bare `except: pass` swallowed it, and **every**
+  history row rendered `—` (the "не видно какие сделки" symptom). The select is now
+  `id, title, outcome` only, and a lookup failure logs `trade_history_signal_lookup_failed`
+  loudly instead of degrading silently. History rows now also show trade size, settle date
+  and use `smart_truncate` (BP20.C) instead of a mid-word `[:32]` slice.
+  **(C) Positions amount added + outcome persisted.** The card shows
+  `в позициях ≈ $X` from `get_open_trades_cost` (cost basis, the equity convention).
+  `poll_tracked_wallets` now persists the concrete `outcome` name on every
+  `trade_signals` insert (previously always NULL for Model B → the BP20 tier-2 outcome
+  fallback was dead), with a fail-safe retry-without-column so the money path survives
+  even if migration 017 is not applied.
+  **(D) Honest balance.** `_user_view` rendered `$0.00 доступно` on **any** RPC failure
+  (`except: avail = 0.0`) — indistinguishable from a truly empty wallet. It now renders
+  `⚠️ ошибка чтения (RPC)` and logs `admin_balance_read_failed`; POL renders `—` on error.
+  Migration **017** (`trade_signals.outcome` + partial index
+  `(user_id, redeemed_at desc)` on `copy_trades`) must be applied before deploy.
+
 ---
 
 ## 4. Known Bugs & Missing Features
@@ -3020,6 +3052,12 @@ super-admin (`ADMIN_TELEGRAM_ID` from env) is always authorized regardless of th
   `migrations/014_max_daily_trades.sql` (applied — deploy with Blueprint 13 code)
 - **015** ✅ — `trade_signals.ai_signal_type` (Blueprint 14.B structured AI output) →
   `migrations/015_ai_signal_type.sql` (applied — deploy with Blueprint 14 code)
+- **016** ✅ — `copy_trades.entry_bid` + `users.risk_override_until` (Blueprint 17) →
+  `migrations/016_entry_bid.sql`
+- **017** 🔴 — `trade_signals.outcome` + partial index `(user_id, redeemed_at desc)` on
+  `copy_trades` (Blueprint 22 — admin-bot audit) → `migrations/017_trade_signals_outcome.sql`
+  (**apply before deploying the BP22 code**; the poller has a retry-without-column
+  fail-safe, but the admin history outcome display needs the column)
 
 ### 6.10 Migration order
 
@@ -3027,7 +3065,8 @@ super-admin (`ADMIN_TELEGRAM_ID` from env) is always authorized regardless of th
 `006` wallet score → `007` tracked wallets → `008` settlement ledger → `009` tracked avg size →
 `010` risk controls → `011` user sizing mode → `012` position state (exit_tx + user/condition index) →
 `013` risk state + manual override (Blueprint 8) → `014` max daily trades (Blueprint 13.2) →
-`015` ai_signal_type (Blueprint 14.B).
+`015` ai_signal_type (Blueprint 14.B) → `016` entry_bid + risk_override_until (Blueprint 17) →
+`017` trade_signals.outcome + history index (Blueprint 22).
 
 ---
 
@@ -4676,3 +4715,88 @@ Guard the unknown-cost-basis case (legacy rows, BP16/BP19): if `entry_cost` is u
 - Live probe (user 4): 3 resolved winners with `shares>0` blocked by live redeem keys (money stuck) and
   6 resolved winners with `shares==0` still `confirmed/unredeemed` (ledger desync). Directly validates
   §20.1 A1 (stale key) + A2 (dispatch-without-`trade_id`) → fixes §20.2 A1–A4.
+
+---
+
+## Blueprint 22 — Admin-bot Audit: PnL / History / Positions / Balance ✅ IMPLEMENTED 2026-07-09
+
+> **Class of bug:** the recurring *wrong-source / fail-silent* family (BP12-B, BP16, BP18, BP19).
+> All four defects are **read-path/display** — no user money moves — but the numbers drive admin
+> support decisions, so implausible PnL and fake-$0 balances are operational trust bugs.
+
+### 22.0 Symptoms (prod, admin bot `/user`)
+
+1. **Неправдоподобный PnL** — the card shows inflated/implausible realized PnL per user.
+2. **Не видно, какие сделки совершил бот** — `📜 Последние 5 сделок` renders every row's
+   title as `—`.
+3. **Неправильная сумма в позициях** — no dollar amount for open positions, only a count.
+4. **Неправильный баланс** — the balance line shows `$0.00 доступно` for funded users.
+
+### 22.1 Root causes
+
+**A — PnL: Data API primary + broken proxy-wallet cost basis.** Commit `e6f56a0`
+("use Polymarket Data API for admin PnL") inverted the BP18 design: the API became primary and
+the `copy_trades` ledger a fallback. But `/closed-positions` `realizedPnl` is derived from the
+indexer's `avgPrice` — **provably 0/late for POLY_1271 proxy wallets** (BP16 §16.1, BP19
+Finding B). Zero cost basis ⇒ a win's "profit" = the entire payout ⇒ inflated totals. The
+`limit=100` request also silently truncates all-time PnL for active users, and the API window
+buckets disagree with the ledger buckets the risk breakers use.
+
+**B — History titles: nonexistent `event_slug` column kills the whole lookup.**
+`get_user_trade_history` batch-selected `id, title, outcome, event_slug` from `trade_signals`.
+`event_slug` was **never created by any migration and never inserted by any writer** — PostgREST
+rejects the entire select, the bare `except: pass` swallows the error, `sig_map` stays empty and
+**every** history row falls back to title `—`. (The FK-embed → two-step rewrite in `a0c45a9`
+fixed the embed failure but kept the phantom column.)
+
+**C — Positions: count only, and `outcome` never persisted for Model B.** The card had no
+$-amount for open positions. Separately, the active poller (`poll_tracked_wallets`) never wrote
+`outcome` on `trade_signals` inserts (only dormant Model A `scan_markets` carried it in the
+in-memory dict, and even it didn't insert the column) — so history's `sig.get("outcome")` and
+BP20's tier-2 outcome fallback always came up NULL; grouped markets showed a wrong YES/NO derived
+from `outcome_index`.
+
+**D — Balance: fail-silent zero.** `_user_view` wrapped `withdrawable_usdc(u)` in
+`except Exception: avail = 0.0` — any RPC hiccup rendered a confident `$0.00 доступно`,
+indistinguishable from a truly empty wallet. Same for POL.
+
+### 22.2 Fixes shipped
+
+| # | File | Change |
+|---|---|---|
+| A | `api/routers/admin_bot.py` `_user_view` | **DB-first PnL**: `get_pnl_summary(uid)` (ledger) primary; Data API only when the ledger has `settled == 0` (pre-008 legacy) or the DB read throws. Card labels the source: `📈 PnL (леджер)` / `(Data API)`. |
+| B | `core/db/queries.py` `get_user_trade_history` | Signal lookup selects only `id, title, outcome`; failure now logs `trade_history_signal_lookup_failed` (never a bare pass). |
+| B+ | `api/routers/admin_bot.py` `_fmt_history_row` | `smart_truncate(title, 40)` (BP20.C) instead of `[:32]`; row now shows trade **size** (`$X.XX`) and **settle date**. |
+| C | `api/routers/admin_bot.py` `_user_view` | `📊 Открытых позиций: N · в позициях ≈ $X` — cost-basis sum via `get_open_trades_cost(uid)` (the §4/BP8 equity convention; no on-chain call). |
+| C+ | `worker/tasks/poll_tracked_wallets.py` | `outcome` persisted on every `trade_signals` insert. **Fail-safe (§5):** on insert error the payload retries **without** `outcome` (`signal_insert_retry_no_outcome`) so the money path survives a missing migration. |
+| D | `api/routers/admin_bot.py` `_user_view` | Balance read failure renders `⚠️ ошибка чтения (RPC)` + `admin_balance_read_failed` log; POL renders `—` on error. Never a fake `$0.00`. |
+| — | `migrations/017_trade_signals_outcome.sql` | `alter table trade_signals add column if not exists outcome text;` + partial index `ix_copy_trades_user_redeemed (user_id, redeemed_at desc) where redeemed_at is not null` (admin history/PnL reads). |
+
+New import in `admin_bot.py`: `get_open_trades_cost` (already exported from `core/db` — no
+`__init__.py` change needed, BP12-A guard satisfied).
+
+### 22.3 Deliberate design points
+
+- **The ledger is the admin's source of truth.** `get_pnl_summary` uses the same
+  `redeemed_at IS NOT NULL` + `COALESCE(realized_pnl, pnl_usdc)` predicate family as the risk
+  breakers — the admin card and the risk engine can never disagree again. The user bot's `/pnl`
+  (Data-API based) may legitimately differ from the ledger; the source label on the admin card
+  makes that explicit instead of hiding it.
+- **Positions valued at cost basis, not mark** — consistent with the §4 conventions (BP8):
+  marking open positions to a depressed bid fabricates phantom numbers.
+- **No silent zeros anywhere** in `_user_view` — every degraded read either shows an explicit
+  error/`—` or falls back with a logged warning.
+
+### 22.4 Acceptance criteria
+
+1. `/user` PnL for a user with settled ledger rows equals `Σ realized_pnl` from `copy_trades`
+   (source label `леджер`); a pre-008 user with an empty ledger falls back to Data API with the
+   label `Data API`.
+2. `📜 Последние 5 сделок` shows real market titles, outcome, entry→exit, size, PnL and date for
+   ledger rows with `signal_id`; if the signal lookup fails it logs
+   `trade_history_signal_lookup_failed` (grep-able) instead of silently rendering `—`.
+3. The card shows `в позициях ≈ $X` = sum of open `copy_trades.size_usdc` (cost basis).
+4. With the RPC down, the balance line reads `⚠️ ошибка чтения (RPC)` — never `$0.00`.
+5. New Model B signals persist `outcome`; if migration 017 is missing, the poller logs
+   `signal_insert_retry_no_outcome` and still fires the signal (money path never blocked).
+6. Migration 017 applied before deploy (idempotent; safe to re-run).

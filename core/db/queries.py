@@ -888,6 +888,12 @@ def get_user_trade_history(user_id: int, limit: int = 5, offset: int = 0) -> lis
 
     Two-step query: fetch trade rows first, then batch-lookup signal titles by signal_id.
     Avoids relying on Supabase FK-embed syntax which requires an explicit schema relationship.
+
+    BP22: the signal lookup must select only columns guaranteed to exist
+    (id, title, outcome — migration 017). A previous version selected event_slug
+    which was absent from the live schema; PostgREST rejected the whole query and
+    the bare except swallowed it, so every history row rendered title '—'.
+    A lookup failure is now logged loudly instead of silently degrading.
     """
     sb = get_supabase()
     res = (
@@ -913,13 +919,18 @@ def get_user_trade_history(user_id: int, limit: int = 5, offset: int = 0) -> lis
         try:
             sig_res = (
                 sb.table("trade_signals")
-                .select("id, title, outcome, event_slug")
+                .select("id, title, outcome")
                 .in_("id", signal_ids)
                 .execute()
             )
             sig_map = {s["id"]: s for s in (sig_res.data or [])}
         except Exception:
-            pass
+            # Degrade to titleless rows but leave a trace (BP22: never fail silent).
+            import structlog
+            structlog.get_logger(__name__).warning(
+                "trade_history_signal_lookup_failed", user_id=user_id,
+                signal_ids=signal_ids[:10],
+            )
 
     for r in rows:
         r["trade_signals"] = sig_map.get(r.get("signal_id")) or {}
