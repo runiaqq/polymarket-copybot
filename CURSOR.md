@@ -4800,3 +4800,28 @@ New import in `admin_bot.py`: `get_open_trades_cost` (already exported from `cor
 5. New Model B signals persist `outcome`; if migration 017 is missing, the poller logs
    `signal_insert_retry_no_outcome` and still fires the signal (money path never blocked).
 6. Migration 017 applied before deploy (idempotent; safe to re-run).
+
+### 22.5 Follow-up fix — dead pagination arrow in the history view (2026-07-09)
+
+**Symptom:** tapping `▶️` in `📜 История сделок` did nothing (reported right after the BP22
+deploy, once titles became visible).
+
+**Root causes (three independent, all in the same render path):**
+1. **Unescaped HTML in market titles.** `_fmt_history_row` interpolated the raw
+   `trade_signals.title` into `<b>{title}</b>`. Polymarket titles legitimately contain
+   `<`/`>`/`&` (e.g. *"Will BTC dip <$100K…"*) — Telegram's HTML parser rejects the message,
+   `edit_message_text` throws, and the page flip dies. Page 1 happened to have clean titles;
+   a dirty title on page 2 made the arrow look dead. Fix: `html.escape()` on title and
+   outcome in `_fmt_history_row` (and in `_trades_view`, same latent bug).
+2. **Silent failure UX.** The `on_callback` catch-all only logged
+   `admin_callback_failed`; because `q.answer()` had already been consumed, the retry toast
+   never displayed → dead button with zero user feedback. Fix: HTML-parse failures now
+   retry the same content as **plain text** (tags stripped) so the page always renders;
+   other errors answer with `show_alert=True` including the error snippet.
+3. **Phantom arrow on an exact-multiple-of-5 history.** `len(trades) == 5` was the
+   "has next page" test, so a user with exactly 5/10/15 settled trades got a `▶️` leading
+   to an empty page. Fix: fetch `limit+1` rows as a next-page probe (`has_more`), render
+   the 5, show `▶️` only when the 6th exists.
+
+**Diagnosis command (server):** `docker compose logs api | grep admin_callback_failed` —
+the swallowed exception (`Can't parse entities…`) is visible there for any past occurrence.

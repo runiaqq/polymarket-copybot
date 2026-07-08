@@ -446,11 +446,16 @@ def _fmt_history_row(t: dict) -> str:
     Derives exit price from result/shares — guards against divide-by-zero for legacy
     rows where shares is NULL (Blueprint 16 §16.7).
     """
+    import html as _html
+
     from core.polymarket import smart_truncate
 
     sig    = t.get("trade_signals") or {}
-    title  = smart_truncate(sig.get("title"), 40)
-    oc     = sig.get("outcome") or ("YES" if t.get("outcome_index") == 0 else "NO")
+    # BP22.5: escape — Polymarket titles legitimately contain '<'/'>' ("<$100K",
+    # "<20°C"); unescaped they break Telegram's HTML parser and the page edit
+    # fails, which rendered the pagination arrow dead.
+    title  = _html.escape(smart_truncate(sig.get("title"), 40))
+    oc     = _html.escape(sig.get("outcome") or ("YES" if t.get("outcome_index") == 0 else "NO"))
     entry  = float(t.get("entry_price") or 0)
     shares = float(t.get("shares") or 0)
     size   = float(t.get("size_usdc") or 0)
@@ -486,7 +491,12 @@ def _history_view(tid: int, offset: int) -> tuple[str, InlineKeyboardMarkup]:
         return "Пользователь не найден.", back_kb
 
     nick   = f"@{u['username']}" if u.get("username") else f"id{tid}"
-    trades = get_user_trade_history(u["id"], 5, offset)
+    # BP22.5: fetch one extra row as a "has next page" probe, so ▶️ only renders
+    # when there genuinely is a next page (previously a full page of exactly 5
+    # showed a phantom arrow leading to an empty view).
+    trades = get_user_trade_history(u["id"], 6, offset)
+    has_more = len(trades) > 5
+    trades = trades[:5]
 
     header = f"(с позиции {offset + 1})" if offset > 0 else "(показаны последние записи)"
     lines  = [f"📜 <b>История сделок · {nick}</b>", header, ""]
@@ -501,7 +511,7 @@ def _history_view(tid: int, offset: int) -> tuple[str, InlineKeyboardMarkup]:
     nav: list[InlineKeyboardButton] = []
     if offset > 0:
         nav.append(InlineKeyboardButton("◀️", callback_data=f"uh:{tid}:{max(0, offset - 5)}"))
-    if len(trades) == 5:
+    if has_more:
         nav.append(InlineKeyboardButton("▶️", callback_data=f"uh:{tid}:{offset + 5}"))
     if nav:
         rows.append(nav)
@@ -618,10 +628,11 @@ def _trades_view(addr: str, origin: str) -> tuple[str, InlineKeyboardMarkup]:
     lines = [f"📊 <b>Последние сделки</b>\n<code>{_short_addr(addr)}</code>\n"]
     if not trades:
         lines.append("Нет недавних сделок (или API недоступен).")
+    import html as _html
     for t in trades:
         side = "🟢 BUY" if str(t.get("side", "")).upper() == "BUY" else "🔴 SELL"
-        title = (t.get("title") or "—")[:48]
-        outcome = t.get("outcome") or ""
+        title = _html.escape((t.get("title") or "—")[:48])
+        outcome = _html.escape(t.get("outcome") or "")
         oc = f" · {outcome}" if outcome else ""
         price = float(t.get("price") or 0)
         size = float(t.get("size_usdc") or 0)
@@ -727,6 +738,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     data = q.data or ""
     toast = ""
+    text: str | None = None
+    kb: InlineKeyboardMarkup | None = None
     try:
         if data == "noop":
             await q.answer()
@@ -766,15 +779,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         await q.answer(toast)
-        await q.edit_message_text(
-            text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        try:
+            await q.edit_message_text(
+                text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        except Exception as edit_exc:
+            # "not modified" no-op edits happen after answer() was already sent — ignore.
+            if "not modified" in str(edit_exc).lower():
+                return
+            # BP22.5: HTML parse failures (unescaped chars in market titles) used
+            # to kill the edit silently — retry the same content as plain text so
+            # the button is never dead, and log the parse error loudly.
+            if "parse" in str(edit_exc).lower() and text:
+                log.warning("admin_callback_html_parse_failed", data=data,
+                            error=str(edit_exc))
+                import re as _re
+                plain = _re.sub(r"<[^>]+>", "", text)
+                await q.edit_message_text(
+                    plain, reply_markup=kb, disable_web_page_preview=True)
+            else:
+                raise
     except Exception as exc:
-        # "not modified" no-op edits happen after answer() was already sent — ignore.
         if "not modified" in str(exc).lower():
             return
         log.warning("admin_callback_failed", data=data, error=str(exc))
         try:
-            await q.answer("⚠️ Ошибка, попробуй снова")
+            # show_alert so a failed page flip is visible, not a dead button.
+            await q.answer(f"⚠️ Ошибка: {str(exc)[:150]}", show_alert=True)
         except Exception:
             pass
 
