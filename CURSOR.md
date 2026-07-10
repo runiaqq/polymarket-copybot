@@ -424,6 +424,31 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   only. The −EV entry root-cause (single-whale consensus on high-priced fast-resolving
   favorites) is intentionally **out of scope** for this release (no market/price/consensus
   filter yet).
+- **[BP22] Gevent-safe Telegram notifier** (2026-07-10): fixes a prod flood of
+  `RuntimeError: asyncio.run() cannot be called from a running event loop` that was
+  **silently dropping most user notifications** — most visibly the signal-only alerts to
+  @sto1ner (uid 4) and the other signal-mode users after the Alchemy outage cleared and a
+  backlog of signals fanned out at once. **Root cause:** the worker runs on a **gevent**
+  pool (one OS thread, many greenlets), but every notifier in
+  `worker/tasks/execute_copy.py` sent via `asyncio.run(PTB Bot.send_message(...))`. When
+  two notifications overlapped, greenlet A's event loop was still *running* (parked on the
+  Telegram HTTP await) when gevent switched to greenlet B, whose `asyncio.run()` in the
+  *same* thread then raised. It only worked when calls happened to not overlap, so it
+  looked intermittent; a fan-out burst turned it into a near-total drop. **Fix:** one new
+  module-level helper `_tg_send(chat_id, text, *, disable_preview=False)` posts to the
+  Telegram Bot API with a plain **synchronous `httpx.post`** (httpx is gevent-patched, owns
+  no event loop → concurrency-safe, cannot raise that error). All 10 notifiers
+  (`_notify`, `_notify_signal_only`, `_notify_consensus`, `_notify_subscription_expired`,
+  `_notify_daily_limit`, `_notify_not_registered`, `_notify_low_balance`,
+  `_notify_trading_at_minimum`, `_notify_risk_pause`) were converted from the
+  `async def _send` / `asyncio.run` pattern to build the message synchronously and call
+  `_tg_send`; the top-level `import asyncio` was removed as now-unused. `_tg_send` uses
+  `resp.raise_for_status()` on purpose so a Telegram **403** (user blocked the bot — a
+  benign, expected case seen for a few telegram_ids) still surfaces to each caller's
+  `except` and is logged as `notify_*_failed`, exactly as before. **No behaviour change**
+  to message content, throttling (`notify_once`) or the trade/redeem money-path — this is
+  a transport fix only. This bug was **unrelated to Alchemy**; the outage merely created
+  the burst that exposed it.
 
 - **[BP22] Admin-bot audit: DB-first PnL, trade-history titles, positions cost, honest balance**
   (2026-07-09, migration **017**): full audit of `api/routers/admin_bot.py` after the admin

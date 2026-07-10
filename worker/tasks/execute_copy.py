@@ -20,7 +20,6 @@ Integrations in this file:
           worker.tasks.ai_filter).
 """
 
-import asyncio
 import time
 
 import structlog
@@ -641,24 +640,47 @@ def _subscription_guard(user: dict) -> bool:
     return False
 
 
-def _notify_subscription_expired(telegram_id: int) -> None:
-    from telegram import Bot
+def _tg_send(chat_id: int, text: str, *, disable_preview: bool = False) -> None:
+    """BP22: gevent-safe Telegram sendMessage.
+
+    The worker runs on a gevent pool — one OS thread, many greenlets.  The old
+    notifier pattern ``asyncio.run(PTB Bot.send_message)`` blew up with
+    ``RuntimeError: asyncio.run() cannot be called from a running event loop``
+    whenever two notifications overlapped: greenlet A's loop was still running
+    (parked on the Telegram HTTP await) when gevent switched to greenlet B, which
+    then called ``asyncio.run()`` in the *same* thread.  Under a fan-out burst
+    (e.g. the signal-only broadcast after an Alchemy outage cleared) that dropped
+    most messages.  A plain synchronous ``httpx.post`` (httpx is gevent-patched)
+    owns no event loop, so it is concurrency-safe and never raises that error.
+
+    ``raise_for_status`` is intentional: it preserves the previous behaviour where
+    a Telegram 403 (user blocked the bot) surfaces to the caller's ``except`` and
+    is logged as ``notify_*_failed`` rather than silently swallowed.
+    """
+    import httpx
     from core.config import settings
 
-    async def _send() -> None:
-        bot = Bot(token=settings.telegram_bot_token)
-        await bot.send_message(
-            chat_id=telegram_id,
-            text=(
+    payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if disable_preview:
+        payload["disable_web_page_preview"] = True
+    resp = httpx.post(
+        f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
+        json=payload,
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+
+
+def _notify_subscription_expired(telegram_id: int) -> None:
+    try:
+        _tg_send(
+            telegram_id,
+            (
                 "❌ <b>Ваша подписка истекла.</b>\n\n"
                 "Торговля и отправка сигналов остановлены. "
                 "Продлите подписку для продолжения работы."
             ),
-            parse_mode="HTML",
         )
-
-    try:
-        asyncio.run(_send())
     except Exception:
         log.exception("notify_sub_expired_failed", telegram_id=telegram_id)
 
@@ -672,71 +694,61 @@ def _notify_signal_only(telegram_id: int, signal: dict) -> None:
     event title, the concrete outcome (Yes/No or candidate/team name), the live
     price / implied probability, and the whale conviction metrics.
     """
-    from telegram import Bot
     from core.config import settings
-    from core.polymarket import event_url
+    from core.polymarket import event_url, format_time_left, get_order_book
 
-    async def _send() -> None:
-        from core.polymarket import format_time_left, get_order_book
-        bot = Bot(token=settings.telegram_bot_token)
-        title = (signal.get("title") or "—")[:80]
-        url = event_url(signal.get("event_slug"))
-        title_html = f"<a href=\"{url}\">{title}</a>" if url else f"<b>{title}</b>"
-        outcome = signal.get("outcome") or "—"
+    title = (signal.get("title") or "—")[:80]
+    url = event_url(signal.get("event_slug"))
+    title_html = f"<a href=\"{url}\">{title}</a>" if url else f"<b>{title}</b>"
+    outcome = signal.get("outcome") or "—"
 
-        # Prefer a fresh order-book ask; fall back to the signal's VWAP entry.
-        price = float(signal.get("price") or 0)
-        token_id = signal.get("token_id")
-        if token_id:
-            try:
-                book = get_order_book(token_id)
-                if book and book.get("best_ask"):
-                    price = float(book["best_ask"])
-            except Exception:
-                pass
-        prob = f"{price * 100:.0f}%" if price else "—"
+    # Prefer a fresh order-book ask; fall back to the signal's VWAP entry.
+    price = float(signal.get("price") or 0)
+    token_id = signal.get("token_id")
+    if token_id:
+        try:
+            book = get_order_book(token_id)
+            if book and book.get("best_ask"):
+                price = float(book["best_ask"])
+        except Exception:
+            pass
+    prob = f"{price * 100:.0f}%" if price else "—"
 
-        whale_usdc = float(signal.get("size_usdc") or 0)
-        fills = int(signal.get("fills") or 0)
-        consensus = int(signal.get("consensus") or 1)
-        whale_line = (
-            f"🐳 Кит вошёл на: <b>${whale_usdc:,.0f}</b>"
-            if whale_usdc else "🐳 Сигнал от кита"
-        )
-        if fills > 1:
-            whale_line += f" ({fills} сделок)"
-        if consensus >= 2:
-            whale_line += f"\n🔥 <b>Консенсус: {consensus} кита</b> в этом исходе"
+    whale_usdc = float(signal.get("size_usdc") or 0)
+    fills = int(signal.get("fills") or 0)
+    consensus = int(signal.get("consensus") or 1)
+    whale_line = (
+        f"🐳 Кит вошёл на: <b>${whale_usdc:,.0f}</b>"
+        if whale_usdc else "🐳 Сигнал от кита"
+    )
+    if fills > 1:
+        whale_line += f" ({fills} сделок)"
+    if consensus >= 2:
+        whale_line += f"\n🔥 <b>Консенсус: {consensus} кита</b> в этом исходе"
 
-        # BP5: compute time-left fresh at send time, never from a cached scalar.
-        time_left = format_time_left(signal.get("resolution_iso"))
-        hours_line = f" · ⏳ {time_left}" if time_left else ""
-        link_line = f"\n🔗 <a href=\"{url}\">Открыть рынок на Polymarket</a>" if url else ""
+    # BP5: compute time-left fresh at send time, never from a cached scalar.
+    time_left = format_time_left(signal.get("resolution_iso"))
+    hours_line = f" · ⏳ {time_left}" if time_left else ""
+    link_line = f"\n🔗 <a href=\"{url}\">Открыть рынок на Polymarket</a>" if url else ""
 
-        msg = (
-            f"🔔 <b>Новый сигнал по киту</b>\n\n"
-            f"📌 {title_html}\n"
-            f"🎯 Исход: <b>{outcome}</b> @ {price:.3f} (~{prob}){hours_line}\n"
-            f"{whale_line}\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            "💡 Режим <b>«Только сигналы»</b>: бот не открывает сделку за тебя.\n"
-            f"Чтобы войти — открой рынок и купи <b>{outcome}</b> вручную."
-            f"{link_line}"
-        )
-        await bot.send_message(
-            chat_id=telegram_id, text=msg, parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+    msg = (
+        f"🔔 <b>Новый сигнал по киту</b>\n\n"
+        f"📌 {title_html}\n"
+        f"🎯 Исход: <b>{outcome}</b> @ {price:.3f} (~{prob}){hours_line}\n"
+        f"{whale_line}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "💡 Режим <b>«Только сигналы»</b>: бот не открывает сделку за тебя.\n"
+        f"Чтобы войти — открой рынок и купи <b>{outcome}</b> вручную."
+        f"{link_line}"
+    )
 
     try:
-        asyncio.run(_send())
+        _tg_send(telegram_id, msg, disable_preview=True)
     except Exception:
         log.exception("notify_signal_only_failed", telegram_id=telegram_id)
 
 
 def _notify_consensus(telegram_id: int, signal: dict, consensus: int) -> None:
-    from telegram import Bot
-    from core.config import settings
     from core.cache import notify_once
     from core.polymarket import event_url
 
@@ -744,15 +756,15 @@ def _notify_consensus(telegram_id: int, signal: dict, consensus: int) -> None:
     if not notify_once(f"consensus:{telegram_id}:{cond}:{consensus}"):
         return
 
-    async def _send() -> None:
-        bot = Bot(token=settings.telegram_bot_token)
-        title = (signal.get("title") or "—")[:60]
-        outcome = signal.get("outcome") or "—"
-        url = event_url(signal.get("event_slug"))
-        link = f"\n🔗 <a href=\"{url}\">Смотреть позицию</a>" if url else ""
-        await bot.send_message(
-            chat_id=telegram_id,
-            text=(
+    title = (signal.get("title") or "—")[:60]
+    outcome = signal.get("outcome") or "—"
+    url = event_url(signal.get("event_slug"))
+    link = f"\n🔗 <a href=\"{url}\">Смотреть позицию</a>" if url else ""
+
+    try:
+        _tg_send(
+            telegram_id,
+            (
                 f"🔥 <b>Ещё один профи зашёл!</b>\n\n"
                 f"📌 {title}\n"
                 f"🎯 Исход: <b>{outcome}</b>\n\n"
@@ -760,62 +772,45 @@ def _notify_consensus(telegram_id: int, signal: dict, consensus: int) -> None:
                 f"уверенность в победе растёт. Твоя позиция уже открыта, "
                 f"повторно не входим.{link}"
             ),
-            parse_mode="HTML", disable_web_page_preview=True,
+            disable_preview=True,
         )
-
-    try:
-        asyncio.run(_send())
     except Exception:
         log.exception("notify_consensus_failed", telegram_id=telegram_id)
 
 
 def _notify_daily_limit(telegram_id: int, used: int, limit: int) -> None:
     """BP13.2: one throttled nudge per user when the daily trade cap is hit."""
-    from telegram import Bot
     from core.config import settings
     from core.cache import notify_once
 
     if not notify_once(f"daily_limit:{telegram_id}", ttl=settings.lowbal_alert_throttle_sec):
         return
 
-    async def _send() -> None:
-        bot = Bot(token=settings.telegram_bot_token)
-        await bot.send_message(
-            chat_id=telegram_id,
-            text=(
+    try:
+        _tg_send(
+            telegram_id,
+            (
                 f"🔁 <b>Дневной лимит сделок исчерпан</b>\n\n"
                 f"Ты установил лимит <b>{limit} сделок/день</b> — "
                 f"сегодня уже вошли в <b>{used}</b>.\n\n"
                 "Новые сигналы пропускаются до 00:00 UTC.\n"
                 "Изменить лимит: ⚙️ Настройки."
             ),
-            parse_mode="HTML",
         )
-
-    try:
-        asyncio.run(_send())
     except Exception:
         log.exception("notify_daily_limit_failed", telegram_id=telegram_id)
 
 
 def _notify_not_registered(telegram_id: int) -> None:
-    from telegram import Bot
-    from core.config import settings
-
-    async def _send() -> None:
-        bot = Bot(token=settings.telegram_bot_token)
-        await bot.send_message(
-            chat_id=telegram_id,
-            text=(
+    try:
+        _tg_send(
+            telegram_id,
+            (
                 "⚙️ <b>Нужна настройка кошелька</b>\n\n"
                 "Чтобы бот копировал сделки, разверни торговый кошелёк: /register "
                 "(без газа с твоей стороны). После этого пополни баланс и включи /resume."
             ),
-            parse_mode="HTML",
         )
-
-    try:
-        asyncio.run(_send())
     except Exception:
         log.exception("notify_not_registered_failed", telegram_id=telegram_id)
 
@@ -832,7 +827,6 @@ def _notify_low_balance(
     The throttle key is per-user, independent of the signal, so a high-volume
     signal day does not produce alert spam.
     """
-    from telegram import Bot
     from core.config import settings
     from core.cache import notify_once
 
@@ -840,29 +834,26 @@ def _notify_low_balance(
     if not notify_once(f"lowbal:{telegram_id}", ttl=settings.lowbal_alert_throttle_sec):
         return
 
-    async def _send() -> None:
-        bot = Bot(token=settings.telegram_bot_token)
-        title = signal.get("title") or "—"
-        if reason == "min_balance":
-            text = (
-                f"⚠️ <b>Баланс ниже минимума для копирования</b>\n\n"
-                f"📌 {title}\n\n"
-                f"💰 Минимальный баланс: <b>${needed:.2f} USDC</b>\n"
-                f"💼 Текущий капитал: <b>${balance:.2f} USDC</b>\n\n"
-                f"Пополни кошелёк через /wallet чтобы не пропускать сделки."
-            )
-        else:
-            text = (
-                f"⚠️ <b>Недостаточно средств для сделки</b>\n\n"
-                f"📌 {title}\n\n"
-                f"💰 Нужно: <b>${needed:.2f} USDC</b>\n"
-                f"💼 На балансе: <b>${balance:.2f} USDC</b>\n\n"
-                f"Пополни кошелёк через /wallet чтобы не пропускать сделки."
-            )
-        await bot.send_message(chat_id=telegram_id, text=text, parse_mode="HTML")
+    title = signal.get("title") or "—"
+    if reason == "min_balance":
+        text = (
+            f"⚠️ <b>Баланс ниже минимума для копирования</b>\n\n"
+            f"📌 {title}\n\n"
+            f"💰 Минимальный баланс: <b>${needed:.2f} USDC</b>\n"
+            f"💼 Текущий капитал: <b>${balance:.2f} USDC</b>\n\n"
+            f"Пополни кошелёк через /wallet чтобы не пропускать сделки."
+        )
+    else:
+        text = (
+            f"⚠️ <b>Недостаточно средств для сделки</b>\n\n"
+            f"📌 {title}\n\n"
+            f"💰 Нужно: <b>${needed:.2f} USDC</b>\n"
+            f"💼 На балансе: <b>${balance:.2f} USDC</b>\n\n"
+            f"Пополни кошелёк через /wallet чтобы не пропускать сделки."
+        )
 
     try:
-        asyncio.run(_send())
+        _tg_send(telegram_id, text)
     except Exception:
         log.exception("notify_low_balance_failed", telegram_id=telegram_id)
 
@@ -872,14 +863,10 @@ def _notify_trading_at_minimum(telegram_id: int, balance: float, recommended: fl
     BP3.1: soft warning — balance below recommended, but we still trade at minimum.
     Throttled via notify_once in the caller (once per lowbal_alert_throttle_sec).
     """
-    from telegram import Bot
-    from core.config import settings
-
-    async def _send() -> None:
-        bot = Bot(token=settings.telegram_bot_token)
-        await bot.send_message(
-            chat_id=telegram_id,
-            text=(
+    try:
+        _tg_send(
+            telegram_id,
+            (
                 f"⚠️ <b>Торгуем на минимальном объёме</b>\n\n"
                 f"💼 Баланс: <b>${balance:.2f} pUSD</b> "
                 f"(рекомендуется ≥ ${recommended:.0f})\n\n"
@@ -887,35 +874,23 @@ def _notify_trading_at_minimum(telegram_id: int, balance: float, recommended: fl
                 f"допустимый размер ордера.\n"
                 f"Пополни кошелёк через /wallet для нормального риск-менеджмента."
             ),
-            parse_mode="HTML",
         )
-
-    try:
-        asyncio.run(_send())
     except Exception:
         log.exception("notify_trading_at_minimum_failed", telegram_id=telegram_id)
 
 
 def _notify_risk_pause(telegram_id: int, reason: str) -> None:
     """BP4: notify user that copying was paused by a risk gate."""
-    from telegram import Bot
-    from core.config import settings
-
-    async def _send() -> None:
-        bot = Bot(token=settings.telegram_bot_token)
-        await bot.send_message(
-            chat_id=telegram_id,
-            text=(
+    try:
+        _tg_send(
+            telegram_id,
+            (
                 f"🛡 <b>Риск-защита сработала</b>\n\n"
                 f"{reason}\n\n"
                 f"Копирование приостановлено автоматически для защиты депозита. "
                 f"После отдыха бот возобновится сам."
             ),
-            parse_mode="HTML",
         )
-
-    try:
-        asyncio.run(_send())
     except Exception:
         log.exception("notify_risk_pause_failed", telegram_id=telegram_id)
 
@@ -935,83 +910,74 @@ def _notify(
     concentration_warn: when "concentration_over_60" (BP7), append a risk note
     about position concentration directly into this message (no separate alert).
     """
-    from telegram import Bot
-    from core.config import settings
-    from core.polymarket import event_url
+    from core.polymarket import event_url, format_time_left
 
-    async def _send() -> None:
-        from core.polymarket import format_time_left
-        bot = Bot(token=settings.telegram_bot_token)
-        title = (signal.get("title") or "—")[:60]
-        url = event_url(signal.get("event_slug"))
-        title_html = f"<a href=\"{url}\">{title}</a>" if url else f"<b>{title}</b>"
-        price = float(signal.get("price") or 0)
-        outcome = signal.get("outcome") or "—"
-        prob = f"{price * 100:.0f}%"
-        whale_usdc = float(signal.get("size_usdc") or 0)
-        fills = int(signal.get("fills") or 0)
-        consensus = int(signal.get("consensus") or 1)
-        whale_line = f"🐳 Профи вошёл на: <b>${whale_usdc:,.0f}</b>" if whale_usdc else "🐳 Сигнал от профи-кошелька"
-        if fills > 1:
-            whale_line += f" ({fills} сделок)"
-        if consensus >= 2:
-            whale_line += f"\n🔥 <b>Консенсус: {consensus} профи</b> в этом исходе"
-        # BP5: compute time-left fresh at notification time, never from a cached scalar.
-        time_left = format_time_left(signal.get("resolution_iso"))
-        hours_line = f" · ⏳ {time_left}"
-        link_line = f"\n🔗 <a href=\"{url}\">Смотреть позицию</a>" if url else ""
+    title = (signal.get("title") or "—")[:60]
+    url = event_url(signal.get("event_slug"))
+    title_html = f"<a href=\"{url}\">{title}</a>" if url else f"<b>{title}</b>"
+    price = float(signal.get("price") or 0)
+    outcome = signal.get("outcome") or "—"
+    prob = f"{price * 100:.0f}%"
+    whale_usdc = float(signal.get("size_usdc") or 0)
+    fills = int(signal.get("fills") or 0)
+    consensus = int(signal.get("consensus") or 1)
+    whale_line = f"🐳 Профи вошёл на: <b>${whale_usdc:,.0f}</b>" if whale_usdc else "🐳 Сигнал от профи-кошелька"
+    if fills > 1:
+        whale_line += f" ({fills} сделок)"
+    if consensus >= 2:
+        whale_line += f"\n🔥 <b>Консенсус: {consensus} профи</b> в этом исходе"
+    # BP5: compute time-left fresh at notification time, never from a cached scalar.
+    time_left = format_time_left(signal.get("resolution_iso"))
+    hours_line = f" · ⏳ {time_left}"
+    link_line = f"\n🔗 <a href=\"{url}\">Смотреть позицию</a>" if url else ""
 
-        if fill_status == "none":
-            msg = (
-                f"⚠️ <b>Сделка не прошла</b>\n\n"
-                f"📌 {title_html}\n"
-                f"🎯 Исход: <b>{outcome}</b>\n\n"
-                f"Стакан слишком тонкий — ордер не наполнился, позиция не открыта.{link_line}"
+    if fill_status == "none":
+        msg = (
+            f"⚠️ <b>Сделка не прошла</b>\n\n"
+            f"📌 {title_html}\n"
+            f"🎯 Исход: <b>{outcome}</b>\n\n"
+            f"Стакан слишком тонкий — ордер не наполнился, позиция не открыта.{link_line}"
+        )
+    else:
+        head = "✅ <b>Бот открыл позицию</b>"
+        if fill_status == "partial":
+            head = "✅ <b>Бот открыл позицию (частично)</b>"
+
+        invested = filled_usdc if fill_status in ("full", "partial") else intended_usdc
+        partial_note = f" из ${intended_usdc:.2f} (тонкий стакан)" if fill_status == "partial" else ""
+
+        ai_block = ""
+        if ai_score is not None and ai_thesis:
+            from core.risk_label import risk_label
+            emoji, verdict = risk_label(ai_score)
+            caution_line = f"\n⚠️ {ai_caution}" if ai_caution else ""
+            ai_block = (
+                f"\n\n━━━━━━━━━━━━━━━━━\n"
+                f"🧠 <b>ИИ-анализ</b>\n"
+                f"{emoji} <b>{verdict}</b> · риск {ai_score}/10\n"
+                f"💬 {ai_thesis}"
+                f"{caution_line}"
             )
-        else:
-            head = "✅ <b>Бот открыл позицию</b>"
-            if fill_status == "partial":
-                head = "✅ <b>Бот открыл позицию (частично)</b>"
 
-            invested = filled_usdc if fill_status in ("full", "partial") else intended_usdc
-            partial_note = f" из ${intended_usdc:.2f} (тонкий стакан)" if fill_status == "partial" else ""
+        # BP7: inline concentration note — appended here, no separate message.
+        concentration_line = ""
+        if concentration_warn == "concentration_over_60":
+            concentration_line = "\n⚠️ Позиция заняла >60% капитала — риск концентрации"
 
-            ai_block = ""
-            if ai_score is not None and ai_thesis:
-                from core.risk_label import risk_label
-                emoji, verdict = risk_label(ai_score)
-                caution_line = f"\n⚠️ {ai_caution}" if ai_caution else ""
-                ai_block = (
-                    f"\n\n━━━━━━━━━━━━━━━━━\n"
-                    f"🧠 <b>ИИ-анализ</b>\n"
-                    f"{emoji} <b>{verdict}</b> · риск {ai_score}/10\n"
-                    f"💬 {ai_thesis}"
-                    f"{caution_line}"
-                )
-
-            # BP7: inline concentration note — appended here, no separate message.
-            concentration_line = ""
-            if concentration_warn == "concentration_over_60":
-                concentration_line = "\n⚠️ Позиция заняла >60% капитала — риск концентрации"
-
-            msg = (
-                f"{head}\n\n"
-                f"📌 {title_html}\n"
-                f"🎯 Исход: <b>{outcome}</b> @ {price:.3f} (~{prob}){hours_line}\n"
-                + (f"{whale_line}\n" if whale_line else "")
-                + "━━━━━━━━━━━━━━━━━\n"
-                f"💵 Бот вложил: <b>${invested:.2f}{partial_note}</b>\n"
-                f"💼 Остаток: <b>${remaining:.2f} pUSD</b>"
-                f"{concentration_line}"
-                f"{ai_block}"
-                f"{link_line}"
-            )
-        await bot.send_message(
-            chat_id=telegram_id, text=msg, parse_mode="HTML",
-            disable_web_page_preview=True,
+        msg = (
+            f"{head}\n\n"
+            f"📌 {title_html}\n"
+            f"🎯 Исход: <b>{outcome}</b> @ {price:.3f} (~{prob}){hours_line}\n"
+            + (f"{whale_line}\n" if whale_line else "")
+            + "━━━━━━━━━━━━━━━━━\n"
+            f"💵 Бот вложил: <b>${invested:.2f}{partial_note}</b>\n"
+            f"💼 Остаток: <b>${remaining:.2f} pUSD</b>"
+            f"{concentration_line}"
+            f"{ai_block}"
+            f"{link_line}"
         )
 
     try:
-        asyncio.run(_send())
+        _tg_send(telegram_id, msg, disable_preview=True)
     except Exception:
         log.exception("notify_failed", telegram_id=telegram_id)
