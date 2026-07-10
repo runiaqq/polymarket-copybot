@@ -424,7 +424,31 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   only. The −EV entry root-cause (single-whale consensus on high-priced fast-resolving
   favorites) is intentionally **out of scope** for this release (no market/price/consensus
   filter yet).
-- **[BP22] Gevent-safe Telegram notifier** (2026-07-10): fixes a prod flood of
+- **[BP22.8] Redeem-lease 7-day-TTL deadlock fix** (2026-07-10): winnings stopped
+  being auto-redeemed for **days** — `reconcile_settlements` looped
+  `reconcile_redeem_blocked` with `checked=97 processed=0`, `redeem_position` never ran,
+  and Redis held **104 live `once:redeem:{uid}:{cond}` leases**. **Root cause:**
+  `backfill_legacy_redemptions` claimed the redeem lease via
+  `notify_once(f"redeem:{uid}:{cond}")` **without `ttl=`**, so it used the `notify_once`
+  **7-day default (604800 s)** instead of `redeem_lease_sec` (900 s) — sampled leases had
+  TTLs of 12 435 / 70 981 / 171 904 s, i.e. created 5–7 days earlier. Those week-long leases
+  gated **both** re-dispatch paths (`reconcile_settlements` L1147 and `sync_positions` L158
+  share the same key), and `sync_positions` only fires on the Data-API `redeemable` flag
+  (which had since flipped off), so nothing could ever re-dispatch and clear them → a
+  self-sustaining deadlock. Compounding it, three `redeem_position` early-returns
+  (`no_wallet`, `not_registered`, and especially `terminal_state`) returned **without**
+  releasing the lease, so a backfill-claimed 7-day lease stuck permanently once the trade
+  was already terminal. **Fix (both leak points):** (1) both `backfill_legacy_redemptions`
+  claim sites now pass `ttl=settings.redeem_lease_sec`; (2) `redeem_position` now
+  `clear_once(f"redeem:{uid}:{cond}")` on the `no_wallet` / `not_registered` /
+  `terminal_state` early-returns too, so a claimed lease can never linger. **Safe by
+  design:** the terminal state is the DB (`copy_trades.redeemed_at`), never the Redis key,
+  and `redeem_position` re-verifies terminal state on entry — clearing a lease is never a
+  double-redeem risk. **Operational recovery:** the pre-existing 7-day leases were flushed
+  from Redis (`DEL once:redeem:*`); redemption resumed immediately (verified: uid 2 paid
+  `+$6.89`, tx `0x1732b260…` confirmed in 16 s; `checked` fell 97→95). Redeem tx/gas were
+  never the problem. Diagnosed alongside BP23.
+- **[BP23] Gevent-safe Telegram notifier** (2026-07-10): fixes a prod flood of
   `RuntimeError: asyncio.run() cannot be called from a running event loop` that was
   **silently dropping most user notifications** — most visibly the signal-only alerts to
   @sto1ner (uid 4) and the other signal-mode users after the Alchemy outage cleared and a

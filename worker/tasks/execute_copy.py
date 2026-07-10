@@ -641,7 +641,7 @@ def _subscription_guard(user: dict) -> bool:
 
 
 def _tg_send(chat_id: int, text: str, *, disable_preview: bool = False) -> None:
-    """BP22: gevent-safe Telegram sendMessage.
+    """BP23: gevent-safe Telegram sendMessage.
 
     The worker runs on a gevent pool — one OS thread, many greenlets.  The old
     notifier pattern ``asyncio.run(PTB Bot.send_message)`` blew up with

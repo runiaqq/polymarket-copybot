@@ -787,9 +787,13 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
     res = sb.table("users").select("*").eq("id", user_id).maybe_single().execute()
     user = res.data if res else None
     if not user or not user.get("wallet_private_key_enc"):
+        # BP22.8: always release the lease on an early skip so a claimed
+        # redeem:{uid}:{cond} key can never linger and block re-dispatch.
+        clear_once(f"redeem:{user_id}:{condition_id}")
         return {"skipped": True, "reason": "no_wallet"}
     dw = user.get("deposit_wallet_address")
     if not dw:
+        clear_once(f"redeem:{user_id}:{condition_id}")
         return {"skipped": True, "reason": "not_registered"}
 
     # Blueprint 6 (1): terminal-state guard — if the trade was already closed by
@@ -804,6 +808,9 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
             if tr.data:
                 td = tr.data
                 if td.get("status") == "closed" or td.get("redeemed_at"):
+                    # BP22.8: terminal already — release the lease (this was the
+                    # main path that left backfill's 7-day lease stuck forever).
+                    clear_once(f"redeem:{user_id}:{condition_id}")
                     log.info("redeem_skip_terminal", user_id=user_id, trade_id=trade_id)
                     return {"skipped": True, "reason": "terminal_state"}
         except Exception:
@@ -1329,7 +1336,11 @@ def backfill_legacy_redemptions() -> dict:
                 cur = float(p.get("cur_price") or 0)
                 if cur < 0.5:
                     continue  # loss — nothing to redeem
-                if not notify_once(f"redeem:{uid}:{condition_id}"):
+                # BP22.8: short lease TTL (redeem_lease_sec), NOT the notify_once
+                # 7-day default.  A 7-day lease here is what silently deadlocked
+                # redemption for a week — reconcile/sync could never re-dispatch.
+                if not notify_once(f"redeem:{uid}:{condition_id}",
+                                   ttl=settings.redeem_lease_sec):
                     continue
                 outcome_idx = p.get("outcome_index")
                 if outcome_idx is None:
@@ -1359,7 +1370,9 @@ def backfill_legacy_redemptions() -> dict:
                 won = get_payout_numerator(condition_id, int(outcome_idx)) > 0
                 if not won:
                     continue
-                if not notify_once(f"redeem:{uid}:{condition_id}"):
+                # BP22.8: short lease TTL (redeem_lease_sec), NOT the 7-day default.
+                if not notify_once(f"redeem:{uid}:{condition_id}",
+                                   ttl=settings.redeem_lease_sec):
                     continue
                 redeem_position.delay(
                     uid, token_id, condition_id,
