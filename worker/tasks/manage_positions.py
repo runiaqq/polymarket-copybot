@@ -965,7 +965,13 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
         if self.request.retries >= self.max_retries:
             try:
                 tg_id = user.get("telegram_id")
-                if tg_id:
+                # BP24.1: dedup the "credit delayed" message — reconcile re-dispatches
+                # redeem every cycle, and without this guard each exhausted run
+                # re-notified the user (the "уже несколько раз" spam).  One message
+                # per condition per 6h; the eventual "✅ зачислено" still fires on
+                # success and the row keeps being retried idempotently in the queue.
+                if tg_id and notify_once(f"retryfail:{user_id}:{condition_id}",
+                                         ttl=6 * 3600):
                     _emit_win_retry_failed(tg_id, title, resolved_outcome, event_slug)
             except Exception:
                 pass
