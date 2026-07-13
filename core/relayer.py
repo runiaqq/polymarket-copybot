@@ -19,9 +19,11 @@ from web3 import Web3
 from core.config import settings
 from core.clob import (
     CONDITIONAL_TOKENS,
+    CTF_COLLATERAL_ADAPTER,
     CTF_EXCHANGE,
     MAX_UINT,
     NEG_RISK_ADAPTER,
+    NEG_RISK_CTF_COLLATERAL_ADAPTER,
     NEG_RISK_CTF_EXCHANGE,
     PUSD_ADDRESS,
 )
@@ -107,6 +109,17 @@ def set_trading_approvals(private_key_enc: str) -> dict:
 
     calls = []
     for sp in _TRADING_SPENDERS:
+        calls.append(DepositWalletCall(target=Web3.to_checksum_address(PUSD_ADDRESS),
+                                       value="0", data=_approve_data(sp)))
+        calls.append(DepositWalletCall(target=Web3.to_checksum_address(CONDITIONAL_TOKENS),
+                                       value="0", data=_set_approval_data(sp)))
+
+    # BP25: also approve the pUSD-native collateral adapters so redeem/split/merge can
+    # run through them.  The relayer allowlist blocks direct NegRiskAdapter redemptions
+    # from a deposit wallet; neg-risk wins must route through NegRiskCtfCollateralAdapter,
+    # which needs setApprovalForAll on CTF (to burn the outcome tokens) + a pUSD approve.
+    # Idempotent — safe to re-run for wallets that were registered before this change.
+    for sp in (CTF_COLLATERAL_ADAPTER, NEG_RISK_CTF_COLLATERAL_ADAPTER):
         calls.append(DepositWalletCall(target=Web3.to_checksum_address(PUSD_ADDRESS),
                                        value="0", data=_approve_data(sp)))
         calls.append(DepositWalletCall(target=Web3.to_checksum_address(CONDITIONAL_TOKENS),
@@ -216,7 +229,8 @@ def redeem_winnings(private_key_enc: str, condition_id: str, neg_risk: bool,
     Auto-detects how the held outcome token is collateralized by matching the
     on-chain positionId against candidate collaterals — this is bulletproof and
     does NOT rely on the (often missing) `negativeRisk` API flag:
-      * WrappedCollateral match → neg-risk → NegRiskAdapter.redeemPositions
+      * WrappedCollateral match → neg-risk → NegRiskCtfCollateralAdapter.redeemPositions
+        (BP25: the raw NegRiskAdapter is blocked by the relayer allowlist)
       * stable (pUSD/USDC.e/USDC) match → binary → CTF.redeemPositions
 
     Payout lands in the deposit wallet (msg.sender). Idempotent: once the tokens
@@ -244,11 +258,20 @@ def redeem_winnings(private_key_enc: str, condition_id: str, neg_risk: bool,
         bal = int(ctf.functions.balanceOf(dw_cs, asset_int).call())
         if bal <= 0:
             return {"skipped": True, "reason": "no_token_balance", "deposit_wallet": dw}
-        amounts = [0, 0]
-        amounts[idx] = bal
-        sel = Web3.keccak(text="redeemPositions(bytes32,uint256[])")[:4]
-        data = "0x" + (sel + encode(["bytes32", "uint256[]"], [cond_b, amounts])).hex()
-        target = NEG_RISK_ADAPTER
+        # BP25: route neg-risk redemption through the pUSD-native NegRiskCtfCollateralAdapter,
+        # NOT the raw NegRiskAdapter — the relayer allowlist blocks direct NegRiskAdapter
+        # calls from a deposit wallet ("call blocked: calls to 0xd91E…35296 are not
+        # permitted").  The adapter burns the WCOL-collateralised ERC1155 via CTF and
+        # returns pUSD directly (no separate WCOL/USDC.e unwrap needed).  Uses the 4-arg
+        # CTF-style redeem the docs document for the adapter path: collateral = pUSD,
+        # parentCollectionId = 0, index sets [1,2] (redeems the whole balance; the losing
+        # leg pays $0).
+        sel = Web3.keccak(text="redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
+        data = "0x" + (sel + encode(
+            ["address", "bytes32", "bytes32", "uint256[]"],
+            [Web3.to_checksum_address(PUSD_ADDRESS), b"\x00" * 32, cond_b, [1, 2]],
+        )).hex()
+        target = NEG_RISK_CTF_COLLATERAL_ADAPTER
         mode = "neg_risk"
     else:
         # 2) binary: find the stable collateral whose positionId matches the token.
@@ -272,10 +295,20 @@ def redeem_winnings(private_key_enc: str, condition_id: str, neg_risk: bool,
         target = CONDITIONAL_TOKENS
         mode = "binary"
 
-    call = DepositWalletCall(target=Web3.to_checksum_address(target), value="0", data=data)
+    calls = []
+    # BP25: self-heal the collateral adapter's CTF operator approval for deposit wallets
+    # that were registered before BP25 added it to set_trading_approvals.  Idempotent,
+    # and both targets (CTF, adapter) are on the relayer allowlist, so this batches
+    # safely with the redeem call itself.
+    if mode == "neg_risk":
+        calls.append(DepositWalletCall(
+            target=Web3.to_checksum_address(CONDITIONAL_TOKENS), value="0",
+            data=_set_approval_data(NEG_RISK_CTF_COLLATERAL_ADAPTER)))
+    calls.append(DepositWalletCall(target=Web3.to_checksum_address(target),
+                                   value="0", data=data))
     nonce = str(c.get_nonce(c.signer.address(), TransactionType.WALLET.value)["nonce"])
     resp = c.execute_deposit_wallet_batch(
-        calls=[call], wallet_address=dw, nonce=nonce,
+        calls=calls, wallet_address=dw, nonce=nonce,
         deadline=str(int(time.time()) + 600),
     ).wait()
     if not resp or resp.get("state") not in ("STATE_MINED", "STATE_CONFIRMED"):

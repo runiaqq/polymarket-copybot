@@ -20,8 +20,18 @@ CONDITIONAL_TOKENS    = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # CTF outc
 PUSD_ADDRESS          = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # pUSD — V2 collateral
 MAX_UINT              = 2**256 - 1
 
+# BP25: pUSD-native collateral adapters — the relayer-permitted route for pUSD-native
+# split/merge/redeem.  Direct NegRiskAdapter redeemPositions from a deposit wallet is
+# rejected by the relayer allowlist ("call blocked: calls to 0xd91E…35296 are not
+# permitted"); these thin adapters burn the ERC1155 via CTF and return pUSD.
+CTF_COLLATERAL_ADAPTER          = "0xAdA100Db00Ca00073811820692005400218FcE1f"  # CtfCollateralAdapter
+NEG_RISK_CTF_COLLATERAL_ADAPTER = "0xadA2005600Dec949baf300f4C6120000bDB6eAab"  # NegRiskCtfCollateralAdapter
+
 # Spenders that need approval for CLOB order matching + settlement.
 _TRADING_SPENDERS = (CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE, NEG_RISK_ADAPTER)
+# Spenders that must be approved so the pUSD-native adapters can burn/move the deposit
+# wallet's tokens during split/merge/redeem (setApprovalForAll on CTF + pUSD approve).
+_ADAPTER_SPENDERS = (CTF_COLLATERAL_ADAPTER, NEG_RISK_CTF_COLLATERAL_ADAPTER)
 
 _ERC20_APPROVE_ABI = [{"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}]
 _ERC1155_APPROVAL_ABI = [{"inputs":[{"name":"operator","type":"address"},{"name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"}]

@@ -521,6 +521,32 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   a harmless re-sweep, never fund loss). No behaviour change for anyone who never creates a
   second wallet.
 
+- **[BP25] Neg-risk redemption via pUSD collateral adapter (relayer-allowlist fix)**
+  (2026-07-14): neg-risk (multi-bucket) winnings — e.g. temperature markets like
+  "highest temperature in Madrid 35°C" — could **never be redeemed** and produced the
+  repeating "⏳ Выигрыш определён, зачисление задерживается" message. `redeem_winnings`
+  routed the neg-risk claim through the **raw NegRiskAdapter**
+  (`0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296`), but Polymarket's relayer **allowlist
+  blocks direct calls to that contract from a deposit wallet**
+  (`RelayerApiException 400: "call blocked: call[0] blocked: calls to 0xd91E…35296 are not
+  permitted"`). Binary Yes/No wins were unaffected — they go through `ConditionalTokens`,
+  which is permitted. **Fix:** neg-risk redemptions now route through the pUSD-native
+  **`NegRiskCtfCollateralAdapter`** (`0xadA2005600Dec949baf300f4C6120000bDB6eAab`), the
+  relayer-sanctioned redeem path, which burns the WCOL-collateralised ERC-1155 via CTF and
+  **returns pUSD directly** (no separate WCOL/USDC.e unwrap). Uses the 4-arg CTF-style
+  `redeemPositions(address collateral=pUSD, bytes32 parentCollectionId=0, bytes32
+  conditionId, uint256[] indexSets=[1,2])` the docs document for the adapter path.
+  The adapter needs `CTF.setApprovalForAll(adapter, true)` from the deposit wallet to burn
+  tokens, so (a) `set_trading_approvals` now also approves both pUSD-native adapters
+  (`CtfCollateralAdapter` + `NegRiskCtfCollateralAdapter`) for new wallets, and (b) the
+  neg-risk redeem batch **self-heals** that approval inline (idempotent `setApprovalForAll`
+  as `call[0]`, redeem as `call[1]`) so wallets registered before BP25 redeem without a
+  separate re-approval pass. Binary redemption is unchanged. New constants
+  `CTF_COLLATERAL_ADAPTER` / `NEG_RISK_CTF_COLLATERAL_ADAPTER` in `core/clob.py`; changes in
+  `core/relayer.py` (`set_trading_approvals`, `redeem_winnings`). No DB/schema change; no
+  funds were ever at risk — the winning tokens sit safely in the deposit wallet until the
+  next `reconcile_settlements` retry, which now succeeds.
+
 - **[BP22] Admin-bot audit: DB-first PnL, trade-history titles, positions cost, honest balance**
   (2026-07-09, migration **017**): full audit of `api/routers/admin_bot.py` after the admin
   reported implausible PnL, invisible trade history, wrong positions amount and wrong balance.
