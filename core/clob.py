@@ -60,11 +60,43 @@ def register_deposit_wallet(private_key_enc: str) -> dict:
     deposit wallet (POLY_1271). No POL needed from the user for any of this.
     Funding (moving pUSD into the deposit wallet) happens separately on deposit.
     """
+    import time
+
     from core import relayer
 
     deposit_wallet = relayer.derive_deposit_wallet(private_key_enc)
     relayer.deploy_deposit_wallet(private_key_enc)
-    relayer.set_trading_approvals(private_key_enc)
+
+    # The relayer's owner/wallet registry is indexed ASYNCHRONOUSLY after the
+    # deploy tx mines.  On a brand-new wallet the approvals batch (which calls the
+    # relayer's get_nonce / execute) can race ahead of that indexing and fail with
+    # "wallet registry validation failed: <eoa> is not registered".  Existing users
+    # never hit this because their deposit wallet was deployed long ago (deploy is
+    # skipped as already-deployed).  Retry until the registry catches up.  deploy is
+    # idempotent, so re-invoking it between attempts is safe.
+    last_exc: Exception | None = None
+    for attempt in range(8):
+        try:
+            relayer.set_trading_approvals(private_key_enc)
+            last_exc = None
+            break
+        except Exception as exc:  # noqa: BLE001 — inspect message, re-raise if unrelated
+            msg = str(exc).lower()
+            if "not registered" in msg or "registry" in msg:
+                last_exc = exc
+                log.warning("approvals_registry_lag_retry",
+                            attempt=attempt + 1, dw=deposit_wallet[:12])
+                time.sleep(5)
+                try:
+                    relayer.deploy_deposit_wallet(private_key_enc)  # idempotent
+                except Exception:
+                    pass
+                continue
+            raise
+    if last_exc is not None:
+        raise RuntimeError(
+            f"trading approvals failed after registry-lag retries: {last_exc}")
+
     creds = generate_api_creds(private_key_enc, funder=deposit_wallet)
 
     log.info("deposit_wallet_registered", dw=deposit_wallet[:12])
