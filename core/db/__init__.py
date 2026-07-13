@@ -57,9 +57,31 @@ from core.db.queries import (
     upsert_user,
 )
 from core.db.session import get_supabase
+from core.db.wallets import (
+    MAX_WALLETS_PER_USER,
+    count_wallets,
+    create_wallet,
+    get_active_wallet,
+    get_wallet,
+    list_wallets,
+    rename_wallet,
+    resolve_signing_wallet,
+    set_active_wallet,
+    update_wallet,
+)
 
 __all__ = [
     "get_supabase",
+    "MAX_WALLETS_PER_USER",
+    "count_wallets",
+    "create_wallet",
+    "get_active_wallet",
+    "get_wallet",
+    "list_wallets",
+    "rename_wallet",
+    "resolve_signing_wallet",
+    "set_active_wallet",
+    "update_wallet",
     "count_open_positions",
     "get_active_donor_addresses",
     "get_active_subscribers",

@@ -507,6 +507,10 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
 
     trade_row = insert_copy_trade({
         "user_id":        user["id"],
+        # BP24: stamp the wallet that opened this trade (the user's ACTIVE wallet,
+        # mirrored on the users row). Exits/redeems sign with THIS wallet even after
+        # the user later switches. NULL-safe for the pre-migration-018 schema.
+        **({"wallet_id": user["active_wallet_id"]} if user.get("active_wallet_id") else {}),
         "signal_id":      signal_id,
         "status":         "executing",
         "size_usdc":      size_usdc,

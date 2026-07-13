@@ -15,12 +15,19 @@ from telegram.ext import (
 
 from core.config import settings
 from core.db import (
+    MAX_WALLETS_PER_USER,
+    count_wallets,
     create_access_code,
+    create_wallet,
+    get_active_wallet,
     get_subscription_status,
     get_user_by_telegram_id,
     get_user_by_username,
+    get_wallet,
     is_admin,
+    list_wallets,
     redeem_access_code,
+    set_active_wallet,
     set_subscription,
     update_user,
     upsert_user,
@@ -141,8 +148,50 @@ def _wallet_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("♻️ В pUSD", callback_data="wrap"),
             InlineKeyboardButton("🔐 Регистрация", callback_data="register"),
         ],
+        [InlineKeyboardButton("👛 Мои кошельки", callback_data="wallet_list")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
     ])
+
+
+# ── BP24: multi-wallet ────────────────────────────────────────────────────────
+
+import re as _re
+
+_WALLET_NAME_RE = _re.compile(r"^[A-Za-z0-9 ]{1,24}$")
+
+
+def _valid_wallet_name(name: str) -> bool:
+    """Letters, numbers and spaces only, 1–24 chars (mirrors the Kreo-style flow)."""
+    return bool(_WALLET_NAME_RE.match((name or "").strip()))
+
+
+def _wallets_list_text(wallets: list[dict]) -> str:
+    lines = ["👛 <b>Мои кошельки</b>\n"]
+    for w in wallets:
+        mark = "✅ " if w.get("is_active") else "▫️ "
+        dw = w.get("deposit_wallet_address") or w.get("wallet_address") or ""
+        short = f"{dw[:6]}…{dw[-4:]}" if dw else "—"
+        active = " <i>(активный)</i>" if w.get("is_active") else ""
+        lines.append(f"{mark}<b>{w.get('name')}</b>{active}\n<code>{short}</code>")
+    lines.append(
+        "\nНовые сделки копируются только на <b>активный</b> кошелёк. "
+        "Открытые позиции остальных кошельков продолжают отслеживаться и клеймиться."
+    )
+    return "\n".join(lines)
+
+
+def _wallets_list_kb(wallets: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for w in wallets:
+        if not w.get("is_active"):
+            rows.append([InlineKeyboardButton(
+                f"🔄 Сделать активным: {w.get('name')}",
+                callback_data=f"wal_switch:{w['id']}",
+            )])
+    if len(wallets) < MAX_WALLETS_PER_USER:
+        rows.append([InlineKeyboardButton("➕ Создать кошелёк", callback_data="wallet_new")])
+    rows.append([InlineKeyboardButton("↩️ Назад", callback_data="wallet")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _stop_resume_kb(copy_active: bool) -> InlineKeyboardMarkup:
@@ -1138,7 +1187,44 @@ def _register_deposit_wallet(telegram_id: int, db_user: dict) -> dict:
 
     result = register_deposit_wallet(db_user["wallet_private_key_enc"])
     creds = result.get("creds") or {}
-    update_user(telegram_id, {
+    payload = {
+        "deposit_wallet_address":  result["deposit_wallet"],
+        "deposit_wallet_deployed": True,
+        "wallet_registered":       True,
+        "clob_api_key":            creds.get("clob_api_key"),
+        "clob_secret":             creds.get("clob_secret"),
+        "clob_passphrase":         creds.get("clob_passphrase"),
+    }
+    update_user(telegram_id, payload)
+    # BP24: keep the ACTIVE user_wallets row in sync with the users mirror.
+    try:
+        from core.db import update_wallet
+        active = get_active_wallet(db_user["id"]) if db_user.get("id") else None
+        if active:
+            update_wallet(active["id"], payload)
+    except Exception:
+        log.warning("register_wallet_row_sync_failed", user=telegram_id)
+    return result
+
+
+def _create_named_wallet(telegram_id: int, user_id: int, name: str) -> dict:
+    """BP24: create a brand-new named wallet (no key import), auto-register its
+    deposit wallet (gasless deploy + approvals + CLOB creds) and make it active.
+
+    make_active mirrors the new wallet onto users.* so the entry/balance/deposit
+    path immediately operates on it; existing wallets keep their open positions
+    monitored/redeemed via copy_trades.wallet_id.
+    """
+    from core.clob import register_deposit_wallet
+
+    w = generate_wallet()
+    fields: dict = {
+        "wallet_address":         w["address"],
+        "wallet_private_key_enc": w["private_key_enc"],
+    }
+    result = register_deposit_wallet(w["private_key_enc"])
+    creds = result.get("creds") or {}
+    fields.update({
         "deposit_wallet_address":  result["deposit_wallet"],
         "deposit_wallet_deployed": True,
         "wallet_registered":       True,
@@ -1146,7 +1232,10 @@ def _register_deposit_wallet(telegram_id: int, db_user: dict) -> dict:
         "clob_secret":             creds.get("clob_secret"),
         "clob_passphrase":         creds.get("clob_passphrase"),
     })
-    return result
+    row = create_wallet(user_id, name, fields, make_active=True)
+    # New named wallet implies intent to auto-trade (same hand-off as /register).
+    update_user(telegram_id, {"is_signal_only": False})
+    return {"deposit_wallet": result["deposit_wallet"], "wallet": row}
 
 
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1373,6 +1462,75 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     text = (update.message.text or "").strip()  # type: ignore[union-attr]
+
+    # ── BP24: create-wallet flow (name step) ───────────────────────────────────
+    if context.user_data.get("awaiting_wallet_name"):
+        if not _valid_wallet_name(text):
+            await update.message.reply_text(  # type: ignore[union-attr]
+                "⚠️ Только буквы, цифры и пробелы (до 24 символов). Попробуй ещё раз "
+                "или нажми Отмена:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data="wallet_list")
+                ]]),
+            )
+            return
+        name = text.strip()
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user or not db_user.get("wallet_address"):
+            context.user_data["awaiting_wallet_name"] = False
+            await update.message.reply_text("Сначала отправь /start", parse_mode="HTML")  # type: ignore[union-attr]
+            return
+        existing = list_wallets(db_user["id"])
+        if any((w.get("name") or "").lower() == name.lower() for w in existing):
+            await update.message.reply_text(  # type: ignore[union-attr]
+                f"⚠️ Кошелёк с именем «{name}» уже есть. Придумай другое имя:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data="wallet_list")
+                ]]),
+            )
+            return
+        if len(existing) >= MAX_WALLETS_PER_USER:
+            context.user_data["awaiting_wallet_name"] = False
+            await update.message.reply_text(  # type: ignore[union-attr]
+                f"⚠️ Достигнут лимит — максимум {MAX_WALLETS_PER_USER} кошельков.",
+                parse_mode="HTML",
+            )
+            return
+        context.user_data["awaiting_wallet_name"] = False
+        msg = await update.message.reply_text(  # type: ignore[union-attr]
+            f"⏳ <b>Создаю кошелёк «{name}»…</b>\n\n"
+            "Генерирую адрес и настраиваю торговлю на Polymarket "
+            "(без газа с твоей стороны). Это займёт 30–60 секунд.",
+            parse_mode="HTML",
+        )
+        try:
+            result = _create_named_wallet(tg_user.id, db_user["id"], name)
+            dw = result.get("deposit_wallet", "")
+            await msg.edit_text(  # type: ignore[union-attr]
+                f"✅ <b>Кошелёк «{name}» создан и активирован!</b>\n\n"
+                f"📬 Адрес для пополнения (USDC, Polygon):\n<code>{dw}</code>\n\n"
+                "Новые сделки теперь копируются на этот кошелёк. Пополни его в сети "
+                "<b>Polygon</b>, чтобы начать торговлю.",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👛 Мои кошельки", callback_data="wallet_list")],
+                    [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
+                ]),
+            )
+        except Exception as exc:
+            log.exception("create_wallet_failed", user=tg_user.id)
+            await msg.edit_text(  # type: ignore[union-attr]
+                f"❌ <b>Не удалось создать кошелёк:</b>\n<code>{str(exc)[:250]}</code>\n\n"
+                "Попробуй ещё раз через минуту.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("👛 Мои кошельки", callback_data="wallet_list")
+                ]]),
+            )
+        return
 
     # ── Withdraw flow ──────────────────────────────────────────────────────────
     withdraw_step = context.user_data.get("withdraw_step")
@@ -1626,6 +1784,81 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode="HTML",
             disable_web_page_preview=True,
             reply_markup=_wallet_kb(),
+        )
+        return
+
+    # ── BP24: multi-wallet management ─────────────────────────────────────────
+    if data == "wallet_list":
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user or not db_user.get("wallet_address"):
+            await query.answer("Сначала отправь /start", show_alert=True)
+            return
+        wallets = list_wallets(db_user["id"])
+        if not wallets:
+            # Legacy account created before migration 018 — fold the users-row
+            # wallet into an implicit "Wallet 1" view so the UI still works.
+            wallets = [{
+                "id": db_user.get("active_wallet_id") or 0,
+                "name": "Wallet 1",
+                "is_active": True,
+                "deposit_wallet_address": db_user.get("deposit_wallet_address"),
+                "wallet_address": db_user.get("wallet_address"),
+            }]
+        await query.edit_message_text(
+            _wallets_list_text(wallets),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=_wallets_list_kb(wallets),
+        )
+        return
+
+    if data == "wallet_new":
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user or not db_user.get("wallet_address"):
+            await query.answer("Сначала отправь /start", show_alert=True)
+            return
+        if count_wallets(db_user["id"]) >= MAX_WALLETS_PER_USER:
+            await query.answer(
+                f"Максимум {MAX_WALLETS_PER_USER} кошельков.", show_alert=True)
+            return
+        context.user_data["awaiting_wallet_name"] = True
+        await query.edit_message_text(
+            "🔐 <b>Создание кошелька — шаг 1 из 1</b>\n\n"
+            "Как назвать новый кошелёк?\n\n"
+            "Только буквы, цифры и пробелы (до 24 символов).\n"
+            "Например: <code>MainWallet</code>, <code>Wallet123</code> или "
+            "<code>God of Gamblers</code>.\n\n"
+            "<i>Будет создан новый пустой кошелёк — импорт ключа не требуется. "
+            "После создания просто пополни его адрес.</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data="wallet_list")
+            ]]),
+        )
+        return
+
+    if data and data.startswith("wal_switch:"):
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user:
+            await query.answer("Отправь /start", show_alert=True)
+            return
+        try:
+            target_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await query.answer("Некорректный кошелёк", show_alert=True)
+            return
+        target = get_wallet(target_id)
+        if not target or target.get("user_id") != db_user["id"]:
+            await query.answer("Кошелёк не найден", show_alert=True)
+            return
+        set_active_wallet(db_user["id"], target_id)
+        await query.answer(f"Активный кошелёк: {target.get('name')}")
+        wallets = list_wallets(db_user["id"])
+        await query.edit_message_text(
+            _wallets_list_text(wallets),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=_wallets_list_kb(wallets),
         )
         return
 

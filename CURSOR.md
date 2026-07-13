@@ -474,6 +474,53 @@ Triggered from the admin bot (`/refresh`, `/top`) and `scripts/seed_quality.py`.
   a transport fix only. This bug was **unrelated to Alchemy**; the outage merely created
   the burst that exposed it.
 
+- **[BP24] Multi-wallet: named, switchable wallets** (2026-07-13, migration **018**):
+  users can now create several **named** wallets (no key/seed import — just a name),
+  switch which one is **active**, and see them all in a `👛 Мои кошельки` menu.
+  Existing users are untouched — their current wallet is folded into an active
+  **"Wallet 1"** by the migration backfill. **Semantics (confirmed with product):**
+  copying is **active-wallet-only** — new whale trades are only copied onto the user's
+  active wallet; wallets the user switched away from keep holding positions and are
+  **still monitored, stop-lossed and redeemed**. New wallets are **auto-registered**
+  (gasless deposit-wallet deploy + approvals + CLOB creds) at creation, so they are
+  ready to trade once funded. Cap: `MAX_WALLETS_PER_USER = 5`.
+  **Architecture (hybrid mirror):** new table `user_wallets` (id, user_id, name,
+  wallet_address, wallet_private_key_enc, deposit_wallet_address, deposit_wallet_deployed,
+  wallet_registered, clob_*, balance_usdc, is_active) is the source of truth; a partial
+  unique index enforces one active wallet per user. The wallet columns on `users` are
+  kept as a live **mirror of the ACTIVE wallet** (`core/db/wallets._mirror_wallet_to_user`),
+  so the entire ENTRY / balance / deposit / withdraw / UI path keeps reading `users.*`
+  unchanged and always operates on the active wallet — near-zero churn and no regression
+  for single-wallet users. `copy_trades.wallet_id` (new FK) records which wallet OPENED
+  each trade. `users.active_wallet_id` points at the active row.
+  **Money-path (`worker/tasks/manage_positions.py`):** `close_position` and
+  `redeem_position` gained a `wallet_id` arg and now load their signing context via
+  `resolve_signing_wallet(user_id, wallet_id)` (falls back to the active wallet, then to
+  the raw users row for pre-migration accounts) — so a trade always signs/redeems with the
+  wallet that opened it, even after a switch. `get_users_for_monitoring()` now returns one
+  **flattened entry per wallet** (users row with wallet-scoped fields overridden + a
+  `wallet_id`), so `sync_positions` monitors ALL of a user's wallets; single-wallet users
+  get exactly one entry (identical to BP21 behaviour). `get_outstanding_copy_trades()`
+  selects `wallet_id`; `reconcile_settlements` and `backfill_legacy_redemptions` resolve /
+  iterate per wallet and pass `wallet_id` through. `execute_copy_trade` stamps
+  `copy_trades.wallet_id = users.active_wallet_id` on insert. New helpers in
+  `core/db/wallets.py` (`list_wallets`, `count_wallets`, `get_wallet`, `get_active_wallet`,
+  `create_wallet`, `update_wallet`, `rename_wallet`, `set_active_wallet`,
+  `resolve_signing_wallet`, `MAX_WALLETS_PER_USER`) are re-exported from
+  `core/db/__init__.py` (import block **and** `__all__`, per the BP12-A drift guard).
+  **Telegram UI (`api/routers/telegram.py`):** `_wallet_kb` gained `👛 Мои кошельки`
+  (`wallet_list`); `wallet_new` starts a one-step name prompt (`awaiting_wallet_name`,
+  validated to letters/digits/spaces ≤24 chars, dedup by name); the name handler calls
+  `_create_named_wallet` (generate → gasless register → `create_wallet(make_active=True)`
+  → `is_signal_only=False` hand-off); `wal_switch:{id}` activates a wallet via
+  `set_active_wallet`. `_register_deposit_wallet` now also syncs the active `user_wallets`
+  row so the mirror and the row never diverge. **Known limitations (documented, out of
+  scope for v1):** the deposit monitor (`monitor_deposits`) still watches only the ACTIVE
+  wallet's EOA (users.*), so a user should fund the wallet that is currently active; the
+  per-wallet `balance_usdc` baseline can go stale after switching away and back (worst case
+  a harmless re-sweep, never fund loss). No behaviour change for anyone who never creates a
+  second wallet.
+
 - **[BP22] Admin-bot audit: DB-first PnL, trade-history titles, positions cost, honest balance**
   (2026-07-09, migration **017**): full audit of `api/routers/admin_bot.py` after the admin
   reported implausible PnL, invisible trade history, wrong positions amount and wrong balance.

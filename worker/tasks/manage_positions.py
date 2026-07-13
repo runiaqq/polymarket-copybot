@@ -83,6 +83,7 @@ def sync_positions() -> dict:
             continue
         uid = user["id"]
         tg = user["telegram_id"]
+        wid = user.get("wallet_id")  # BP24: the wallet these positions belong to
 
         # ── Open positions: win-on-resolution (redeemable) + TP/SL ──────────────
         try:
@@ -176,6 +177,7 @@ def sync_positions() -> dict:
                             p.get("outcome_index"),
                             trade_id=_rp_trade_id,
                             entry_cost=_rp_entry_cost,
+                            wallet_id=wid,
                         )
                         actions += 1
                 elif won:
@@ -379,7 +381,7 @@ def sync_positions() -> dict:
                          cur_price=best_bid, threshold=settings.hard_stop_abs_price)
                 _drop_ticks.pop(fkey, None)
                 _closing.add(ckey)
-                close_position.delay(uid, token_id, "hard_stop")
+                close_position.delay(uid, token_id, "hard_stop", wallet_id=wid)
                 actions += 1
                 continue
             elif _hard_stop_mid:
@@ -389,7 +391,7 @@ def sync_positions() -> dict:
                          mid=round(price_ref, 4), threshold=settings.hard_stop_abs_price)
                 _drop_ticks.pop(fkey, None)
                 _closing.add(ckey)
-                close_position.delay(uid, token_id, "hard_stop")
+                close_position.delay(uid, token_id, "hard_stop", wallet_id=wid)
                 actions += 1
                 continue
 
@@ -469,7 +471,7 @@ def sync_positions() -> dict:
                              threshold=settings.delta_drop_stop_pct)
                     _drop_ticks.pop(fkey, None)
                     _closing.add(ckey)
-                    close_position.delay(uid, token_id, "delta_drop_stop")
+                    close_position.delay(uid, token_id, "delta_drop_stop", wallet_id=wid)
                     actions += 1
                     continue
                 else:
@@ -551,6 +553,7 @@ def sync_positions() -> dict:
                                 _row.get("outcome_index"),
                                 trade_id=_cl_trade_id,
                                 entry_cost=_cl_entry_cost,
+                                wallet_id=wid,
                             )
                             actions += 1
                     except Exception:
@@ -593,16 +596,18 @@ def sync_positions() -> dict:
     bind=True, name="worker.tasks.close_position", queue="trades", max_retries=2,
     default_retry_delay=5,
 )
-def close_position(self, user_id: int, token_id: str, reason: str = "manual") -> dict:
+def close_position(self, user_id: int, token_id: str, reason: str = "manual",
+                   wallet_id: int | None = None) -> dict:
     from core.clob import generate_api_creds, sell_position
-    from core.db import get_supabase
+    from core.db import get_supabase, resolve_signing_wallet
     from core.polymarket import get_order_book, get_positions
 
     sb = get_supabase()
-    res = sb.table("users").select("*").eq("id", user_id).maybe_single().execute()
-    user = res.data if res else None
+    # BP24: sign with the wallet that opened the trade (falls back to active).
+    user = resolve_signing_wallet(user_id, wallet_id)
     if not user or not user.get("wallet_private_key_enc"):
         return {"skipped": True, "reason": "no_wallet"}
+    _sign_wallet_id = user.get("wallet_id")
 
     deposit_wallet = user.get("deposit_wallet_address")
     if not deposit_wallet:
@@ -669,7 +674,13 @@ def close_position(self, user_id: int, token_id: str, reason: str = "manual") ->
     if not api_creds["clob_api_key"]:
         try:
             api_creds = generate_api_creds(user["wallet_private_key_enc"], funder=deposit_wallet)
-            sb.table("users").update(api_creds).eq("id", user_id).execute()
+            # BP24: cache creds on the SIGNING wallet row, not blindly on users
+            # (which mirrors the ACTIVE wallet) — avoids corrupting the mirror when
+            # closing a position on a non-active wallet.
+            if _sign_wallet_id:
+                sb.table("user_wallets").update(api_creds).eq("id", _sign_wallet_id).execute()
+            else:
+                sb.table("users").update(api_creds).eq("id", user_id).execute()
         except Exception as exc:
             raise self.retry(exc=exc)
 
@@ -771,21 +782,24 @@ def redeem_position(self, user_id: int, token_id: str, condition_id: str,
                     title: str | None = None, event_slug: str | None = None,
                     outcome_index: int | None = None,
                     trade_id: int | None = None,
-                    entry_cost: float | None = None) -> dict:
+                    entry_cost: float | None = None,
+                    wallet_id: int | None = None) -> dict:
     """
     Redeem a resolved winning position into pUSD and notify the user.
 
     BP1 extra args:
       trade_id   — copy_trades.id to update with result + redeem_tx.
       entry_cost — original cost basis for P&L calculation.
+    BP24: wallet_id — sign/redeem with the wallet that opened the trade (falls
+      back to the active wallet), so a win on a non-active wallet is still claimed
+      to that wallet's deposit address.
     """
-    from core.db import get_supabase
+    from core.db import get_supabase, resolve_signing_wallet
     from core.polygon import get_balances
     from core.relayer import convert_dw_usdce_to_pusd, redeem_winnings
 
     sb = get_supabase()
-    res = sb.table("users").select("*").eq("id", user_id).maybe_single().execute()
-    user = res.data if res else None
+    user = resolve_signing_wallet(user_id, wallet_id)
     if not user or not user.get("wallet_private_key_enc"):
         # BP22.8: always release the lease on an early skip so a claimed
         # redeem:{uid}:{cond} key can never linger and block re-dispatch.
@@ -1164,8 +1178,11 @@ def reconcile_settlements() -> dict:
                     log.info("reconcile_skip_terminal", user_id=uid, cond=cond[:14])
                     continue
 
-                res = sb.table("users").select("*").eq("id", uid).maybe_single().execute()
-                user = res.data if res else None
+                # BP24: resolve the wallet that OPENED this trade (falls back to
+                # active), so the dust check reads the right deposit wallet and the
+                # redeem signs with the right key even after the user switched.
+                from core.db import resolve_signing_wallet
+                user = resolve_signing_wallet(uid, trade.get("wallet_id"))
                 if not user:
                     log.warning("reconcile_user_not_found", user_id=uid, cond=cond[:14])
                     continue
@@ -1238,6 +1255,7 @@ def reconcile_settlements() -> dict:
                     outcome_index=int(outcome_idx),
                     trade_id=trade["id"],
                     entry_cost=entry_cost,
+                    wallet_id=trade.get("wallet_id"),
                 )
                 redeem_dispatched.add(uid)
                 log.info("reconcile_win_dispatched", user_id=uid, cond=cond[:14],
@@ -1273,18 +1291,33 @@ def backfill_legacy_redemptions() -> dict:
     from core.relayer import is_condition_resolved, get_payout_numerator
 
     sb = get_supabase()
-    # All users with deposit wallets (not just active subscribers — legacy funds
-    # can be recovered regardless of subscription status).
-    res = sb.table("users").select(
-        "id, telegram_id, wallet_private_key_enc, deposit_wallet_address"
+    # BP24: iterate every NAMED wallet with a deposit address (not just users.* /
+    # the active wallet) so legacy funds are recovered on all of a user's wallets,
+    # regardless of subscription status.  Fall back to the users row for accounts
+    # that have no user_wallets rows yet (pre-migration-018 state).
+    wres = sb.table("user_wallets").select(
+        "id, user_id, wallet_private_key_enc, deposit_wallet_address"
     ).not_.is_("deposit_wallet_address", "null").execute()
-    users = res.data or []
+    wallet_rows = wres.data or []
+    if wallet_rows:
+        users = [
+            {"id": w["user_id"], "wallet_id": w["id"],
+             "deposit_wallet_address": w.get("deposit_wallet_address"),
+             "wallet_private_key_enc": w.get("wallet_private_key_enc")}
+            for w in wallet_rows
+        ]
+    else:
+        res = sb.table("users").select(
+            "id, telegram_id, wallet_private_key_enc, deposit_wallet_address"
+        ).not_.is_("deposit_wallet_address", "null").execute()
+        users = [{**u, "wallet_id": None} for u in (res.data or [])]
 
     dispatched = 0
     wrapped = 0
 
     for user in users:
         uid = user["id"]
+        wid = user.get("wallet_id")
         dw = user.get("deposit_wallet_address")
         if not dw or not user.get("wallet_private_key_enc"):
             continue
@@ -1351,6 +1384,7 @@ def backfill_legacy_redemptions() -> dict:
                     bool(p.get("neg_risk", False)),
                     p.get("outcome"), p.get("title"), p.get("event_slug"),
                     int(outcome_idx),
+                    wallet_id=wid,
                 )
                 dispatched += 1
                 user_dispatched = True
@@ -1379,6 +1413,7 @@ def backfill_legacy_redemptions() -> dict:
                     bool(p.get("neg_risk", False)),
                     p.get("outcome"), p.get("title"), p.get("event_slug"),
                     int(outcome_idx),
+                    wallet_id=wid,
                 )
                 dispatched += 1
                 user_dispatched = True

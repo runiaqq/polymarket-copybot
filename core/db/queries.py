@@ -87,8 +87,9 @@ def get_active_subscribers() -> list[dict]:
 
 
 def get_users_for_monitoring() -> list[dict]:
-    """Blueprint 21: users whose OPEN positions must keep being monitored,
-    stop-lossed and redeemed — INDEPENDENT of any risk pause / copy_active state.
+    """Blueprint 21 + 24: every wallet whose OPEN positions must keep being
+    monitored, stop-lossed and redeemed — INDEPENDENT of any risk pause /
+    copy_active state.
 
     Unlike get_active_subscribers (the ENTRY / fan-out gate, which excludes
     copy_paused_until users), this deliberately does NOT filter on
@@ -98,21 +99,60 @@ def get_users_for_monitoring() -> list[dict]:
     already holds.  A paused account must still get its stops fired and its wins
     claimed.
 
-    Scope stays tight: still a paying, unexpired subscription and a deposit
-    wallet (the address sync_positions reads on-chain positions from).  Signal-
-    only users are included — they may carry positions opened before the switch.
+    BP24 (multi-wallet): returns ONE flattened entry PER wallet, not per user.
+    Each entry is the users row with its wallet-scoped fields overridden by the
+    specific wallet (deposit_wallet_address / wallet_private_key_enc / clob_*),
+    plus `wallet_id`.  So sync_positions monitors ALL of a user's wallets — new
+    trades only ever land on the active wallet, but a wallet the user switched
+    away from must still have its open positions stopped and redeemed.  For a
+    single-wallet user this yields exactly one entry, identical to the old
+    behaviour.  Legacy accounts with no user_wallets rows fall back to the users
+    row itself (wallet_id=None → resolve_signing_wallet uses the active wallet).
     """
+    from core.db.wallets import _WALLET_FIELDS
+
     sb = get_supabase()
     now = datetime.now(timezone.utc).isoformat()
-    res = (
+    users = (
         sb.table("users")
         .select("*")
         .neq("sub_tier", "free")
         .gt("sub_expires_at", now)
-        .not_.is_("deposit_wallet_address", "null")
         .execute()
-    )
-    return res.data or []
+    ).data or []
+    if not users:
+        return []
+
+    uid_list = [u["id"] for u in users]
+    wrows = (
+        sb.table("user_wallets")
+        .select("*")
+        .in_("user_id", uid_list)
+        .execute()
+    ).data or []
+    by_user: dict = {}
+    for w in wrows:
+        by_user.setdefault(w["user_id"], []).append(w)
+
+    out: list[dict] = []
+    for u in users:
+        wallets = by_user.get(u["id"])
+        if wallets:
+            for w in wallets:
+                if not w.get("deposit_wallet_address"):
+                    continue
+                entry = dict(u)
+                for f in _WALLET_FIELDS:
+                    entry[f] = w.get(f)
+                entry["wallet_id"] = w["id"]
+                entry["wallet_name"] = w.get("name")
+                out.append(entry)
+        elif u.get("deposit_wallet_address"):
+            # Legacy fallback: no wallet rows yet — monitor the users-row wallet.
+            entry = dict(u)
+            entry["wallet_id"] = u.get("active_wallet_id")
+            out.append(entry)
+    return out
 
 
 def get_user_by_telegram_id(telegram_id: int) -> dict | None:
@@ -466,7 +506,7 @@ def get_outstanding_copy_trades() -> list[dict]:
     sb = get_supabase()
     res = (
         sb.table("copy_trades")
-        .select("id, user_id, condition_id, token_id, outcome_index, neg_risk,"
+        .select("id, user_id, wallet_id, condition_id, token_id, outcome_index, neg_risk,"
                 " entry_price, shares, size_usdc")
         .eq("status", "confirmed")
         .is_("redeemed_at", "null")
