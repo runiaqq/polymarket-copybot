@@ -5035,3 +5035,115 @@ followed by `redeemed` + `redeem_done` (success) or `redeem_failed` (tracebacks 
 one at a time). If redeems STILL fail serially, the relayer path itself is broken — grep
 `docker compose logs --since 1h worker | grep -A5 redeem_failed` and investigate the actual
 exception (nonce/auth/RPC).
+
+---
+
+## Blueprint 26 — Sniper-Mode Donor Mirroring (5-min BTC markets) 🟡 DESIGNED 2026-07-15 / READY TO IMPLEMENT
+
+### 26.0 Product decision (confirmed with PO)
+
+We found a profitable donor bot that enters **5-minute Bitcoin up/down markets in the last
+~30 seconds** when the outcome is priced at **70–80%**. Requirements:
+
+1. Copy this wallet **in addition to** the existing Model-B copying (which is untouched).
+2. **Mirror sizing** — enter with the donor's exact USDC amount. NO Kelly, NO per-user
+   `max_position_usdc` cap, NO 5%-of-equity cap, NO profit-protection cap, NO exposure /
+   event / drawdown / daily-loss gates, NO daily-trade cap, NO `copy_paused_until` honor.
+3. **Same price or small slippage** — enter at the fresh best_ask, but ONLY if it is within
+   `sniper_slippage_pct` of the donor's fill price (skip on drift — EV preservation).
+4. The ONLY risk control left: the **30% stop-loss** (= the existing `delta_drop_stop_pct=0.30`
+   Delta-Drop stop with all BP17/BP19/BP21 hardening), with sniper-specific overrides:
+   `min_hold = 0`, `confirm_ticks = 1`.
+5. Only **two allowlisted users** copy this wallet: telegram_ids **879714159** and **504677064**.
+   Nobody else may ever receive these signals. Existing users see zero behaviour change.
+
+### 26.1 Why the existing pipeline CANNOT do this (5 hard blockers)
+
+1. **Market-universe filter**: `_build_market_meta` (core/polymarket.py) drops markets with
+   `hours_left < market_min_hours_to_resolve` (0.5h) and `liquidityNum < 2000` — a 5-min BTC
+   market NEVER enters the `fast_markets` cache → `poll_tracked_wallets` skips the signal as
+   `skipped_no_market`. The cache TTL (120s) also exceeds the market's entire lifetime.
+2. **Slice accumulator latency**: the Redis accumulator fires `slice_quiet_period_sec=45`
+   seconds after the last fill. The market resolves before the signal fires.
+3. **Poll cadence**: `tracked_poll_sec=15` + Data-API indexing lag (1–10s) eats the whole
+   30-second window.
+4. **Sizing/risk gates rewrite the stake**: fixed mode clamps to `max_position_usdc`
+   (default $25), then unified risk cap, profit cap, book_safe_frac=0.25 depth clamp,
+   risk gates 1–4, daily-trade cap.
+5. **The stop can never fire**: `delta_drop_min_hold_sec=900` + `delta_drop_confirm_ticks=2`
+   at a 120s sync cadence ≈ 19 minutes of required age; sniper positions live ~30 seconds.
+
+### 26.2 Design (additive, zero churn for existing users)
+
+**Schema (migration 019)** — `tracked_wallets.mode text not null default 'default'`
+(`'sniper'` marks this donor), `tracked_wallets.allowed_telegram_ids bigint[]` (allowlist;
+NULL/empty = nobody), `copy_trades.mode text default 'default'` (stamps sniper trades so the
+stop-loss overrides and ops queries can find them).
+
+**New fast poll task** `worker/tasks/poll_sniper_wallets.py` (beat: every `sniper_poll_sec=3.0`s,
+queue periodic). Per sniper wallet: one Data-API activity fetch (limit `sniper_fetch_limit=10`);
+group fresh BUY fills (age ≤ `sniper_max_trade_age_sec=25`) by (condition, token); per group an
+**atomic Redis once-key** `sniper:{addr}:{cond}:{token}` (TTL 900s — one entry per market, later
+slice-fills of the same burst are folded into the first batch or dropped); market meta comes
+from **CLOB `/markets/{condition_id}` directly** (new helper `get_clob_market` in core/clob.py —
+NOT the fast-markets cache), skipping when `accepting_orders=false` (already closed/resolved).
+VWAP of the batch = signal price; SUM of the batch = mirror size. The signal carries
+`"mode": "sniper"` and fans out ONLY to the allowlisted users (queried by telegram_id with an
+active paid sub; `copy_paused_until` deliberately ignored per §26.0-2).
+`poll_tracked_wallets` (slow path) MUST now skip `mode='sniper'` wallets — otherwise the donor
+would be double-copied through both paths.
+
+**Execute path** (`execute_copy_trade`, branch on `signal["mode"]=="sniper"`): skip pause check,
+skip daily cap, `size_usdc = signal["size_usdc"]` (mirror; clamped only to free balance and the
+$5 exchange minimum), skip Kelly/fixed sizing + unified risk cap + profit cap + risk gates 1–4 +
+`max_open_positions` (unredeemed 5-min wins would exhaust the 15 cap in an hour), keep
+`already_in_market`. Book re-check: skip when `best_ask > signal_price * (1 + sniper_slippage_pct)`
+(reason `sniper_price_drift`) or `best_ask > sniper_max_entry_price=0.97`; depth cap = full
+fillable within the band (no 0.25 fraction). Skip the inline AI call (market resolves before the
+text is read; saves ~1s + tokens). On exception: mark failed and **return — NO Celery retry**
+(a retry 5s later fires into a resolved market). Stamp `"mode": "sniper"` on the copy_trades row.
+
+**Stop-loss** (`sync_positions`): `get_open_trade_by_token` additionally selects `mode`; when
+`db_trade.mode == 'sniper'` → hold-time guard uses 0 instead of `delta_drop_min_hold_sec`, and
+the confirm-ticks requirement is 1 instead of `delta_drop_confirm_ticks`. The threshold itself
+stays `delta_drop_stop_pct=0.30` — exactly the PO's 30%. All other layers (phantom-book guard,
+hard-stop-first, spread veto + catastrophic bypass) apply unchanged.
+
+**New settings** (core/config.py): `sniper_poll_sec=3.0`, `sniper_max_trade_age_sec=25`,
+`sniper_fetch_limit=10`, `sniper_slippage_pct=0.02`, `sniper_max_entry_price=0.97`,
+`sniper_dedup_ttl_sec=900`.
+
+### 26.3 Accepted limitations & pitfalls (documented, NOT bugs)
+
+- **Latency race**: donor at T-30s → Data-API indexing (1–10s) → poll (≤3s) → execute (~2-4s).
+  We land at T-25…T-5s; sometimes the market closes first → CLOB rejects the order → row goes
+  `failed` with the rejection text. Expected; the drift-skip and accepting_orders check keep
+  most doomed orders from even being sent.
+- **Capital velocity**: winnings sit as unredeemed tokens until `reconcile_settlements` drains
+  them (serialized 1 redeem/user/2min — BP22.7). With a donor trading every 5 min, part of the
+  bankroll is always in flight; entries during that window get clamped to free balance (or skip
+  under $5). This is balance-limited mirroring, not a bug.
+- **Stop-loss is best-effort on a 30s lifetime**: sync runs every 120s, so a position that
+  lives 30s usually resolves before the first stop evaluation. The 30% stop matters mainly for
+  donor trades on longer markets and for the tail case where the 5-min market glitches. This
+  is understood and accepted; we deliberately did NOT build a per-second stop loop for v1.
+- **Notification volume**: every entry/win/loss produces the standard messages; a busy donor
+  = many messages to the two users. Accepted for v1.
+- **Multiple fills**: the donor may slice; only fills present in the same poll batch are
+  summed. A slice arriving in the NEXT poll is dropped by the once-key (mirror size can
+  undershoot the donor's final total). Accepted — never overshoots.
+
+### 26.4 Ops — enable the donor (after deploy + migration 019)
+
+```sql
+-- Supabase SQL editor; replace 0xDONOR with the real address (lowercase!)
+insert into tracked_wallets (address, label, active, mode, allowed_telegram_ids)
+values ('0xdonor…', 'BTC 5-min sniper', true, 'sniper', array[879714159, 504677064]::bigint[])
+on conflict (address) do update
+  set active = true, mode = 'sniper',
+      allowed_telegram_ids = array[879714159, 504677064]::bigint[];
+```
+
+Verify: `docker compose logs --since 10m worker | grep -E "sniper_signal_fired|sniper_skip|copy_trade_ok"`;
+`poll_sniper_wallets` should tick every ~3s (grep `sniper_poll`); slow path must show the donor
+excluded. A dry check without funds: allowlist a signal-only test user first.
