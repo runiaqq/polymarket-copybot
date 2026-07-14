@@ -238,6 +238,20 @@ class Settings(BaseSettings):
     # (one entry per burst, not one per fill / per poll cycle).
     tracked_reentry_hours: int = 12
 
+    # ── Blueprint 26: sniper-mode donor mirroring (5-min BTC markets) ──────────
+    # Fast poll cadence for mode='sniper' tracked wallets (seconds).
+    sniper_poll_sec: float = 3.0
+    # Ignore donor fills older than this (market lives ~5 min; donor enters at T-30s).
+    sniper_max_trade_age_sec: int = 25
+    # Data-API activity fetch limit per sniper wallet per poll.
+    sniper_fetch_limit: int = 10
+    # Max slippage vs the donor's fill price (skip entry on drift beyond this).
+    sniper_slippage_pct: float = 0.02
+    # Absolute entry-price ceiling for sniper entries.
+    sniper_max_entry_price: float = 0.97
+    # Redis once-key TTL for per-market dedup (one entry per market instance).
+    sniper_dedup_ttl_sec: int = 900
+
     # ── Wallet track-record filter (validate the edge before enforcing) ──────────
     # off     = ignore the buyer's history entirely
     # observe = resolve the buyer, score their P&L, LOG it on the signal, never block

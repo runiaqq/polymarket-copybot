@@ -150,6 +150,27 @@ def get_market_token_id(condition_id: str, outcome: str) -> str | None:
     return None
 
 
+def get_clob_market(condition_id: str) -> dict | None:
+    """BP26: fetch market meta directly from CLOB (5-min markets never enter the
+    Gamma fast-markets cache). Returns None on any failure — caller must skip."""
+    try:
+        resp = httpx.get(f"{CLOB_HOST}/markets/{condition_id}", timeout=10.0)
+        resp.raise_for_status()
+        d = resp.json()
+        return {
+            "question":          d.get("question", ""),
+            "accepting_orders":  bool(d.get("accepting_orders")),
+            "neg_risk":          bool(d.get("neg_risk", False)),
+            "tick_size":         str(d.get("minimum_tick_size") or "0.01"),
+            "end_date_iso":      d.get("end_date_iso"),
+            "token_outcomes":    {str(t.get("token_id")): str(t.get("outcome") or "")
+                                  for t in (d.get("tokens") or []) if t.get("token_id")},
+        }
+    except Exception:
+        log.warning("get_clob_market_failed", cond=condition_id[:14])
+        return None
+
+
 def _tick_decimals(tick_size: str) -> int:
     """Number of price decimals implied by the tick size string ('0.01' -> 2)."""
     if "." in tick_size:

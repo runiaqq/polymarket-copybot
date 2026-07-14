@@ -613,7 +613,7 @@ def get_open_trade_by_token(user_id: int, token_id: str) -> dict | None:
     sb = get_supabase()
     res = (
         sb.table("copy_trades")
-        .select("id, size_usdc, condition_id, signal_id, created_at, entry_bid")
+        .select("id, size_usdc, condition_id, signal_id, created_at, entry_bid, mode")
         .eq("user_id", user_id)
         .eq("token_id", token_id)
         .eq("status", "confirmed")

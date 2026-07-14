@@ -150,6 +150,10 @@ def poll_tracked_wallets() -> dict:
         addr = (w.get("address") or "").lower()
         if not addr:
             continue
+        # BP26: sniper wallets are handled EXCLUSIVELY by poll_sniper_wallets —
+        # without this skip the donor would be double-copied through both paths.
+        if (w.get("mode") or "default") == "sniper":
+            continue
         threshold = _threshold(w)
 
         try:

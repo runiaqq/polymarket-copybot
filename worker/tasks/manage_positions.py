@@ -211,6 +211,7 @@ def sync_positions() -> dict:
             # the in-process _first_seen dict only when the DB row is unavailable.
             fkey = f"{uid}:{token_id}"
             age_sec: float = settings.delta_drop_min_hold_sec  # default: eligible
+            db_trade = None  # BP26: initialized before try so it's in scope for sniper checks
             try:
                 from core.db import get_open_trade_by_token as _got
                 db_trade = _got(uid, token_id)
@@ -227,7 +228,9 @@ def sync_positions() -> dict:
                 seen_at = _first_seen.setdefault(fkey, now)
                 age_sec = now - seen_at
 
-            if age_sec < settings.delta_drop_min_hold_sec:
+            # BP26: sniper trades live ~30s — hold-time guard must be zero for them.
+            _min_hold = 0 if (db_trade or {}).get("mode") == "sniper" else settings.delta_drop_min_hold_sec
+            if age_sec < _min_hold:
                 log.debug("exit_skipped_too_new",
                           user_id=uid, token=token_id[:14],
                           age_min=round(age_sec / 60, 1))
@@ -453,13 +456,14 @@ def sync_positions() -> dict:
                     # ── Layer 4: persistence / debounce ────────────────────
                     _drop_ticks[fkey] = _drop_ticks.get(fkey, 0) + 1
                     ticks = _drop_ticks[fkey]
-                    if ticks < settings.delta_drop_confirm_ticks:
+                    _req_ticks = 1 if (db_trade or {}).get("mode") == "sniper" else settings.delta_drop_confirm_ticks
+                    if ticks < _req_ticks:
                         log.info("delta_drop_confirming",
                                  user_id=uid, token=token_id[:14],
                                  entry=entry_px, price_ref=round(price_ref, 4),
                                  drop=round(drop_pct, 3),
                                  ticks=ticks,
-                                 required=settings.delta_drop_confirm_ticks)
+                                 required=_req_ticks)
                         continue
                     # Confirmed across required consecutive polls — close.
                     log.info("delta_drop_triggered",
@@ -481,7 +485,7 @@ def sync_positions() -> dict:
             # ── Hollow book: un-exitable position (best_bid == 0) ───────────
             # BP19 Fix 3: loss already locked; nothing to act on until a bid ≥ tick
             # reappears.  Log for ops visibility (throttled).
-            if best_bid == 0 and age_sec >= settings.delta_drop_min_hold_sec:
+            if best_bid == 0 and age_sec >= _min_hold:
                 if _notify_once(f"hollow:{uid}:{token_id}"):
                     log.warning(
                         "stop_unsellable_hollow_book",

@@ -115,6 +115,9 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         _notify_not_registered(user["telegram_id"])
         return {"skipped": True, "reason": "not_registered"}
 
+    # BP26: sniper-mode mirror — bypasses ALL sizing/risk gates except the 30% stop.
+    is_sniper = (signal.get("mode") == "sniper")
+
     # Only copy BUY signals — SELL requires owning the token first
     if signal.get("side", "").upper() in ("SELL", "NO"):
         log.debug("skip_sell_signal", user_id=user_id)
@@ -124,7 +127,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     # fan-out in get_active_subscribers also excludes paused users, but a
     # concurrent pause could arrive between fan-out and task execution).
     from datetime import datetime, timezone
-    paused_until = user.get("copy_paused_until")
+    paused_until = None if is_sniper else user.get("copy_paused_until")
     if paused_until:
         try:
             from dateutil.parser import parse as _parse_dt
@@ -142,7 +145,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     # Checked here — before balance reads, position loads, and order-book RPCs —
     # so a blocked user costs almost nothing.  Fails open on DB errors (never
     # blocks a trade due to a count failure).
-    max_daily = user.get("max_daily_trades")
+    max_daily = None if is_sniper else user.get("max_daily_trades")
     if max_daily is not None:
         try:
             from core.db import get_daily_trade_count
@@ -194,7 +197,12 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             float(p.get("current_value") or 0) for p in positions if p.get("shares", 0) > 0
         )
 
-    if effective_mode == "kelly":
+    if is_sniper:
+        # BP26: mirror the donor's exact size; clamp ONLY to free balance below.
+        size_usdc = float(signal.get("size_usdc") or 0)
+        score = None
+        log.info("sizing_sniper_mirror", size=round(size_usdc, 2), user_id=user_id)
+    elif effective_mode == "kelly":
         from core.sizing import kelly_stake
         from core.wallet_score import score_wallet
         try:
@@ -238,7 +246,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     # ── BP8: unified per-trade risk cap (applies in BOTH fixed and kelly modes) ─
     # Worst-case loss of a binary trade = full stake. Cap it so a single loss
     # cannot exceed max_risk_per_trade × equity regardless of sizing mode.
-    if settings.enforce_risk_per_trade_cap and equity > 0:
+    if not is_sniper and settings.enforce_risk_per_trade_cap and equity > 0:
         hard_cap = settings.max_risk_per_trade * equity
         if size_usdc > hard_cap:
             log.info("unified_risk_cap_applied", user_id=user_id,
@@ -248,7 +256,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
 
     # BP8: profit-protection trailing cap — don't give back >max_trade_loss_vs_profit_pct
     # of accumulated realized profit above the baseline in a single trade.
-    if settings.max_trade_loss_vs_profit_pct > 0 and equity > 0:
+    if not is_sniper and settings.max_trade_loss_vs_profit_pct > 0 and equity > 0:
         try:
             from core.db import get_realized_baseline
             baseline = get_realized_baseline(user_id)
@@ -333,7 +341,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             return {"skipped": True, "reason": "already_in_market"}
 
         open_count = sum(1 for p in positions if p["shares"] > 0)
-        if open_count >= settings.max_open_positions:
+        if not is_sniper and open_count >= settings.max_open_positions:
             log.info("skip_max_positions", user_id=user_id, open=open_count)
             return {"skipped": True, "reason": "max_positions"}
     except Exception:
@@ -373,16 +381,32 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         book = get_order_book(token_id)
         if book and book.get("best_ask"):
             entry_price = float(book["best_ask"])
-            if entry_price > settings.max_entry_price or entry_price < settings.min_entry_price:
-                log.info("skip_price_out_of_range", user_id=user_id, price=entry_price)
-                return {"skipped": True, "reason": "price_out_of_range"}
-            band = entry_price * (1.0 + settings.order_slippage_pct)
-            fillable = sum(
-                lvl["price"] * lvl["size"] for lvl in book["asks"] if lvl["price"] <= band
-            )
-            cap = fillable * settings.book_safe_frac
-            if cap > 0:
-                size_usdc = min(size_usdc, cap)
+            if is_sniper:
+                # BP26: drift guard — donor price + small slippage, or skip (EV preservation).
+                donor_px = float(signal.get("price") or 0)
+                if donor_px > 0 and entry_price > donor_px * (1.0 + settings.sniper_slippage_pct):
+                    log.info("sniper_skip", reason="price_drift", user_id=user_id,
+                             donor=round(donor_px, 4), ask=round(entry_price, 4))
+                    return {"skipped": True, "reason": "sniper_price_drift"}
+                if entry_price > settings.sniper_max_entry_price:
+                    log.info("sniper_skip", reason="price_ceiling", user_id=user_id,
+                             ask=round(entry_price, 4))
+                    return {"skipped": True, "reason": "sniper_price_ceiling"}
+                band = entry_price * (1.0 + settings.sniper_slippage_pct)
+                fillable = sum(l["price"] * l["size"] for l in book["asks"] if l["price"] <= band)
+                if fillable > 0:
+                    size_usdc = min(size_usdc, fillable)  # full depth, no 0.25 fraction
+            else:
+                if entry_price > settings.max_entry_price or entry_price < settings.min_entry_price:
+                    log.info("skip_price_out_of_range", user_id=user_id, price=entry_price)
+                    return {"skipped": True, "reason": "price_out_of_range"}
+                band = entry_price * (1.0 + settings.order_slippage_pct)
+                fillable = sum(
+                    lvl["price"] * lvl["size"] for lvl in book["asks"] if lvl["price"] <= band
+                )
+                cap = fillable * settings.book_safe_frac
+                if cap > 0:
+                    size_usdc = min(size_usdc, cap)
         if book and book.get("best_bid"):
             entry_bid_at_fill = float(book["best_bid"])
     except Exception:
@@ -408,54 +432,55 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     # (daily-loss) does not block new entries for the rest of the day.
     # Gates 1-3 (exposure / event / drawdown-from-new-baseline) still apply.
     concentration_warn: str | None = None
-    try:
-        from core.risk import check_risk_gates
-        from core.db import get_user_equity_hwm, get_daily_realized_pnl, get_risk_override_until
-        from datetime import datetime as _dt, timezone as _tz
-        hwm = get_user_equity_hwm(user_id)
-        daily_pnl = get_daily_realized_pnl(user_id)
+    if not is_sniper:
         try:
-            _override_ts = get_risk_override_until(user_id)
-            if _override_ts:
-                from dateutil.parser import parse as _pdt
-                _override_exp = _pdt(_override_ts)
-                if _override_exp.tzinfo is None:
-                    _override_exp = _override_exp.replace(tzinfo=_tz.utc)
-                if _dt.now(_tz.utc) < _override_exp:
-                    log.debug("risk_gate4_bypassed_override",
-                              user_id=user_id, override_until=_override_ts)
-                    daily_pnl = 0.0  # gate 4 sees no loss → does not block
+            from core.risk import check_risk_gates
+            from core.db import get_user_equity_hwm, get_daily_realized_pnl, get_risk_override_until
+            from datetime import datetime as _dt, timezone as _tz
+            hwm = get_user_equity_hwm(user_id)
+            daily_pnl = get_daily_realized_pnl(user_id)
+            try:
+                _override_ts = get_risk_override_until(user_id)
+                if _override_ts:
+                    from dateutil.parser import parse as _pdt
+                    _override_exp = _pdt(_override_ts)
+                    if _override_exp.tzinfo is None:
+                        _override_exp = _override_exp.replace(tzinfo=_tz.utc)
+                    if _dt.now(_tz.utc) < _override_exp:
+                        log.debug("risk_gate4_bypassed_override",
+                                  user_id=user_id, override_until=_override_ts)
+                        daily_pnl = 0.0  # gate 4 sees no loss → does not block
+            except Exception:
+                pass
+            decision = check_risk_gates(
+                signal=signal,
+                stake=size_usdc,
+                open_positions=positions,
+                equity=equity,
+                equity_hwm=hwm,
+                daily_pnl=daily_pnl,
+                cfg=settings,
+                ledger_cost_by_token=ledger_cost,
+            )
+            if not decision.allowed:
+                gate = decision.gate
+                # BP8: no notification here — manage_positions owns the pause alert.
+                log.info("skip_risk_gate", user_id=user_id,
+                         gate=gate, reason=decision.reason[:80])
+                return {"skipped": True, "reason": f"risk_gate:{gate}"}
+
+            # BP7: apply clamped stake when Gates 1/2 reduced it (e.g. partial headroom).
+            if decision.max_stake is not None:
+                clamped = max(min(decision.max_stake, tradeable), exchange_min)
+                log.info("risk_gate_clamp_applied", user_id=user_id,
+                         original=round(size_usdc, 2), clamped=round(clamped, 2),
+                         gate=decision.gate)
+                size_usdc = clamped
+
+            # Carry the concentration warning forward to the trade notification.
+            concentration_warn = decision.warn
         except Exception:
-            pass
-        decision = check_risk_gates(
-            signal=signal,
-            stake=size_usdc,
-            open_positions=positions,
-            equity=equity,
-            equity_hwm=hwm,
-            daily_pnl=daily_pnl,
-            cfg=settings,
-            ledger_cost_by_token=ledger_cost,
-        )
-        if not decision.allowed:
-            gate = decision.gate
-            # BP8: no notification here — manage_positions owns the pause alert.
-            log.info("skip_risk_gate", user_id=user_id,
-                     gate=gate, reason=decision.reason[:80])
-            return {"skipped": True, "reason": f"risk_gate:{gate}"}
-
-        # BP7: apply clamped stake when Gates 1/2 reduced it (e.g. partial headroom).
-        if decision.max_stake is not None:
-            clamped = max(min(decision.max_stake, tradeable), exchange_min)
-            log.info("risk_gate_clamp_applied", user_id=user_id,
-                     original=round(size_usdc, 2), clamped=round(clamped, 2),
-                     gate=decision.gate)
-            size_usdc = clamped
-
-        # Carry the concentration warning forward to the trade notification.
-        concentration_warn = decision.warn
-    except Exception:
-        log.warning("risk_gate_check_failed", user_id=user_id)
+            log.warning("risk_gate_check_failed", user_id=user_id)
 
     # ── Idempotency guard & signal insert ────────────────────────────────────
     signal_id = signal.get("signal_id")
@@ -523,6 +548,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         # Blueprint 17 Layer 3: CLOB best_bid at fill time (Layer 3 bid-vs-bid guard).
         # NULL-safe: column may be absent in old DB schema — insert only when present.
         **({"entry_bid": round(entry_bid_at_fill, 6)} if entry_bid_at_fill > 0 else {}),
+        "mode":           "sniper" if is_sniper else "default",
     })
 
     try:
@@ -535,7 +561,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             size_usdc=size_usdc,
             tick_size=str(signal.get("tick_size", "0.01")),
             neg_risk=bool(signal.get("neg_risk", False)),
-            slippage_pct=settings.order_slippage_pct,
+            slippage_pct=settings.sniper_slippage_pct if is_sniper else settings.order_slippage_pct,
             deposit_wallet=deposit_wallet,
         )
 
@@ -561,11 +587,12 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             remaining = 0.0
 
         score_val, signal_type_val, thesis_val, caution_val = None, None, None, None
-        try:
-            from worker.tasks.ai_filter import _call_gpt
-            score_val, signal_type_val, thesis_val, caution_val = _call_gpt(signal)
-        except Exception:
-            log.warning("ai_inline_failed", user_id=user_id)
+        if not is_sniper:
+            try:
+                from worker.tasks.ai_filter import _call_gpt
+                score_val, signal_type_val, thesis_val, caution_val = _call_gpt(signal)
+            except Exception:
+                log.warning("ai_inline_failed", user_id=user_id)
 
         final_status = "confirmed" if fill_status != "none" else "unfilled"
         try:
@@ -607,6 +634,10 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         except Exception:
             pass
         log.exception("copy_trade_failed", user_id=user_id)
+        if is_sniper:
+            # BP26: NO retry — a retry 5s later fires into an already-resolved market.
+            log.warning("sniper_trade_failed_no_retry", user_id=user_id)
+            return {"skipped": True, "reason": "sniper_failed"}
         raise self.retry(exc=exc)
 
 

@@ -73,6 +73,7 @@ _includes = [
     "worker.tasks.wallet_ops",
     "worker.tasks.poll_donors",
     "worker.tasks.poll_tracked_wallets",
+    "worker.tasks.poll_sniper_wallets",
     "worker.tasks.monitor_deposits",
     "worker.tasks.execute_copy",
 ]
@@ -124,6 +125,10 @@ celery_app.conf.update(
         "poll-tracked-wallets": {
             "task": "worker.tasks.poll_tracked_wallets",
             "schedule": settings.tracked_poll_sec,  # copy the whitelist (Model B)
+        },
+        "poll-sniper-wallets": {
+            "task": "worker.tasks.poll_sniper_wallets",
+            "schedule": settings.sniper_poll_sec,  # BP26: 5-min markets need ~3s cadence
         },
         "sync-positions": {
             "task": "worker.tasks.sync_positions",
