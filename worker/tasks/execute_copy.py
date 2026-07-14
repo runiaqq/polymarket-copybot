@@ -548,7 +548,10 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         # Blueprint 17 Layer 3: CLOB best_bid at fill time (Layer 3 bid-vs-bid guard).
         # NULL-safe: column may be absent in old DB schema — insert only when present.
         **({"entry_bid": round(entry_bid_at_fill, 6)} if entry_bid_at_fill > 0 else {}),
-        "mode":           "sniper" if is_sniper else "default",
+        # BP26: NULL-safe for the pre-migration-019 schema — only sniper trades send
+        # the column (they can't exist before migration 019 anyway, since the donor
+        # row needs tracked_wallets.mode); default trades rely on the column default.
+        **({"mode": "sniper"} if is_sniper else {}),
     })
 
     try:

@@ -104,6 +104,13 @@ def poll_sniper_wallets() -> dict:
 
             f0 = fills[0]
             outcome = (meta.get("token_outcomes") or {}).get(token) or f0.get("outcome") or ""
+            # BP26: BTC 5-min outcomes are "Up"/"Down", so the execute-side Yes/No
+            # name fallback would mis-index them. Prefer the activity outcomeIndex;
+            # otherwise derive it from the CLOB token order (list position == index).
+            outcome_index = f0.get("outcome_index")
+            if outcome_index is None:
+                _tokens = list((meta.get("token_outcomes") or {}).keys())
+                outcome_index = _tokens.index(token) if token in _tokens else None
             signal = {
                 "mode":           "sniper",           # BP26 branch flag in execute_copy_trade
                 "market_id":      cond,
@@ -118,7 +125,7 @@ def poll_sniper_wallets() -> dict:
                 "neg_risk":       bool(meta.get("neg_risk", False)),
                 "resolution_iso": meta.get("end_date_iso"),
                 "event_slug":     f0.get("event_slug") or "",
-                "outcome_index":  f0.get("outcome_index"),
+                "outcome_index":  outcome_index,
                 "source_tx_hash": str(f0.get("tx_hash") or f0.get("id") or f"{addr}:{cond}"),
                 "source_wallet":  addr,
                 "consensus":      1,
