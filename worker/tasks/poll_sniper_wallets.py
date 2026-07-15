@@ -5,6 +5,12 @@ A 'sniper' tracked wallet enters 5-min BTC markets in the last ~30 seconds.
 This fast loop (every sniper_poll_sec) mirrors its BUY fills to an explicit
 allowlist of users with NO sizing/risk gates except the 30% Delta-Drop stop.
 The slow Model-B path (poll_tracked_wallets) excludes mode='sniper' wallets.
+
+BP26.5: the PRIMARY low-latency source is now the RTDS WebSocket listener
+(worker/sniper_ws.py, ~1 s after match) which calls fire_sniper_signal()
+directly. This poller stays as a fallback for WS downtime — the shared Redis
+once-key inside fire_sniper_signal makes double entry impossible whichever
+path sees the fill first.
 """
 
 import time
@@ -40,15 +46,102 @@ def _sniper_subscribers(allowed_tg_ids: list[int]) -> list[dict]:
     ]
 
 
+def fire_sniper_signal(addr: str, allowed: list[int], cond: str, token: str,
+                       fills: list[dict]) -> bool:
+    """Shared exit point for BOTH sniper sources (RTDS WS + Data-API poller).
+
+    Claims the atomic per-market Redis once-key, validates the market against
+    the CLOB, builds the signal and fans it out to the allowlisted users.
+    Returns True when a signal was actually dispatched.
+    """
+    from core.clob import get_clob_market
+    from core.db import insert_trade_signal
+    from worker.tasks import execute_copy_trade
+
+    # Atomic per-market dedup (SETNX) — one entry per market instance,
+    # whichever source (WS or poller) sees the fill first wins.
+    if not notify_once(f"sniper:{addr}:{cond}:{token}",
+                       ttl=settings.sniper_dedup_ttl_sec):
+        return False
+
+    meta = get_clob_market(cond)
+    if not meta:
+        log.info("sniper_skip", reason="no_market_meta", market=cond[:14])
+        return False
+    if not meta["accepting_orders"]:
+        log.info("sniper_skip", reason="market_closed", market=cond[:14])
+        return False
+
+    size = sum(float(f.get("size_usdc") or 0) for f in fills)
+    notional = sum(float(f.get("size_usdc") or 0) * float(f.get("price") or 0)
+                   for f in fills)
+    vwap = (notional / size) if size > 0 else 0.0
+    if size <= 0 or vwap <= 0:
+        return False
+
+    f0 = fills[0]
+    outcome = (meta.get("token_outcomes") or {}).get(token) or f0.get("outcome") or ""
+    # BP26: BTC 5-min outcomes are "Up"/"Down", so the execute-side Yes/No
+    # name fallback would mis-index them. Prefer the activity outcomeIndex;
+    # otherwise derive it from the CLOB token order (list position == index).
+    outcome_index = f0.get("outcome_index")
+    if outcome_index is None:
+        _tokens = list((meta.get("token_outcomes") or {}).keys())
+        outcome_index = _tokens.index(token) if token in _tokens else None
+    signal = {
+        "mode":           "sniper",           # BP26 branch flag in execute_copy_trade
+        "market_id":      cond,
+        "token_id":       token,
+        "title":          meta.get("question") or f0.get("title") or "",
+        "outcome":        outcome,
+        "side":           "BUY",
+        "price":          round(vwap, 4),
+        "size_usdc":      round(size, 2),
+        "fills":          len(fills),
+        "tick_size":      meta.get("tick_size", "0.01"),
+        "neg_risk":       bool(meta.get("neg_risk", False)),
+        "resolution_iso": meta.get("end_date_iso"),
+        "event_slug":     f0.get("event_slug") or "",
+        "outcome_index":  outcome_index,
+        "source_tx_hash": str(f0.get("tx_hash") or f0.get("id") or f"{addr}:{cond}"),
+        "source_wallet":  addr,
+        "consensus":      1,
+        "whale_wallet":   addr,
+    }
+    try:
+        row = insert_trade_signal({
+            "market_id":      cond,
+            "title":          signal["title"],
+            "outcome":        outcome or None,
+            "side":           "BUY",
+            "price":          signal["price"],
+            "size_usdc":      signal["size_usdc"],
+            "token_id":       token,
+            "source_tx_hash": signal["source_tx_hash"],
+            "source_wallet":  addr,
+            "consensus":      1,
+        })
+        signal["signal_id"] = row["id"]
+    except Exception:
+        log.exception("sniper_signal_insert_failed", market=cond[:14])
+        return False
+
+    users = _sniper_subscribers(allowed)
+    for u in users:
+        execute_copy_trade.delay(u["id"], signal)
+    log.info("sniper_signal_fired", wallet=addr[:10], market=cond[:14],
+             outcome=outcome, size=round(size, 2), vwap=round(vwap, 4),
+             fills=len(fills), users=len(users))
+    return True
+
+
 @celery_app.task(name="worker.tasks.poll_sniper_wallets", queue="periodic")
 def poll_sniper_wallets() -> dict:
     if not settings.auto_copy_enabled:
         return {"skipped": "auto_copy_off"}
 
-    from core.clob import get_clob_market
-    from core.db import insert_trade_signal, list_tracked_wallets
+    from core.db import list_tracked_wallets
     from core.polymarket import fetch_donor_recent_trades
-    from worker.tasks import execute_copy_trade
 
     wallets = [w for w in list_tracked_wallets()
                if (w.get("mode") or "default") == "sniper"]
@@ -82,79 +175,7 @@ def poll_sniper_wallets() -> dict:
             groups.setdefault((cond, token), []).append(t)
 
         for (cond, token), fills in groups.items():
-            # Atomic per-market dedup (SETNX) — one entry per market instance.
-            if not notify_once(f"sniper:{addr}:{cond}:{token}",
-                               ttl=settings.sniper_dedup_ttl_sec):
-                continue
-
-            meta = get_clob_market(cond)
-            if not meta:
-                log.info("sniper_skip", reason="no_market_meta", market=cond[:14])
-                continue
-            if not meta["accepting_orders"]:
-                log.info("sniper_skip", reason="market_closed", market=cond[:14])
-                continue
-
-            size = sum(float(f.get("size_usdc") or 0) for f in fills)
-            notional = sum(float(f.get("size_usdc") or 0) * float(f.get("price") or 0)
-                           for f in fills)
-            vwap = (notional / size) if size > 0 else 0.0
-            if size <= 0 or vwap <= 0:
-                continue
-
-            f0 = fills[0]
-            outcome = (meta.get("token_outcomes") or {}).get(token) or f0.get("outcome") or ""
-            # BP26: BTC 5-min outcomes are "Up"/"Down", so the execute-side Yes/No
-            # name fallback would mis-index them. Prefer the activity outcomeIndex;
-            # otherwise derive it from the CLOB token order (list position == index).
-            outcome_index = f0.get("outcome_index")
-            if outcome_index is None:
-                _tokens = list((meta.get("token_outcomes") or {}).keys())
-                outcome_index = _tokens.index(token) if token in _tokens else None
-            signal = {
-                "mode":           "sniper",           # BP26 branch flag in execute_copy_trade
-                "market_id":      cond,
-                "token_id":       token,
-                "title":          meta.get("question") or f0.get("title") or "",
-                "outcome":        outcome,
-                "side":           "BUY",
-                "price":          round(vwap, 4),
-                "size_usdc":      round(size, 2),
-                "fills":          len(fills),
-                "tick_size":      meta.get("tick_size", "0.01"),
-                "neg_risk":       bool(meta.get("neg_risk", False)),
-                "resolution_iso": meta.get("end_date_iso"),
-                "event_slug":     f0.get("event_slug") or "",
-                "outcome_index":  outcome_index,
-                "source_tx_hash": str(f0.get("tx_hash") or f0.get("id") or f"{addr}:{cond}"),
-                "source_wallet":  addr,
-                "consensus":      1,
-                "whale_wallet":   addr,
-            }
-            try:
-                row = insert_trade_signal({
-                    "market_id":      cond,
-                    "title":          signal["title"],
-                    "outcome":        outcome or None,
-                    "side":           "BUY",
-                    "price":          signal["price"],
-                    "size_usdc":      signal["size_usdc"],
-                    "token_id":       token,
-                    "source_tx_hash": signal["source_tx_hash"],
-                    "source_wallet":  addr,
-                    "consensus":      1,
-                })
-                signal["signal_id"] = row["id"]
-            except Exception:
-                log.exception("sniper_signal_insert_failed", market=cond[:14])
-                continue
-
-            users = _sniper_subscribers(allowed)
-            for u in users:
-                execute_copy_trade.delay(u["id"], signal)
-            dispatched += 1
-            log.info("sniper_signal_fired", wallet=addr[:10], market=cond[:14],
-                     outcome=outcome, size=round(size, 2), vwap=round(vwap, 4),
-                     fills=len(fills), users=len(users))
+            if fire_sniper_signal(addr, allowed, cond, token, fills):
+                dispatched += 1
 
     return {"dispatched": dispatched}

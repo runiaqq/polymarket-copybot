@@ -252,6 +252,18 @@ class Settings(BaseSettings):
     # Redis once-key TTL for per-market dedup (one entry per market instance).
     sniper_dedup_ttl_sec: int = 900
 
+    # ── Blueprint 26.5: real-time sniper feed (RTDS WebSocket) ──────────────────
+    # Platform-wide activity stream (~1 s after match) — the primary low-latency
+    # path; the 3-second Data-API poller above stays as a fallback.
+    sniper_ws_enabled: bool = True
+    sniper_ws_url: str = "wss://ws-live-data.polymarket.com"
+    # Re-read the sniper donor list from tracked_wallets this often (seconds).
+    sniper_ws_refresh_donors_sec: int = 60
+    # Force a reconnect after this many seconds without ANY frame from the
+    # server (the unfiltered orders_matched stream is never quiet for long;
+    # RTDS connections are known to die silently).
+    sniper_ws_silence_reconnect_sec: int = 60
+
     # ── Wallet track-record filter (validate the edge before enforcing) ──────────
     # off     = ignore the buyer's history entirely
     # observe = resolve the buyer, score their P&L, LOG it on the signal, never block

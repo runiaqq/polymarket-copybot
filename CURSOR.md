@@ -5147,3 +5147,81 @@ on conflict (address) do update
 Verify: `docker compose logs --since 10m worker | grep -E "sniper_signal_fired|sniper_skip|copy_trade_ok"`;
 `poll_sniper_wallets` should tick every ~3s (grep `sniper_poll`); slow path must show the donor
 excluded. A dry check without funds: allowlist a signal-only test user first.
+
+## Blueprint 26.5 — Real-Time Sniper Feed (RTDS WebSocket) ✅ IMPLEMENTED 2026-07-15
+
+### 26.5.0 Why
+
+The Data-API polling path (§26.2) has an irreducible 5–20 s donor→entry latency:
+Data-API activity indexing (measured 4–15 s) + poll cadence (≤3 s) + execute. For a donor
+entering at T-30 s of a 5-minute market that eats most of the edge. PO requires 1–2 s.
+
+### 26.5.1 Source — verified live against the updated (CLOB v2 era) docs
+
+Polymarket's **RTDS** (`wss://ws-live-data.polymarket.com`, docs "Real-Time Data Socket")
+streams **every trade on the platform** on topic `activity`. Verified live 2026-07-15
+(scripts/rtds_smoke.py): **receive lag ≈ 1.5 s after the on-chain match**, payload carries
+`proxyWallet`, `conditionId`, `asset` (token id), `side`, `price`, `size` (**SHARES**, not
+USDC — usdc = size × price), `outcome`, `outcomeIndex`, `eventSlug`, `timestamp` (seconds),
+`transactionHash`. Payload is a single object per frame.
+
+Hard-won protocol facts (github.com/Polymarket/real-time-data-client + issue #34):
+1. Subscription type **`trades` is dead — only `orders_matched` delivers** (same schema).
+2. Server-side filters accept ONLY `event_slug`/`market_slug` (exact string match on a
+   compact JSON string!), NOT wallets → we subscribe **unfiltered** and match
+   `proxyWallet` client-side against the sniper donor set (dict lookup, trivial CPU).
+3. Server expects a literal text `"ping"` every ~5 s; protocol-level keepalive misbehaves
+   (silent drops) → `ping_interval=None` + manual text ping + a **silence watchdog**: no
+   frames for `sniper_ws_silence_reconnect_sec=60` s → force reconnect (the unfiltered
+   firehose is never quiet for long, so silence == dead socket).
+
+### 26.5.2 Architecture
+
+**`worker/sniper_ws.py`** — `SniperFeed`: synchronous `websockets.sync.client` loop
+(connect → subscribe → recv with 5 s timeout → ping/watchdog/donor-refresh), exponential
+reconnect backoff (max 30 s), donor set re-read from `tracked_wallets` every
+`sniper_ws_refresh_donors_sec=60` s. A matching fresh BUY (same
+`sniper_max_trade_age_sec` bar as the poller — also guards reconnect replays) is
+normalized to the poller's fill shape and handed to `fire_sniper_signal`.
+
+**Runs as a daemon thread in the BEAT container** (`worker/beat.py::_start_sniper_ws`),
+NOT the worker: beat is exactly one replica (no duplicate listeners when the worker
+scales) and a plain non-gevent interpreter (the worker's gevent monkey-patching breaks
+socket/asyncio threads — the BP23 lesson). Beat only *dispatches* Celery tasks
+(`execute_copy_trade.delay`), execution stays on the worker's trades queue.
+
+**Shared exit point**: `fire_sniper_signal(addr, allowed, cond, token, fills)` extracted
+from `poll_sniper_wallets` — once-key claim, CLOB meta check, signal build, fan-out.
+The WS listener AND the 3-second poller both call it; the atomic Redis once-key
+`sniper:{addr}:{cond}:{token}` guarantees at most ONE entry per market whichever path
+sees the fill first. **The poller stays enabled as the WS-downtime fallback.**
+
+**Execute-path latency trim** (`execute_copy_trade`): sniper skips the Data-API
+`get_positions` fetch (~0.5–1 s) and the ledger-equity computation — they only feed the
+risk gates / `already_in_market` / `max_open_positions` guards which sniper bypasses
+anyway (`positions=[]`, `equity=tradeable`; the once-key already enforces one entry per
+market). The "$100 recommended" soft warning is also skipped for sniper.
+
+**New settings**: `sniper_ws_enabled=true`, `sniper_ws_url`,
+`sniper_ws_refresh_donors_sec=60`, `sniper_ws_silence_reconnect_sec=60`.
+
+### 26.5.3 Expected end-to-end latency
+
+RTDS delivery ~1.5 s + fire_sniper_signal (CLOB meta + signal insert ~0.4 s) + Celery
+dispatch (~0.1 s) + execute (balance + book + order ~1.5–2 s) ≈ **3–5 s after the donor's
+match** (vs 8–25 s via the polling path). The floor is bounded by RTDS's own ~1.5 s and
+by order placement RPCs; sub-2 s total would require a private fill feed that Polymarket
+does not expose.
+
+### 26.5.4 Pitfalls / accepted
+
+- WS fill `size` is SHARES — the listener converts (× price) before summing; the Data-API
+  poller keeps using `usdcSize`. Mixing the two units would corrupt mirror sizing.
+- The WS sees each donor fill individually (no 3 s batch window), so the mirror fires on
+  the FIRST fill of a sliced burst; later slices are dropped by the once-key → mirror can
+  undershoot a slicing donor (same "never overshoot" stance as §26.3).
+- Beat restart = listener restart; fills during the gap are picked up by the 3 s poller
+  (slower but not lost). No state to persist — the once-key lives in Redis.
+- If RTDS someday kills `orders_matched` like it killed `trades`, the symptom is
+  `sniper_ws_session_error: no frames for 60s` reconnect loops in beat logs while the
+  poller keeps working; swap the subscription type per the client repo's README.

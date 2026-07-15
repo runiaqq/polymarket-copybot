@@ -176,26 +176,35 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     depth_cap = float(signal.get("max_copy_usdc") or signal.get("size_usdc") or 0)
 
     # BP8: load cost-basis ledger for both modes (cost-basis equity, no phantom drawdown).
-    try:
-        from core.polymarket import get_positions as _gp
-        positions = _gp(deposit_wallet)
-    except Exception:
+    # BP26.5: sniper skips BOTH slow lookups (Data-API positions ~0.5-1 s, ledger
+    # equity ~0.3 s) — they only feed the risk gates / already-in-market guard,
+    # which sniper bypasses (the Redis once-key already enforces one entry per
+    # market). Every saved round-trip matters in the last 30 s of a 5-min market.
+    if is_sniper:
         positions = []
-    try:
-        from core.db import get_open_trades_cost
-        from core.risk import total_equity
-        ledger_cost = get_open_trades_cost(user_id)
-        equity = total_equity(
-            tradeable,
-            positions,
-            ledger_cost,
-            mode=settings.drawdown_equity_mode,
-        )
-    except Exception:
         ledger_cost = {}
-        equity = tradeable + sum(
-            float(p.get("current_value") or 0) for p in positions if p.get("shares", 0) > 0
-        )
+        equity = tradeable
+    else:
+        try:
+            from core.polymarket import get_positions as _gp
+            positions = _gp(deposit_wallet)
+        except Exception:
+            positions = []
+        try:
+            from core.db import get_open_trades_cost
+            from core.risk import total_equity
+            ledger_cost = get_open_trades_cost(user_id)
+            equity = total_equity(
+                tradeable,
+                positions,
+                ledger_cost,
+                mode=settings.drawdown_equity_mode,
+            )
+        except Exception:
+            ledger_cost = {}
+            equity = tradeable + sum(
+                float(p.get("current_value") or 0) for p in positions if p.get("shares", 0) > 0
+            )
 
     if is_sniper:
         # BP26: mirror the donor's exact size; clamp ONLY to free balance below.
@@ -282,7 +291,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     # BP7: the "$100 recommended" warning is shown only in kelly mode — in fixed
     # mode the user chose their own size, so we stay silent about balance.
     exchange_min = settings.exchange_min_order_usdc
-    if equity < settings.recommended_min_balance_usdc:
+    if not is_sniper and equity < settings.recommended_min_balance_usdc:
         if effective_mode == "kelly":
             from core.cache import notify_once as _no
             if _no(f"trading_min:{user_id}", ttl=settings.lowbal_alert_throttle_sec):
