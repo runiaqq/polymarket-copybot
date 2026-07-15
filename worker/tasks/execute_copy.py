@@ -387,25 +387,50 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     entry_bid_at_fill: float = 0.0
     try:
         from core.polymarket import get_order_book
-        book = get_order_book(token_id)
-        if book and book.get("best_ask"):
-            entry_price = float(book["best_ask"])
-            if is_sniper:
-                # BP26: drift guard — donor price + small slippage, or skip (EV preservation).
-                donor_px = float(signal.get("price") or 0)
-                if donor_px > 0 and entry_price > donor_px * (1.0 + settings.sniper_slippage_pct):
-                    log.info("sniper_skip", reason="price_drift", user_id=user_id,
-                             donor=round(donor_px, 4), ask=round(entry_price, 4))
+
+        if is_sniper:
+            # BP26.6 "patient entry": the donor's own $14 order sweeps the thin
+            # book — right after his fill the best ask sits cents higher (prod:
+            # 0.81→0.86, 0.80→0.99), which the old one-shot check skipped as
+            # price_drift (62% of signals). But MMs requote these BTC books from
+            # spot within seconds, so we WAIT for the refill: re-read the book up
+            # to sniper_entry_wait_sec and enter the moment the ask is back inside
+            # the band. This also kills the adverse selection of the one-shot
+            # rule (it kept only entries where the price FELL after the donor —
+            # i.e. where the market disagreed with him).
+            donor_px = float(signal.get("price") or 0)
+            band_limit = donor_px * (1.0 + settings.sniper_slippage_pct) if donor_px > 0 else 0
+            deadline = time.time() + settings.sniper_entry_wait_sec
+            book = None
+            last_ask = 0.0
+            while True:
+                try:
+                    b = get_order_book(token_id)
+                except Exception:
+                    b = None
+                if b and b.get("best_ask"):
+                    ask = float(b["best_ask"])
+                    last_ask = ask
+                    if ((band_limit <= 0 or ask <= band_limit)
+                            and ask <= settings.sniper_max_entry_price):
+                        book = b
+                        break
+                if time.time() >= deadline:
+                    log.info("sniper_skip", reason="price_drift_timeout", user_id=user_id,
+                             donor=round(donor_px, 4), last_ask=round(last_ask, 4),
+                             waited=settings.sniper_entry_wait_sec)
                     return {"skipped": True, "reason": "sniper_price_drift"}
-                if entry_price > settings.sniper_max_entry_price:
-                    log.info("sniper_skip", reason="price_ceiling", user_id=user_id,
-                             ask=round(entry_price, 4))
-                    return {"skipped": True, "reason": "sniper_price_ceiling"}
-                band = entry_price * (1.0 + settings.sniper_slippage_pct)
-                fillable = sum(l["price"] * l["size"] for l in book["asks"] if l["price"] <= band)
-                if fillable > 0:
-                    size_usdc = min(size_usdc, fillable)  # full depth, no 0.25 fraction
-            else:
+                time.sleep(settings.sniper_entry_poll_sec)
+
+            entry_price = float(book["best_ask"])
+            band = entry_price * (1.0 + settings.sniper_slippage_pct)
+            fillable = sum(l["price"] * l["size"] for l in book["asks"] if l["price"] <= band)
+            if fillable > 0:
+                size_usdc = min(size_usdc, fillable)  # full depth, no 0.25 fraction
+        else:
+            book = get_order_book(token_id)
+            if book and book.get("best_ask"):
+                entry_price = float(book["best_ask"])
                 if entry_price > settings.max_entry_price or entry_price < settings.min_entry_price:
                     log.info("skip_price_out_of_range", user_id=user_id, price=entry_price)
                     return {"skipped": True, "reason": "price_out_of_range"}

@@ -1146,6 +1146,25 @@ def reconcile_settlements() -> dict:
             if not is_condition_resolved(cond):
                 continue  # not resolved yet — check again next cycle
 
+            # BP26.7: verify the stored outcome_index against the on-chain token
+            # before classifying. The legacy entry-time fallback stamped 1 for any
+            # non-"Yes" outcome, which made LOST trades read the winning leg's
+            # payout → eternal collateral_unmatched redeem loops (prod: rows
+            # 715/764/799 spamming ~300 skips/day). Repair the row and proceed
+            # with the true index.
+            from core.relayer import detect_outcome_index
+            real_idx = detect_outcome_index(cond, token_id)
+            if real_idx is not None and real_idx != int(outcome_idx):
+                log.warning("reconcile_outcome_index_repaired", user_id=uid,
+                            cond=cond[:14], stored=int(outcome_idx), real=real_idx)
+                try:
+                    sb.table("copy_trades").update(
+                        {"outcome_index": real_idx}).eq("id", trade["id"]).execute()
+                except Exception:
+                    log.warning("outcome_index_repair_persist_failed",
+                                trade_id=trade["id"])
+                outcome_idx = real_idx
+
             won = get_payout_numerator(cond, int(outcome_idx)) > 0
             entry_cost = float(trade.get("size_usdc") or 0)
 

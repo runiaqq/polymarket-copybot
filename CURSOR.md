@@ -5225,3 +5225,58 @@ does not expose.
 - If RTDS someday kills `orders_matched` like it killed `trades`, the symptom is
   `sniper_ws_session_error: no frames for 60s` reconnect loops in beat logs while the
   poller keeps working; swap the subscription type per the client repo's README.
+
+## Blueprint 26.6 — Patient Entry + WS Hygiene ✅ IMPLEMENTED 2026-07-16
+
+Prod findings after one day of BP26.5 (16 signals, 7.5 h):
+1. WS latency solved (donor fill seen in 0.16–1.03 s), **but 62% of entries were skipped as
+   `price_drift`**: the donor's own $14 order sweeps the thin BTC book, so 1-2 s later the
+   best ask sits 5–19 cents above his price (0.81→0.86, 0.80→0.99). MMs requote these books
+   from spot within seconds — the one-shot check gave up exactly when waiting would win.
+   The one-shot rule was also adversely selective: it kept entries where the price FELL
+   after the donor (market disagreeing with him) and skipped those where it rose.
+2. RTDS silently dropped ~hourly (`no frames for 60s`); with reconnect backoff capped at
+   30 s one real donor fill was lost (`stale_fill lag=37s`).
+
+**Fixes** (`execute_copy` sniper branch, `sniper_ws`, config):
+- *Patient entry*: poll the book every `sniper_entry_poll_sec=0.7` for up to
+  `sniper_entry_wait_sec=10`; enter the moment best_ask ≤ donor_price × (1+2%) AND
+  ≤ `sniper_max_entry_price`; on timeout skip (`price_drift_timeout`). Depth clamp within
+  the band unchanged.
+- *WS hygiene*: reconnect backoff cap 30 s → 3 s; silence watchdog 60 s → 25 s
+  (`sniper_ws_silence_reconnect_sec` default changed).
+
+Measured capacity note (mass-rollout input): after the donor's sweep the refilled band
+holds $10–25; two mirror users already split it (both got $9.38 partial fills on one
+signal). Mirror-size copying does NOT scale past ~3-6 users; mass rollout must use small
+fixed per-user stakes and accept depth rationing.
+
+## Blueprint 26.7 — Settlement & Stats Truth Fixes ✅ IMPLEMENTED 2026-07-16
+
+Three prod bugs, one root theme: wrong or missing ground truth.
+
+**1. Eternal `collateral_unmatched` redeem loops (≈300 skips/day).** Rows 715/764/799:
+`copy_trades.outcome_index=1` stored by the legacy entry fallback ("not Yes → 1"), but the
+held token is index 0 — which LOST. Reconcile read the winning leg's payout → classified
+as win → dispatched redeem forever; redeem_winnings probed positionId with the wrong index
+→ `collateral_unmatched` skip, no settle, repeat. **Fix**: new
+`core/relayer.py::detect_outcome_index(cond, token_id)` — matches the token's on-chain
+positionId across both indices × all collaterals (pUSD/USDC.e/USDCn/WCOL). Reconcile now
+verifies+repairs the stored index (log `reconcile_outcome_index_repaired`) before
+classifying; redeem_winnings also self-corrects (`redeem_outcome_index_corrected`).
+Effect: those three rows settle as LOSSES on the next reconcile pass (users get the
+correct 💔 notification once, capital ledger unblocks).
+
+**2. Wrong outcome in win/loss notifications ("Исход: New Rihanna Album" on a Tel-Aviv
+market).** `resolve_outcome_name` queried Gamma with a **non-existent `conditionId`
+param** — Gamma ignored it and returned the default market list; Tier 4 then took the
+first market's groupItemTitle. **Fix**: correct param `condition_ids`, with a
+`closed=true` retry (Gamma's default filter hides resolved markets). Tier order also
+corrected: informative `outcomes[idx]` (Up/Down/Over/Under/teams) beats groupItemTitle;
+groupItemTitle still wins over bare Yes/No on grouped markets.
+
+**3. /pnl showed 100% winrate while losses existed.** `_build_pnl` used Data-API
+`/closed-positions`, where a LOST position never appears (its worthless tokens are never
+sold or redeemed — the API keeps it "open"). **Fix**: realized stats now come from the
+copy_trades ledger (`get_realized_pnl_rows`; losses booked by reconcile, wins by redeem,
+manual exits by close_position). Unrealized/open snapshot still live from Data-API.

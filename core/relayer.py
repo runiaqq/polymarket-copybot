@@ -222,6 +222,39 @@ def get_payout_numerator(condition_id: str, outcome_index: int) -> int:
         return 0
 
 
+def detect_outcome_index(condition_id: str, token_id: str) -> int | None:
+    """Return the TRUE outcome index of a held ERC1155 token by matching its
+    on-chain positionId across both indices and all candidate collaterals.
+
+    BP26.7: copy_trades.outcome_index written at entry time can be wrong — the
+    legacy fallback stamped 1 for every non-"Yes" outcome name (team names,
+    temperatures, "Up"/"Down"...). A wrong index poisons BOTH settlement
+    classification (a lost trade reads the winning leg's payout → treated as a
+    win) and redemption (positionId mismatch → collateral_unmatched skip loop).
+    This resolver is the ground truth; returns None when nothing matches
+    (foreign/dust token) or the RPC fails.
+    """
+    try:
+        ctf = _ctf()
+        cond_b = _cond_bytes(condition_id)
+        asset = int(token_id)
+        candidates = [PUSD_ADDRESS, USDC_BRIDGED, USDC_NATIVE]
+        wcol = _wrapped_collateral()
+        if wcol:
+            candidates.append(wcol)
+        for idx in (0, 1):
+            coll_id = ctf.functions.getCollectionId(b"\x00" * 32, cond_b, 1 << idx).call()
+            for coll in candidates:
+                pid = int(ctf.functions.getPositionId(
+                    Web3.to_checksum_address(coll), coll_id).call())
+                if pid == asset:
+                    return idx
+        return None
+    except Exception:
+        log.warning("detect_outcome_index_failed", cond=condition_id[:14])
+        return None
+
+
 def redeem_winnings(private_key_enc: str, condition_id: str, neg_risk: bool,
                     outcome_index: int, token_id: str) -> dict:
     """Redeem a resolved winning position into pUSD on the deposit wallet (gasless).
@@ -249,7 +282,16 @@ def redeem_winnings(private_key_enc: str, condition_id: str, neg_risk: bool,
     idx = int(outcome_index)
 
     ctf = _ctf()
+    # BP26.7: detect the collateral by matching the token across BOTH indices,
+    # not just the stored one — a wrong stored outcome_index used to make every
+    # positionId probe miss (→ eternal collateral_unmatched skips).
     coll_id = ctf.functions.getCollectionId(b"\x00" * 32, cond_b, 1 << idx).call()
+    real_idx = detect_outcome_index(condition_id, token_id)
+    if real_idx is not None and real_idx != idx:
+        log.warning("redeem_outcome_index_corrected", cond=condition_id[:14],
+                    stored=idx, real=real_idx)
+        idx = real_idx
+        coll_id = ctf.functions.getCollectionId(b"\x00" * 32, cond_b, 1 << idx).call()
     wcol = _wrapped_collateral()
 
     # 1) neg-risk: token is WrappedCollateral-collateralized.

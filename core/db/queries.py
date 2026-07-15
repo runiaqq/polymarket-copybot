@@ -584,6 +584,29 @@ def get_daily_trade_count(user_id: int) -> int:
     return int(res.count or 0)
 
 
+def get_realized_pnl_rows(user_id: int, since_iso: str | None = None) -> list[dict]:
+    """Settled trades (win/loss/manual close) with booked realized_pnl.
+
+    BP26.7: the /pnl stats used the Data-API /closed-positions feed, where LOST
+    positions never appear (their worthless tokens are never sold or redeemed,
+    so Polymarket keeps them out of "closed") — the daily stats showed a 100%
+    winrate while the ledger held real losses. copy_trades is the honest source:
+    reconcile books losses (-cost), redeems book wins, close_position books
+    manual exits.
+    """
+    sb = get_supabase()
+    q = (
+        sb.table("copy_trades")
+        .select("realized_pnl, resolved_at, result")
+        .eq("user_id", user_id)
+        .not_.is_("realized_pnl", "null")
+        .not_.is_("resolved_at", "null")
+    )
+    if since_iso:
+        q = q.gte("resolved_at", since_iso)
+    return q.execute().data or []
+
+
 def get_daily_realized_pnl(user_id: int) -> float:
     """Sum of realized_pnl for trades settled in the trailing 24 h."""
     sb = get_supabase()

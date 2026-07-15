@@ -103,21 +103,29 @@ def resolve_outcome_name(
     # Tier 3 & 4 — Gamma market data
     if condition_id:
         try:
-            resp = httpx.get(
-                GAMMA_MARKETS_URL,
-                params={"conditionId": condition_id},
-                timeout=8.0,
-                headers=_HEADERS,
-            )
-            resp.raise_for_status()
-            markets = resp.json()
+            # BP26.7: the correct Gamma filter is `condition_ids` — the old
+            # `conditionId` param does not exist, Gamma silently ignored it and
+            # returned the default market list, so Tier 4 grabbed the
+            # groupItemTitle of a completely unrelated market ("New Rihanna
+            # Album" on a Tel-Aviv-temperature win). Resolved markets are also
+            # excluded by Gamma's default filter → retry with closed=true.
+            markets: list = []
+            for extra in ({}, {"closed": "true"}):
+                resp = httpx.get(
+                    GAMMA_MARKETS_URL,
+                    params={"condition_ids": condition_id, **extra},
+                    timeout=8.0,
+                    headers=_HEADERS,
+                )
+                resp.raise_for_status()
+                markets = resp.json()
+                if isinstance(markets, list) and markets:
+                    break
             if isinstance(markets, list) and markets:
                 m = markets[0]
-                # Tier 4 — groupItemTitle (grouped/scalar markets like "Any Other Score")
-                group_title = (m.get("groupItemTitle") or "").strip()
-                if group_title:
-                    return group_title
-                # Tier 3 — outcomes[outcome_index]
+                # Tier 3 — outcomes[outcome_index], when it carries real
+                # information (Up/Down, Over/Under, team names...).
+                name = ""
                 if outcome_index is not None:
                     raw_out = m.get("outcomes") or "[]"
                     try:
@@ -126,10 +134,19 @@ def resolve_outcome_name(
                             if isinstance(raw_out, str)
                             else (raw_out or [])
                         )
-                        if outcome_index < len(outs) and str(outs[outcome_index]).strip():
-                            return str(outs[outcome_index]).strip()
+                        if outcome_index < len(outs):
+                            name = str(outs[outcome_index]).strip()
                     except Exception:
                         pass
+                if name and name.lower() not in ("yes", "no"):
+                    return name
+                # Tier 4 — groupItemTitle: on grouped Yes/No markets ("Any Other
+                # Score", candidate legs) the group title IS the outcome.
+                group_title = (m.get("groupItemTitle") or "").strip()
+                if group_title:
+                    return group_title
+                if name:
+                    return name
         except Exception:
             log.warning("resolve_outcome_gamma_failed", condition_id=(condition_id or "")[:14])
 

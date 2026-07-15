@@ -1021,25 +1021,35 @@ def _pnl_kb(active: str) -> InlineKeyboardMarkup:
 
 
 def _build_pnl(db_user: dict, period: str = "day") -> str:
-    """Real P&L: realized over the chosen period + current unrealized snapshot."""
+    """Real P&L: realized over the chosen period + current unrealized snapshot.
+
+    BP26.7: realized stats come from OUR copy_trades ledger, not the Data-API
+    /closed-positions feed — lost positions never appear there (their worthless
+    tokens are never sold/redeemed), which showed users a fake 100% winrate.
+    """
     import time as _t
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 
     wallet = _trading_wallet(db_user)
-    open_pos, closed = [], []
+    open_pos = []
     if wallet:
         try:
-            from core.polymarket import get_closed_positions
             open_pos = _live_positions(wallet)
-            closed = get_closed_positions(wallet)
         except Exception:
             pass
 
     window = _PNL_WINDOWS.get(period)
-    cutoff = (_t.time() - window) if window else 0
-    period_closed = [c for c in closed if c["timestamp"] >= cutoff]
-    realized = sum(c["realized_pnl"] for c in period_closed)
-    wins = sum(1 for c in period_closed if c["realized_pnl"] > 0)
-    losses = sum(1 for c in period_closed if c["realized_pnl"] < 0)
+    since_iso = (
+        (_dt.now(_tz.utc) - _td(seconds=window)).isoformat() if window else None
+    )
+    try:
+        from core.db import get_realized_pnl_rows
+        period_closed = get_realized_pnl_rows(db_user["id"], since_iso)
+    except Exception:
+        period_closed = []
+    realized = sum(float(c["realized_pnl"] or 0) for c in period_closed)
+    wins = sum(1 for c in period_closed if float(c["realized_pnl"] or 0) > 0)
+    losses = sum(1 for c in period_closed if float(c["realized_pnl"] or 0) < 0)
 
     invested = sum(p["current_value"] for p in open_pos)
     # Compute unrealized P&L robustly from shares × (cur − entry). The API's cashPnl

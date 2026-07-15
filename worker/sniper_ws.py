@@ -201,7 +201,10 @@ class SniperFeed:
                 log.warning("sniper_ws_session_error",
                             error=str(exc)[:200], backoff=backoff)
                 time.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                # BP26.6: cap at 3 s — prod showed hourly silent drops, and a
+                # 30 s backoff made us miss a donor fill (stale after 37 s).
+                # Reconnecting to RTDS is cheap; staying dark is not.
+                backoff = min(backoff * 2, 3)
 
 
 def run_listener() -> None:

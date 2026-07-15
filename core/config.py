@@ -249,6 +249,12 @@ class Settings(BaseSettings):
     sniper_slippage_pct: float = 0.02
     # Absolute entry-price ceiling for sniper entries.
     sniper_max_entry_price: float = 0.97
+    # BP26.6 "patient entry": the donor's own order sweeps the thin book, so the
+    # ask right after his fill is cents higher — but MMs requote within seconds.
+    # Instead of an instant drift-skip, re-read the book for up to this long and
+    # enter the moment the ask returns inside the slippage band.
+    sniper_entry_wait_sec: float = 10.0
+    sniper_entry_poll_sec: float = 0.7
     # Redis once-key TTL for per-market dedup (one entry per market instance).
     sniper_dedup_ttl_sec: int = 900
 
@@ -261,8 +267,9 @@ class Settings(BaseSettings):
     sniper_ws_refresh_donors_sec: int = 60
     # Force a reconnect after this many seconds without ANY frame from the
     # server (the unfiltered orders_matched stream is never quiet for long;
-    # RTDS connections are known to die silently).
-    sniper_ws_silence_reconnect_sec: int = 60
+    # RTDS connections are known to die silently). BP26.6: 25 s — prod showed
+    # hourly silent drops; a 60 s window + 30 s backoff cost a real donor fill.
+    sniper_ws_silence_reconnect_sec: int = 25
 
     # ── Wallet track-record filter (validate the edge before enforcing) ──────────
     # off     = ignore the buyer's history entirely
