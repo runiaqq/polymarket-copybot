@@ -255,6 +255,10 @@ class Settings(BaseSettings):
     # enter the moment the ask returns inside the slippage band.
     sniper_entry_wait_sec: float = 10.0
     sniper_entry_poll_sec: float = 0.7
+    # BP26.8: how many times to re-place a sniper FAK order after the CLOB
+    # rejects it with "no orders found to match" (ask vanished between the
+    # book read and the order hitting the engine).
+    sniper_fak_max_retries: int = 4
     # Redis once-key TTL for per-market dedup (one entry per market instance).
     sniper_dedup_ttl_sec: int = 900
 

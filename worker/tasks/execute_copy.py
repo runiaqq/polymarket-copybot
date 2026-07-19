@@ -589,18 +589,50 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     })
 
     try:
-        result = place_order(
-            private_key_enc=user["wallet_private_key_enc"],
-            api_creds=api_creds,
-            token_id=token_id,
-            side=signal["side"],
-            price=entry_price,
-            size_usdc=size_usdc,
-            tick_size=str(signal.get("tick_size", "0.01")),
-            neg_risk=bool(signal.get("neg_risk", False)),
-            slippage_pct=settings.sniper_slippage_pct if is_sniper else settings.order_slippage_pct,
-            deposit_wallet=deposit_wallet,
-        )
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                result = place_order(
+                    private_key_enc=user["wallet_private_key_enc"],
+                    api_creds=api_creds,
+                    token_id=token_id,
+                    side=signal["side"],
+                    price=entry_price,
+                    size_usdc=size_usdc,
+                    tick_size=str(signal.get("tick_size", "0.01")),
+                    neg_risk=bool(signal.get("neg_risk", False)),
+                    slippage_pct=settings.sniper_slippage_pct if is_sniper else settings.order_slippage_pct,
+                    deposit_wallet=deposit_wallet,
+                )
+                break
+            except Exception as fak_exc:
+                # BP26.8: "no orders found to match with FAK order" — the ask seen
+                # during patient entry vanished before our order hit the CLOB
+                # (donor sweep / MM pull-and-requote). Prod: 21 burned signals in
+                # 3 days. Sniper-only: re-read the book and re-price inside a
+                # short window instead of burning the signal.
+                if (not is_sniper
+                        or "no orders found to match" not in str(fak_exc)
+                        or attempts > settings.sniper_fak_max_retries):
+                    raise
+                time.sleep(settings.sniper_entry_poll_sec)
+                from core.polymarket import get_order_book as _gob
+                try:
+                    b = _gob(token_id)
+                except Exception:
+                    continue
+                ask = float(b.get("best_ask") or 0) if b else 0.0
+                if ask <= 0:
+                    continue
+                if ((band_limit > 0 and ask > band_limit)
+                        or ask > settings.sniper_max_entry_price):
+                    log.info("sniper_fak_retry_drift", user_id=user_id,
+                             ask=round(ask, 4), attempt=attempts)
+                    continue
+                entry_price = ask
+                log.info("sniper_fak_retry", user_id=user_id,
+                         ask=round(ask, 4), attempt=attempts)
 
         order_id = result.get("orderID") or result.get("order_id") or ""
 
@@ -816,7 +848,15 @@ def _notify_signal_only(telegram_id: int, signal: dict) -> None:
 
     try:
         _tg_send(telegram_id, msg, disable_preview=True)
-    except Exception:
+    except Exception as exc:
+        # BP26.8: a user who blocked the bot 403s on EVERY signal fan-out
+        # (prod: 876 error logs / 72 h from two users). Log it once a day per
+        # user as a warning instead of a full traceback per signal.
+        if "403" in str(exc):
+            from core.cache import notify_once
+            if notify_once(f"tg_blocked:{telegram_id}", ttl=86400):
+                log.warning("notify_signal_only_blocked", telegram_id=telegram_id)
+            return
         log.exception("notify_signal_only_failed", telegram_id=telegram_id)
 
 

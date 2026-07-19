@@ -5280,3 +5280,37 @@ groupItemTitle still wins over bare Yes/No on grouped markets.
 sold or redeemed — the API keeps it "open"). **Fix**: realized stats now come from the
 copy_trades ledger (`get_realized_pnl_rows`; losses booked by reconcile, wins by redeem,
 manual exits by close_position). Unrealized/open snapshot still live from Data-API.
+
+## Blueprint 26.8 — Audit Follow-ups (FAK retry, log hygiene) ✅ IMPLEMENTED 2026-07-19
+
+Findings from the 72-h full audit (2026-07-19). Trading core confirmed healthy: sniper
+mirrors donor size in full, delta-drop stop fires, settlements + payouts flow, the
+collateral_unmatched backlog self-healed (18 → 0 stuck; the remaining 5 "stuck" rows were
+genuinely unresolved markets — golf/box-office/football all resolving 2026-07-19).
+
+**1. Sniper FAK burn (21 failed trades / 3 days).** `place_order` FAK died with
+`no orders found to match with FAK order` — the ask seen by the patient-entry loop
+vanished before our order hit the CLOB (donor sweep / MM pull-and-requote), and the
+sniper branch marked the trade failed with no retry. **Fix** (`execute_copy.py`): on that
+specific error, sniper-only, re-read the book and re-place at the fresh ask while it's
+still inside the slippage band + `sniper_max_entry_price`, up to
+`sniper_fak_max_retries` (default 4) attempts spaced `sniper_entry_poll_sec` apart.
+Logs: `sniper_fak_retry` / `sniper_fak_retry_drift`. Non-sniper path unchanged.
+
+**2. Dedup-race noise (`tracked_signal_insert_failed` ×30).** The unique constraint
+`trade_signals_source_tx_hash_key` (23505) rejecting a racing insert is the dedup working
+— but the handler retried without `outcome` (migration-017 fail-safe), failed again, and
+logged a full error traceback. **Fix** (`poll_tracked_wallets.py`): 23505/duplicate-key is
+recognized before the fail-safe retry and skipped quietly (`signal_duplicate_skip`, info).
+No signal is lost — the racing insert already dispatched it.
+
+**3. Blocked-user log spam (`notify_signal_only_failed` ×876).** Two signal-only users
+(7522224802, 566121446) blocked the bot; every fan-out logged a 403 traceback. **Fix**
+(`execute_copy.py::_notify_signal_only`): Telegram 403 now logs one
+`notify_signal_only_blocked` warning per user per day (Redis `notify_once`), no traceback.
+
+**Historic stop-loss case clarified (not a bug today):** the "South Korea knockout" loss
+(-$4.85, trade 714) was opened 2026-06-27 — *before* BP21 shipped the delta-drop rework.
+Price fell 0.17→0.075 within min-hold-era rules, recovered to 0.29, then gapped to ~0 at
+match end. Current stop logic (confirmed by `delta_drop_triggered` → `position_closed`
+events in the same audit window) would have exited near 21:30 UTC.

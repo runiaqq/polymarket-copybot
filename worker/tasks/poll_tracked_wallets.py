@@ -292,7 +292,14 @@ def poll_tracked_wallets() -> dict:
             try:
                 try:
                     row = insert_trade_signal(sig_payload)
-                except Exception:
+                except Exception as ins_exc:
+                    # BP26.8: unique violation on source_tx_hash (23505) is the DB
+                    # dedup doing its job — a racing beat tick (or a repeat whale
+                    # entry into the same market) already inserted and dispatched
+                    # this signal. Benign: skip quietly, don't retry.
+                    if "23505" in str(ins_exc) or "duplicate key" in str(ins_exc):
+                        log.info("signal_duplicate_skip", market=cond[:14])
+                        continue
                     # Fail-safe (§5): if migration 017 (trade_signals.outcome) is
                     # not applied yet, retry without it — the money path must
                     # never go down on a display-only column.
