@@ -60,8 +60,15 @@ def total_equity(
 
     # cost_basis: price each open position at its entry cost in priority order:
     #   1) copy_trades.size_usdc for the matching open trade (true filled cost)
-    #   2) shares × avg_price  (Data-API cost-basis fallback)
-    #   3) current_value       (last-resort mark, only when no cost basis known)
+    #   2) RESOLVED positions (redeemable) not in our open ledger → final value.
+    #      BP26.9: the Data API keeps LOST positions "open" forever (worthless
+    #      tokens are never redeemed), and the avg_price fallback valued that
+    #      dead weight at entry cost — prod: +$140/+$175 of phantom equity per
+    #      user, which inflated the HWM and made Gate 1 see a fully-deployed
+    #      portfolio. A resolved market has a final price; current_value (0 for
+    #      losers, face for winners) is the truth, not the entry cost.
+    #   3) shares × avg_price  (Data-API cost-basis fallback, open markets only)
+    #   4) current_value       (last-resort mark, only when no cost basis known)
     open_cost = 0.0
     for p in open_positions:
         if p.get("shares", 0) <= 0:
@@ -69,6 +76,8 @@ def total_equity(
         token_id = p.get("token_id") or ""
         if token_id and token_id in ledger_cost_by_token:
             open_cost += ledger_cost_by_token[token_id]
+        elif p.get("redeemable"):
+            open_cost += float(p.get("current_value") or 0)
         elif p.get("shares") and p.get("avg_price"):
             open_cost += float(p["shares"]) * float(p["avg_price"])
         else:
@@ -128,6 +137,11 @@ def check_risk_gates(
         tid = p.get("token_id") or ""
         if tid and tid in cost_map:
             return cost_map[tid]
+        # BP26.9: resolved (redeemable) positions outside our ledger are dead
+        # weight — value them at final worth (0 for losers), not entry cost,
+        # so phantom exposure doesn't eat the Gate 1 headroom.
+        if p.get("redeemable"):
+            return float(p.get("current_value") or 0)
         if p.get("shares") and p.get("avg_price"):
             return float(p["shares"]) * float(p["avg_price"])
         return float(p.get("current_value") or p.get("size") or 0)

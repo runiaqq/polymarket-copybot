@@ -464,7 +464,14 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     # Blueprint 17.B: if risk_override_until is in the future the user has
     # explicitly accepted risk until midnight UTC.  Pass daily_pnl=0 so gate 4
     # (daily-loss) does not block new entries for the rest of the day.
-    # Gates 1-3 (exposure / event / drawdown-from-new-baseline) still apply.
+    # BP26.9: the override must ALSO neutralize gate 3 (drawdown). The unlock
+    # handler resets the HWM, but that reset can be undone within minutes: the
+    # monitor pushes the HWM back up from cost-basis equity that still counts
+    # doomed-but-unsettled positions at entry cost, and once those losses settle
+    # the stale HWM re-blocks every entry — silently, for a user who just
+    # explicitly accepted the risk (prod: 7 manual unlocks with zero effect).
+    # Passing hwm=0 makes check_risk_gates use hwm=max(0, equity)=equity →
+    # drawdown=0 for the rest of the UTC day. Gates 1-2 (exposure) still apply.
     concentration_warn: str | None = None
     if not is_sniper:
         try:
@@ -481,9 +488,10 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
                     if _override_exp.tzinfo is None:
                         _override_exp = _override_exp.replace(tzinfo=_tz.utc)
                     if _dt.now(_tz.utc) < _override_exp:
-                        log.debug("risk_gate4_bypassed_override",
+                        log.debug("risk_gates34_bypassed_override",
                                   user_id=user_id, override_until=_override_ts)
                         daily_pnl = 0.0  # gate 4 sees no loss → does not block
+                        hwm = 0.0        # gate 3 sees no drawdown → does not block
             except Exception:
                 pass
             decision = check_risk_gates(

@@ -5314,3 +5314,38 @@ No signal is lost — the racing insert already dispatched it.
 Price fell 0.17→0.075 within min-hold-era rules, recovered to 0.29, then gapped to ~0 at
 match end. Current stop logic (confirmed by `delta_drop_triggered` → `position_closed`
 events in the same audit window) would have exited near 21:30 UTC.
+
+## Blueprint 26.9 — Risk-Override Gate 3 Bypass + Phantom-Equity Fix ✅ IMPLEMENTED 2026-07-20
+
+**Symptom (prod, 2026-07-20):** zero entries for days despite active whales and a healthy
+signal funnel. User pressed «Снять блокировку» 7× (uid 1) / 4× (uid 2) with no effect.
+
+**Root cause chain (three interlocking bugs):**
+1. **Override never bypassed Gate 3.** `execute_copy` honored `risk_override_until` only
+   for gate 4 (`daily_pnl=0`); gate 3 (drawdown) kept blocking per-trade against the stale
+   HWM — silently (BP8 routes pause alerts to the monitor, so the user saw "active").
+2. **Unlock's HWM reset was undone within minutes.** The monitor's HWM update used
+   cost-basis equity that counted doomed-but-unsettled positions at entry cost, pushing
+   the freshly-reset HWM straight back up (251 → 254 on 2026-07-18).
+3. **Phantom equity from Data-API "open" losers.** The Data API keeps LOST positions open
+   forever (worthless tokens are never redeemed). `total_equity`'s `shares×avg_price`
+   fallback valued that dead weight at entry cost: uid 1 showed $254 equity vs $113.6
+   real; uid 2 $253 vs $77.6. When settlements booked the losses, drawdown jumped to
+   55%/69% vs the inflated HWM → Gate 3 blocked everything, forever.
+
+**Fixes:**
+- `execute_copy`: active override now passes `hwm=0` alongside `daily_pnl=0` →
+  `check_risk_gates` computes `hwm=max(0,equity)=equity` → drawdown=0 for the rest of the
+  UTC day (log `risk_gates34_bypassed_override`). Gates 1–2 still apply.
+- `core/risk.py` (`total_equity` + Gate 1 `_position_cost`): resolved (`redeemable`)
+  positions not in our open ledger are valued at `current_value` (0 for losers, face for
+  winners) instead of entry cost — kills phantom equity/exposure at the source.
+- One-time state repair: `equity_hwm` + `realized_baseline` reset to true equity
+  (uid 1 → 113.60, uid 2 → 77.55). NOTE: re-run the reset AFTER deploying, the old
+  monitor code re-inflates the HWM every cycle until restarted.
+
+**Also 2026-07-20:** admin accidentally ran `/refresh`, which deactivated 12 curated
+wallets (`active=false`, soft) and added 2 auto-discovered ones. Restored the 12 via DB
+update (ids 5,6,8,10,11,12,14,16,17,18,19,20); the 2 new ones (Oddscompiler, rambinsky)
+left inactive per user judgment. `/refresh` is soft — recovery is always an
+`active=true` flip, never data loss.
