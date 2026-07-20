@@ -58,17 +58,17 @@ def _onboarding_stage(db_user: dict) -> str:
     """Derive onboarding stage from existing DB fields — no migration required.
 
     fresh  → wallet not yet created
-    demo   → wallet exists but is_signal_only=True (default for new users, BP15)
+    demo   → wallet exists, NOT registered, signals-only (BP15 legacy funnel)
     intent → opted into autotrade but not yet registered on Polymarket
-    active → registered, auto-trading enabled
+    active → registered on Polymarket (BP27: registration happens at creation,
+             so a registered user is never routed back to the demo welcome —
+             the dashboard checklist covers funding / system-on from here)
     """
     if not db_user.get("wallet_address"):
         return "fresh"
-    if db_user.get("is_signal_only", True):
-        return "demo"
-    if not db_user.get("wallet_registered"):
-        return "intent"
-    return "active"
+    if db_user.get("wallet_registered"):
+        return "active"
+    return "demo" if db_user.get("is_signal_only", True) else "intent"
 
 
 def _main_kb(is_paused: bool = False, is_demo: bool = False) -> InlineKeyboardMarkup:
@@ -126,15 +126,63 @@ def _autotrade_gate_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def _funding_steps_kb() -> InlineKeyboardMarkup:
-    """L2 — Funding + register. The deposit address lives only behind this screen."""
+def _funding_steps_kb(registered: bool = False) -> InlineKeyboardMarkup:
+    """L2 — Funding screen. The deposit address lives only behind this screen.
+
+    BP27: users from the new flow are already registered at wallet creation, so
+    their action button is «Включить систему»; legacy demo users still see the
+    register button (their EOA has no deposit wallet yet).
+    """
+    action = (
+        InlineKeyboardButton("🚀 Включить систему", callback_data="system_on")
+        if registered
+        else InlineKeyboardButton("🔐 Зарегистрировать кошелёк", callback_data="register")
+    )
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔐 Зарегистрировать кошелёк", callback_data="register")],
+        [action],
         [
             InlineKeyboardButton("🔄 Проверить баланс", callback_data="wallet_balance"),
             InlineKeyboardButton("💸 Как вывести",      callback_data="onb_withdraw_info"),
         ],
         [InlineKeyboardButton("↩️ Назад", callback_data="onb_autotrade")],
+    ])
+
+
+# ── BP27: explicit wallet-creation onboarding ────────────────────────────────
+
+def _onb_create_kb() -> InlineKeyboardMarkup:
+    """BP27 Screen A — wallet creation is the primary CTA, demo stays available."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Создать мой Polymarket-кошелёк", callback_data="onb_create_wallet")],
+        [InlineKeyboardButton("🎬 Смотреть сигналы (без риска)",   callback_data="onb_signals")],
+        [InlineKeyboardButton("❓ Как это устроено?",              callback_data="onb_how_wallet")],
+    ])
+
+
+def _copy_address_button(addr: str) -> InlineKeyboardButton:
+    """Native tap-to-copy button (Bot API 7.11, PTB >= 21.7).
+
+    On older PTB installs falls back to a callback that sends the address as a
+    <code> message — tapping monospace text in Telegram copies it too.
+    """
+    try:
+        from telegram import CopyTextButton
+        return InlineKeyboardButton("📋 Скопировать адрес кошелька",
+                                    copy_text=CopyTextButton(addr))
+    except ImportError:
+        return InlineKeyboardButton("📋 Скопировать адрес кошелька",
+                                    callback_data="onb_copy_addr")
+
+
+def _wallet_ready_kb(addr: str) -> InlineKeyboardMarkup:
+    """BP27 Screen C keyboard — verify, copy, fund, custody."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Проверить кошелёк в блокчейне",
+                              url=f"https://polygonscan.com/address/{addr}")],
+        [_copy_address_button(addr)],
+        [InlineKeyboardButton("💳 Пополнить мой Polymarket-кошелёк",
+                              callback_data="onb_fund_steps")],
+        [InlineKeyboardButton("❓ Кто управляет кошельком?", callback_data="onb_custody")],
     ])
 
 
@@ -465,8 +513,103 @@ def _onb_withdraw_info_text() -> str:
     )
 
 
-def _funding_steps_text(addr: str) -> str:
+# ── BP27: explicit wallet-creation onboarding texts ──────────────────────────
+
+def _onb_create_text() -> str:
+    """BP27 Screen A — /start for a fresh user: explicit wallet creation."""
+    return (
+        "🧠 <b>Добро пожаловать в PolyMind AI!</b>\n\n"
+        "👛 <b>Создадим ваш торговый кошелёк Polymarket</b>\n\n"
+        "Сначала мы создадим для вас отдельный торговый кошелёк Polymarket в сети "
+        "Polygon. Бот делает это через API-инфраструктуру Polymarket прямо внутри "
+        "Telegram — вам не нужно регистрироваться на сайте и разбираться с "
+        "технической настройкой.\n\n"
+        "После создания у кошелька появится собственный адрес формата 0x… Именно на "
+        "этом адресе будут учитываться ваш торговый баланс, позиции и история "
+        "сделок.\n\n"
+        "Пока вы не нажмёте кнопку «Включить систему», бот не будет совершать сделки."
+    )
+
+
+def _onb_how_wallet_text() -> str:
+    """BP27 Screen B — plain-words explainer behind «Как это устроено?»."""
+    return (
+        "❓ <b>Как это устроено</b>\n\n"
+        "Простыми словами: Telegram-бот здесь работает как удобный интерфейс. Сам "
+        "торговый кошелёк создаётся не во внутреннем балансе PolyMind, а через "
+        "инфраструктуру Polymarket.\n\n"
+        "Когда вы нажимаете кнопку создания, бот отправляет запрос на развёртывание "
+        "отдельного кошелька для вашего профиля. После создания Polymarket-кошелёк "
+        "получает уникальный адрес в сети Polygon.\n\n"
+        "В дальнейшем на этом адресе учитываются ваш торговый баланс, открытые "
+        "позиции и результаты сделок.\n\n"
+        "Само создание кошелька ничего не списывает и не запускает торговлю."
+    )
+
+
+_ONB_CREATING_STAGE1 = (
+    "⏳ <b>Создаём ваш Polymarket-кошелёк</b>\n\n"
+    "Получаем отдельный адрес для вашего профиля…"
+)
+
+_ONB_CREATING_STAGE2 = (
+    "⏳ <b>Создаём ваш Polymarket-кошелёк</b>\n\n"
+    "Адрес получен. Регистрируем кошелёк\n"
+    "в инфраструктуре Polymarket…"
+)
+
+
+def _wallet_ready_text(addr: str, pusd: float, created_str: str) -> str:
+    """BP27 Screen C — the finished wallet card."""
+    return (
+        "✅ <b>Ваш Polymarket-кошелёк готов</b>\n\n"
+        "Это ваш торговый адрес для работы на Polymarket:\n"
+        f"<code>{addr}</code>\n\n"
+        "🌐 Сеть: <b>Polygon</b>\n"
+        f"💵 Баланс: <b>{pusd:.2f} pUSD</b>\n"
+        "🤖 Торговая система: <b>выключена</b>\n"
+        f"🗓 Дата создания: {created_str}\n\n"
+        "Сейчас кошелёк пустой и ничего не делает. Вы можете открыть его адрес в "
+        "блокчейне и убедиться, что для вашего профиля создан отдельный on-chain "
+        "кошелёк.\n\n"
+        "Следующим шагом вы сможете пополнить именно этот кошелёк. После пополнения "
+        "система всё равно останется выключенной, пока вы самостоятельно не "
+        "подтвердите запуск."
+    )
+
+
+def _onb_custody_text() -> str:
+    """BP27 — «Кто управляет кошельком?» explainer."""
+    return (
+        "🔐 <b>Кто управляет кошельком</b>\n\n"
+        "Кошелёк создан для вашего профиля, и средства на нём — ваши.\n\n"
+        "🤖 <b>Сделки.</b> Бот подписывает сделки ключами кошелька, которые хранит "
+        "в зашифрованном виде, — и только после того, как вы нажмёте «Включить "
+        "систему». До этого он не совершит ни одной операции.\n\n"
+        "💸 <b>Вывод.</b> В любой момент кнопкой «💸 Вывод»: USDC уходит на любой "
+        "ваш адрес в сети Polygon, без подтверждений с нашей стороны.\n\n"
+        "🔎 <b>Прозрачность.</b> Кошелёк живёт в блокчейне Polygon — все операции "
+        "видны по его адресу на Polygonscan."
+    )
+
+
+def _funding_steps_text(addr: str, registered: bool = False) -> str:
     """L2 — Only place the deposit address and network instructions appear."""
+    if registered:
+        # BP27: wallet already registered at creation — step 2 is automatic,
+        # the explicit action is enabling the system.
+        return (
+            "💳 <b>Пополнение — 3 шага</b>\n\n"
+            "📬 <b>Ваш адрес для пополнения (USDC, сеть Polygon):</b>\n"
+            f"<code>{addr}</code>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "1️⃣ Отправьте <b>USDC</b> на адрес выше — <b>строго в сети Polygon</b>\n"
+            "2️⃣ Бот сам переведёт средства на торговый баланс (pUSD)\n"
+            "3️⃣ Нажмите <b>🚀 Включить систему</b> — и бот начнёт копировать сделки\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "⚠️ <b>Только сеть Polygon</b> — не Ethereum, не BSC, не Arbitrum!\n"
+            "ℹ️ Пока система выключена, бот не совершает сделок — даже с балансом."
+        )
     return (
         "🚀 <b>Пополнение — 3 шага</b>\n\n"
         "📬 <b>Твой адрес для пополнения (USDC, сеть Polygon):</b>\n"
@@ -731,30 +874,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not db_user.get("wallet_address"):
-        # BP15: silent wallet creation — no address/deposit push on first message.
+        # BP27: explicit wallet creation — no silent key generation on /start.
+        # Keys are generated only when the user taps «Создать мой кошелёк».
         await update.message.reply_text(  # type: ignore[union-attr]
-            "⏳ Создаём твой аккаунт…",
+            _onb_create_text(),
             parse_mode="HTML",
+            reply_markup=_onb_create_kb(),
         )
-        try:
-            wallet = generate_wallet()
-            update_user(tg_user.id, {
-                "wallet_address":         wallet["address"],
-                "wallet_private_key_enc": wallet["private_key_enc"],
-                "is_signal_only":         True,  # BP15: default to demo mode
-            })
-            db_user = get_user_by_telegram_id(tg_user.id) or db_user
-            await update.message.reply_text(  # type: ignore[union-attr]
-                _onboarding_welcome_text(),
-                parse_mode="HTML",
-                reply_markup=_onboarding_kb(),
-            )
-        except Exception:
-            log.exception("wallet_create_failed", telegram_id=tg_user.id)
-            await update.message.reply_text(  # type: ignore[union-attr]
-                "❌ <b>Не удалось создать кошелёк.</b>\n\nПопробуй ещё раз через минуту или обратись в поддержку.",
-                parse_mode="HTML",
-            )
     else:
         # BP15: route by onboarding stage — demo users get the value-first welcome.
         if _onboarding_stage(db_user) == "demo":
@@ -1215,6 +1341,41 @@ def _register_deposit_wallet(telegram_id: int, db_user: dict) -> dict:
     except Exception:
         log.warning("register_wallet_row_sync_failed", user=telegram_id)
     return result
+
+
+async def _show_wallet_card(query, db_user: dict) -> None:
+    """BP27 Screen C — render the finished wallet card (edit in place)."""
+    addr = db_user.get("wallet_address") or ""
+
+    pusd = 0.0
+    try:
+        from core.polygon import get_balances
+        dw = db_user.get("deposit_wallet_address")
+        if dw:
+            pusd = get_balances(dw).get("pusd", 0.0)
+    except Exception:
+        log.warning("wallet_card_balance_read_failed", user_id=db_user.get("id"))
+
+    created_iso = None
+    try:
+        active = get_active_wallet(db_user["id"]) if db_user.get("id") else None
+        created_iso = (active or {}).get("created_at")
+    except Exception:
+        pass
+    created_iso = created_iso or db_user.get("created_at")
+    try:
+        from dateutil.parser import parse as _pdt
+        created_str = _pdt(created_iso).strftime("%d.%m.%Y %H:%M UTC")
+    except Exception:
+        from datetime import datetime, timezone
+        created_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+
+    await query.edit_message_text(
+        _wallet_ready_text(addr, pusd, created_str),
+        parse_mode="HTML",
+        reply_markup=_wallet_ready_kb(addr),
+        disable_web_page_preview=True,
+    )
 
 
 def _create_named_wallet(telegram_id: int, user_id: int, name: str) -> dict:
@@ -1728,7 +1889,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 )
             else:
                 # BP15: demo users return to the value-first welcome, not the full dashboard.
-                if _onboarding_stage(db_user) == "demo":
+                stage = _onboarding_stage(db_user)
+                if stage == "fresh":
+                    # BP27: signals-only user without a wallet yet → creation screen.
+                    await query.edit_message_text(
+                        _onb_create_text(),
+                        parse_mode="HTML",
+                        reply_markup=_onb_create_kb(),
+                    )
+                elif stage == "demo":
                     await query.edit_message_text(
                         _onboarding_welcome_text(),
                         parse_mode="HTML",
@@ -1953,14 +2122,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data == "onb_fund_steps":
         # L2 — the ONLY place the deposit address and network instructions are shown.
         db_user = get_user_by_telegram_id(tg_user.id)
-        if not db_user or not db_user.get("wallet_address"):
+        if not db_user:
             await query.answer("Отправь /start", show_alert=True)
             return
+        if not db_user.get("wallet_address"):
+            # BP27: walletless demo user opted into autotrade — the wallet must
+            # be created first, so route into the explicit creation flow.
+            await query.edit_message_text(
+                _onb_create_text(),
+                parse_mode="HTML",
+                reply_markup=_onb_create_kb(),
+            )
+            return
         addr = db_user["wallet_address"]
+        registered = bool(db_user.get("wallet_registered"))
         await query.edit_message_text(
-            _funding_steps_text(addr),
+            _funding_steps_text(addr, registered),
             parse_mode="HTML",
-            reply_markup=_funding_steps_kb(),
+            reply_markup=_funding_steps_kb(registered),
         )
         return
 
@@ -1972,6 +2151,149 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 [InlineKeyboardButton("✅ Продолжить к пополнению", callback_data="onb_fund_steps")],
                 [InlineKeyboardButton("🏠 Меню",                    callback_data="menu")],
             ]),
+        )
+        return
+
+    # ── BP27: explicit wallet-creation onboarding callbacks ──────────────────
+
+    if data == "onb_how_wallet":
+        await query.edit_message_text(
+            _onb_how_wallet_text(),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Понятно, создать мой кошелёк",
+                                      callback_data="onb_create_wallet")],
+                [InlineKeyboardButton("↩️ Назад", callback_data="onb_back_create")],
+            ]),
+        )
+        return
+
+    if data == "onb_back_create":
+        await query.edit_message_text(
+            _onb_create_text(),
+            parse_mode="HTML",
+            reply_markup=_onb_create_kb(),
+        )
+        return
+
+    if data == "onb_create_wallet":
+        import asyncio
+
+        db_user = get_user_by_telegram_id(tg_user.id) or upsert_user(tg_user.id)
+
+        # Idempotent re-entry: everything already set up → just show the card.
+        if db_user.get("wallet_address") and db_user.get("wallet_registered"):
+            await _show_wallet_card(query, db_user)
+            return
+
+        # Double-tap guard: registration takes up to a minute; a second tap
+        # must not start a parallel run. Lease slightly above the worst case.
+        from core.cache import clear_once, notify_once
+        if not notify_once(f"onb_create:{tg_user.id}", ttl=180):
+            await query.answer("Уже создаём кошелёк — это займёт до минуты…",
+                               show_alert=True)
+            return
+
+        try:
+            # Stage 1 — key pair. Generation is instant; the pause keeps the
+            # staged flow readable instead of flashing three edits at once.
+            await query.edit_message_text(_ONB_CREATING_STAGE1, parse_mode="HTML")
+            if not db_user.get("wallet_address"):
+                wallet = generate_wallet()
+                update_user(tg_user.id, {
+                    "wallet_address":         wallet["address"],
+                    "wallet_private_key_enc": wallet["private_key_enc"],
+                    # System stays OFF until the explicit «Включить систему» tap.
+                    "is_signal_only":         True,
+                })
+                db_user = get_user_by_telegram_id(tg_user.id) or db_user
+            await asyncio.sleep(7)
+
+            # Stage 2 — the real Polymarket registration (deploy + approvals +
+            # CLOB creds, gasless, 30–60 s). to_thread keeps the bot loop alive.
+            await query.edit_message_text(_ONB_CREATING_STAGE2, parse_mode="HTML")
+            await asyncio.to_thread(_register_deposit_wallet, tg_user.id, db_user)
+            db_user = get_user_by_telegram_id(tg_user.id) or db_user
+
+            log.info("onb_wallet_created", user=tg_user.id,
+                     addr=(db_user.get("wallet_address") or "")[:10])
+            await _show_wallet_card(query, db_user)
+        except Exception:
+            log.exception("onb_create_wallet_failed", user=tg_user.id)
+            await query.edit_message_text(
+                "❌ <b>Не удалось создать кошелёк.</b>\n\n"
+                "Такое бывает при высокой нагрузке на сеть. Попробуйте ещё раз "
+                "через минуту — прогресс не потеряется.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔁 Повторить", callback_data="onb_create_wallet")
+                ]]),
+            )
+        finally:
+            clear_once(f"onb_create:{tg_user.id}")
+        return
+
+    if data == "onb_wallet_card":
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user or not db_user.get("wallet_address"):
+            await query.answer("Отправь /start", show_alert=True)
+            return
+        await _show_wallet_card(query, db_user)
+        return
+
+    if data == "onb_copy_addr":
+        # Fallback for PTB < 21.7 (no native copy_text button): send the address
+        # as a monospace message — tapping it in Telegram copies to clipboard.
+        db_user = get_user_by_telegram_id(tg_user.id)
+        addr = (db_user or {}).get("wallet_address")
+        if not addr:
+            await query.answer("Сначала создайте кошелёк — /start", show_alert=True)
+            return
+        await context.bot.send_message(chat_id=tg_user.id,
+                                       text=f"<code>{addr}</code>", parse_mode="HTML")
+        await query.answer("Адрес отправлен сообщением — нажмите на него, чтобы скопировать")
+        return
+
+    if data == "onb_custody":
+        await query.edit_message_text(
+            _onb_custody_text(),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Пополнить кошелёк", callback_data="onb_fund_steps")],
+                [InlineKeyboardButton("↩️ Назад к кошельку", callback_data="onb_wallet_card")],
+            ]),
+        )
+        return
+
+    if data == "system_on":
+        db_user = get_user_by_telegram_id(tg_user.id)
+        if not db_user or not db_user.get("wallet_registered"):
+            await query.answer("Сначала создайте кошелёк — /start", show_alert=True)
+            return
+        update_user(tg_user.id, {"is_signal_only": False, "copy_active": True})
+
+        pusd = 0.0
+        try:
+            from core.polygon import get_balances
+            dw = db_user.get("deposit_wallet_address")
+            if dw:
+                pusd = get_balances(dw).get("pusd", 0.0)
+        except Exception:
+            pass
+        hint = (
+            "" if pusd >= MIN_USDC_READY else
+            "\n\n💳 На торговом балансе пока пусто — пополните кошелёк, "
+            "и бот начнёт копировать сделки."
+        )
+        await query.edit_message_text(
+            "🚀 <b>Торговая система включена</b>\n\n"
+            "Бот будет копировать сделки китов на ваш кошелёк по вашим настройкам. "
+            "Приостановить можно в любой момент: «⚙️ Настройки» → «⏸ Приостановить»."
+            f"{hint}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Главное меню", callback_data="menu")
+            ]]),
         )
         return
 

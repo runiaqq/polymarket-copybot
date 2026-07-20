@@ -5349,3 +5349,47 @@ wallets (`active=false`, soft) and added 2 auto-discovered ones. Restored the 12
 update (ids 5,6,8,10,11,12,14,16,17,18,19,20); the 2 new ones (Oddscompiler, rambinsky)
 left inactive per user judgment. `/refresh` is soft — recovery is always an
 `active=true` flip, never data loss.
+
+## Blueprint 27: Explicit wallet-creation onboarding (2026-07-20)
+
+**Why.** BP15 onboarding silently generated EOA keys on `/start` and hid the real
+Polymarket registration behind a «Зарегистрировать кошелёк» button on the funding
+screen. Users didn't understand that a dedicated on-chain wallet exists for them.
+New flow makes wallet creation an explicit, staged, verifiable act.
+
+**Flow (all in `api/routers/telegram.py`, no DB migration):**
+- `/start` for a user without `wallet_address` → Screen A `_onb_create_text()` with
+  buttons: `✅ Создать мой Polymarket-кошелёк` (`onb_create_wallet`),
+  `🎬 Смотреть сигналы (без риска)` (existing `onb_signals`, secondary),
+  `❓ Как это устроено?` (`onb_how_wallet` → Screen B, back via `onb_back_create`).
+  **No keys are generated on /start anymore.**
+- `onb_create_wallet`: staged edits of one message —
+  1. «Получаем отдельный адрес…» → `generate_wallet()` + save EOA
+     (`is_signal_only=True`), then 7 s perception pause;
+  2. «Регистрируем кошелёк в инфраструктуре Polymarket…» → REAL
+     `_register_deposit_wallet` (deploy + approvals + CLOB creds, 30–60 s) via
+     `asyncio.to_thread` so the bot loop isn't blocked;
+  3. Screen C wallet card (`_show_wallet_card`): EOA address, Polygon, pUSD balance,
+     «Торговая система: выключена», creation date (from active `user_wallets` row).
+  Guards: Redis lease `onb_create:{tg_id}` (ttl 180 s, `notify_once`/`clear_once`)
+  against double-tap; idempotent re-entry (EOA kept, registered user → card);
+  failure → error message + `🔁 Повторить`.
+- Card buttons: Polygonscan URL, `📋 Скопировать адрес` (native `copy_text` /
+  `CopyTextButton`, PTB ≥ 21.7 — requirements bumped; runtime fallback
+  `onb_copy_addr` sends the address as a `<code>` message), `💳 Пополнить` →
+  `onb_fund_steps`, `❓ Кто управляет кошельком?` → `onb_custody` (custody explainer,
+  back via `onb_wallet_card`).
+- Funding screen: `_funding_steps_text/_kb` now take `registered` — registered users
+  see step 3 «🚀 Включить систему» (`system_on`: `is_signal_only=False`,
+  `copy_active=True`, empty-balance hint) instead of the register step; unregistered
+  legacy demo users still get the old `register` button (repair path kept).
+- `_onboarding_stage` reordered: `wallet_registered=True` → `active` regardless of
+  `is_signal_only`, so registered-but-off users land on the dashboard (checklist),
+  never back on the demo welcome. `demo` now means "has EOA, NOT registered,
+  signals-only" (legacy BP15 funnel, unchanged for existing users).
+- Compat: walletless signal-only users (possible post-BP27) tapping
+  «Показать адрес для пополнения» are routed into Screen A; stuck users
+  (EOA yes / deposit no) can tap create — generation is skipped, registration runs.
+
+Deploy: `git pull && docker compose up -d --build api` (image rebuild picks up
+PTB ≥ 21.7 for the copy button; no worker/beat changes).

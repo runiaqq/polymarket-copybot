@@ -17,7 +17,7 @@ dependencies = [
     "pydantic-settings>=2.2.0",
 
     # Telegram
-    "python-telegram-bot>=21.3",
+    "python-telegram-bot>=21.7",
 
     # DB
     "supabase>=2.5.0",
