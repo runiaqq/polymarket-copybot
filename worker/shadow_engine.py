@@ -89,6 +89,22 @@ class ShadowEngine:
         self.entered_conditions: set[str] = set()
         self.db_retry_after = 0.0
         self.last_spot_rx_monotonic = time.monotonic()
+        self._signal_tasks: set[asyncio.Task] = set()
+
+    async def _broadcast_signal(self, text: str) -> None:
+        for chat_id in settings.shadow_signal_telegram_ids:
+            try:
+                await _telegram_send(chat_id, text)
+            except Exception:
+                log.exception("shadow_signal_send_failed", chat_id=chat_id)
+
+    def _spawn_signal(self, text: str) -> None:
+        """Send in the background so the 1s evaluation loop is never blocked."""
+        if not settings.shadow_signal_telegram_ids:
+            return
+        task = asyncio.create_task(self._broadcast_signal(text))
+        self._signal_tasks.add(task)
+        task.add_done_callback(self._signal_tasks.discard)
 
     @staticmethod
     def _window_start(timestamp_sec: int | float) -> int:
@@ -441,6 +457,14 @@ class ShadowEngine:
         self.entered_conditions.add(market.condition_id)
         observation.entered = True
         observation.reason = "entered"
+        side_label = "Up ⬆️" if side == "up" else "Down ⬇️"
+        window_end_utc = datetime.fromtimestamp(market.window_end, tz=timezone.utc)
+        self._spawn_signal(
+            f"🎯 Сигнал: {asset.upper()} {side_label}\n"
+            f"Вход: {fill.effective_price:.3f} | Ставка: ${fill.filled_usdc:.2f}\n"
+            f"Модель: {model_p:.0%} | Edge: {edge:+.1%}\n"
+            f"Окно закрывается в {window_end_utc:%H:%M:%S} UTC"
+        )
         log.info(
             "shadow_virtual_entry",
             asset=asset,
@@ -522,7 +546,10 @@ class ShadowEngine:
         return (
             get_supabase()
             .table("shadow_trades")
-            .select("id,condition_id,token_id,window_end,sim_shares,stake_usdc,fee_usdc")
+            .select(
+                "id,condition_id,token_id,window_end,sim_shares,"
+                "stake_usdc,fee_usdc,asset,side,sim_fill_price"
+            )
             .eq("status", "open")
             .order("window_end")
             .execute()
@@ -552,6 +579,11 @@ class ShadowEngine:
                     "void",
                     0.0,
                     now,
+                )
+                await self._broadcast_signal(
+                    f"⚠️ {str(row.get('asset') or '').upper()} "
+                    f"{str(row.get('side') or '').capitalize()}: "
+                    "рынок не резолвился за 24 часа, сделка аннулирована"
                 )
             return
         outcome_index = await asyncio.to_thread(
@@ -586,6 +618,16 @@ class ShadowEngine:
             "win" if won else "loss",
             pnl,
             now,
+        )
+        cost = stake + fee
+        roi = pnl / cost if cost > 0 else 0.0
+        header = "✅ Победа" if won else "❌ Проигрыш"
+        self._spawn_signal(
+            f"{header}: {str(row.get('asset') or '').upper()} "
+            f"{str(row.get('side') or '').capitalize()}\n"
+            f"Вход: {float(row.get('sim_fill_price') or 0):.3f} | "
+            f"Ставка: ${stake:.2f}\n"
+            f"PnL: ${pnl:+.2f} ({roi:+.1%})"
         )
 
     @staticmethod

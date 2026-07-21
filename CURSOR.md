@@ -5785,6 +5785,13 @@ resolution, report-bucket, and digest timing also have `shadow_*` settings; ther
 are no strategy magic numbers in the service. `shadow_digest_telegram_ids=[]`
 disables Telegram delivery by default.
 
+Real-time signals: `shadow_signal_telegram_ids` (default `[]`) lists chat ids
+that receive a Telegram message the moment a virtual entry is recorded (asset,
+side, fill price, stake, model probability, edge, window end) and again at
+settlement (win/loss with PnL and ROI, or void after 24 h). Entry/settlement
+sends run as fire-and-forget tasks so the 1-second evaluation loop never blocks
+on Telegram.
+
 Do not proceed to live trading until the unchanged BP28 gate is met: at least two
 weeks of shadow data, at least 300 settled virtual trades, net ROI after fees
 above +3%, and better same-period performance than the donor benchmark. Failure

@@ -321,6 +321,8 @@ class Settings(BaseSettings):
     shadow_resolution_poll_sec: float = 60.0
     shadow_resolution_void_after_sec: int = 86400
     shadow_db_retry_sec: float = 30.0
+    # Real-time entry/exit signals for shadow trades (Telegram chat ids).
+    shadow_signal_telegram_ids: list[int] = Field(default_factory=list)
     shadow_digest_telegram_ids: list[int] = Field(default_factory=list)
     shadow_digest_hour_utc: int = 0
     shadow_digest_minute_utc: int = 5
