@@ -24,10 +24,55 @@ from worker.celery_app import celery_app
 log = structlog.get_logger(__name__)
 
 
+def _book_depth(levels: list[dict], price_limit: float, *, asks: bool) -> float:
+    """Return dollar depth through an inclusive ask/bid price limit."""
+    if asks:
+        selected = (level for level in levels if float(level["price"]) <= price_limit)
+    else:
+        selected = (level for level in levels if float(level["price"]) >= price_limit)
+    return sum(float(level["price"]) * float(level["size"]) for level in selected)
+
+
+def _log_sniper_book_snapshot(token: str, cond: str) -> None:
+    """Best-effort capacity snapshot; signal dispatch must never depend on it."""
+    try:
+        from core.polymarket import get_order_book
+
+        book = get_order_book(token)
+        if not book:
+            return
+        best_bid = float(book.get("best_bid") or 0)
+        best_ask = float(book.get("best_ask") or 0)
+        if best_bid <= 0 or best_ask <= 0:
+            return
+
+        asks = book.get("asks") or []
+        bids = book.get("bids") or []
+        spread = best_ask - best_bid
+        log.info(
+            "sniper_book_snapshot",
+            market=cond,
+            token=token,
+            best_bid=round(best_bid, 6),
+            best_ask=round(best_ask, 6),
+            spread=round(spread, 6),
+            spread_pct=round(spread / best_ask, 6),
+            ask_depth_2=round(_book_depth(asks, best_ask * 1.02, asks=True), 4),
+            ask_depth_5=round(_book_depth(asks, best_ask * 1.05, asks=True), 4),
+            ask_depth_10=round(_book_depth(asks, best_ask * 1.10, asks=True), 4),
+            bid_depth_2=round(_book_depth(bids, best_bid * 0.98, asks=False), 4),
+            bid_depth_5=round(_book_depth(bids, best_bid * 0.95, asks=False), 4),
+            bid_depth_10=round(_book_depth(bids, best_bid * 0.90, asks=False), 4),
+        )
+    except Exception:
+        log.warning("sniper_book_snapshot_failed", market=cond[:14], token=token[:18])
+
+
 def _sniper_subscribers(allowed_tg_ids: list[int]) -> list[dict]:
     """Allowlisted users with an active paid sub. Deliberately IGNORES
     copy_paused_until (BP26: only the 30% stop is kept as risk control)."""
     from datetime import datetime, timezone
+
     from core.db import get_supabase
 
     sb = get_supabase()
@@ -78,6 +123,8 @@ def fire_sniper_signal(addr: str, allowed: list[int], cond: str, token: str,
     vwap = (notional / size) if size > 0 else 0.0
     if size <= 0 or vwap <= 0:
         return False
+
+    _log_sniper_book_snapshot(token, cond)
 
     f0 = fills[0]
     outcome = (meta.get("token_outcomes") or {}).get(token) or f0.get("outcome") or ""

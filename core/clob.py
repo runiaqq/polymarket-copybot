@@ -3,8 +3,12 @@ Polymarket CLOB v2 client wrapper.
 Handles API credential generation and order placement per user.
 """
 
-import structlog
+from collections.abc import Mapping
+from dataclasses import asdict, is_dataclass
+
 import httpx
+import structlog
+
 from core.wallet import decrypt_key
 
 log = structlog.get_logger(__name__)
@@ -35,6 +39,21 @@ _ADAPTER_SPENDERS = (CTF_COLLATERAL_ADAPTER, NEG_RISK_CTF_COLLATERAL_ADAPTER)
 
 _ERC20_APPROVE_ABI = [{"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}]
 _ERC1155_APPROVAL_ABI = [{"inputs":[{"name":"operator","type":"address"},{"name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"}]
+
+
+def _response_dict(response) -> dict:
+    """Preserve every field returned by the SDK, including non-dict models."""
+    if isinstance(response, dict):
+        return dict(response)
+    if isinstance(response, Mapping):
+        return dict(response)
+    if is_dataclass(response):
+        return asdict(response)
+    if hasattr(response, "model_dump"):
+        return response.model_dump()
+    if hasattr(response, "__dict__"):
+        return dict(vars(response))
+    return {"raw": str(response)}
 
 
 def _make_client(private_key: str, api_creds: dict | None = None, funder: str | None = None):
@@ -253,7 +272,7 @@ def sell_position(
         )
         log.info("sell_placed", token=token_id[:20], shares=shares,
                  ref_price=price, worst_price=worst_price, neg_risk=neg_risk)
-        return resp if isinstance(resp, dict) else {"status": "ok", "raw": str(resp)}
+        return _response_dict(resp)
     except Exception:
         log.exception("sell_order_failed", token_id=token_id[:20])
         raise
@@ -328,7 +347,7 @@ def place_order(
             size_usdc=size_usdc,
             neg_risk=neg_risk,
         )
-        return resp if isinstance(resp, dict) else {"status": "ok", "raw": str(resp)}
+        return _response_dict(resp)
     except Exception:
         log.exception("place_order_failed", token_id=token_id[:20], side=side)
         raise

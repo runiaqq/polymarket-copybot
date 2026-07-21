@@ -247,6 +247,8 @@ class Settings(BaseSettings):
     sniper_fetch_limit: int = 10
     # Max slippage vs the donor's fill price (skip entry on drift beyond this).
     sniper_slippage_pct: float = 0.02
+    # Never enter after the ask falls more than this below the donor fill.
+    sniper_max_below_pct: float = 0.04
     # Absolute entry-price ceiling for sniper entries.
     sniper_max_entry_price: float = 0.97
     # BP26.6 "patient entry": the donor's own order sweeps the thin book, so the
@@ -259,6 +261,17 @@ class Settings(BaseSettings):
     # rejects it with "no orders found to match" (ask vanished between the
     # book read and the order hitting the engine).
     sniper_fak_max_retries: int = 4
+    # Reserve balance for CLOB taker-fee validation when a stake hits free pUSD.
+    # Applies to every entry path, not only sniper markets.
+    sniper_fee_headroom_pct: float = 0.03
+    # Retry only the post-fill ledger write; never re-place a matched order.
+    trade_ledger_update_attempts: int = 3
+    trade_ledger_update_retry_sec: float = 0.2
+    # Sniper stake is a fraction of free pUSD, bounded by this dollar cap.
+    sniper_stake_frac: float = 0.10
+    sniper_stake_cap_usdc: float = 50.0
+    # Soft warning only; low balance never blocks a sniper entry.
+    sniper_recommended_balance_usdc: float = 200.0
     # Redis once-key TTL for per-market dedup (one entry per market instance).
     sniper_dedup_ttl_sec: int = 900
 

@@ -5609,3 +5609,73 @@ cannot even measure whether any strategy works.
    yes, tens of dollars within ±2%. Between signals MMs requote quickly. Capacity for
    more users comes from more markets and sharding, not from deeper single books;
    Phase 0.3 logging turns this from estimate into measurement.
+
+## Blueprint 29: Ledger truth and sniper leak stop (2026-07-21)
+
+Implements BP28 phases 0 and 1. The money-path changes require a **worker + beat
+image rebuild**. Migration 020 and the historical repair remain operator actions.
+
+### 29.1 Order-response accounting and fees
+
+Installed `py-clob-client-v2==1.0.1` and the CLOB V2 OpenAPI were checked before
+implementation. `create_and_post_market_order` returns the raw `SendOrderResponse`
+dict. For a BUY, matched `makingAmount` is pUSD spent and `takingAmount` is outcome
+shares received; both are fixed-math integer strings with 6 decimals. The entry path
+now decodes those exact fields, computes `fill_price = making / taking`, and uses the
+existing 5%/90% none/partial/full thresholds. Non-dict SDK responses are serialized
+without dropping fields.
+
+The old Data-API `_confirm_fill` is fallback-only when either response amount is
+missing/zero. Its cost is now `shares × avg_price`; `current_value` is never used.
+Migration `020_trade_fee.sql` adds nullable `copy_trades.fee_usdc`. The documented
+V2 response has no actual-fee field, so current orders log `order_fee_estimate` and
+leave the column NULL; recognized future fee fields are stored with a pre-migration
+retry that omits only `fee_usdc`.
+
+Every balance-bound stake now reserves `sniper_fee_headroom_pct=0.03`, including
+default (non-sniper) copying. This prevents a max-balance order from failing CLOB's
+separate fee-coverage check.
+
+### 29.2 Sniper entry, sizing, and capacity logs
+
+The patient-entry loop and nested FAK retry were replaced by one deadline-bound loop.
+It enters only when best ask is inside the inclusive band
+`[donor × (1-sniper_max_below_pct), donor × (1+sniper_slippage_pct)]` and below
+`sniper_max_entry_price`. Asks below the band are treated as a falling market and
+waited out, not bought. A vanished FAK ask consumes the same
+`sniper_fak_max_retries` budget and returns to the same book loop. Timeout logs
+`sniper_skip reason=price_out_of_band` plus `direction=below|above|no_book`.
+
+Sniper stakes no longer mirror donor dollars. `calculate_sniper_stake` starts from
+`sniper_stake_frac=0.10` of free pUSD, applies the $5 exchange floor, then caps by
+`sniper_stake_cap_usdc=50`, ask depth inside the donor band, and fee-adjusted free
+balance. Donor size remains in the signal notification only. Users below
+`sniper_recommended_balance_usdc=200` get a non-blocking Russian warning at most
+once per 24 hours through `notify_once`.
+
+`fire_sniper_signal` now emits one `sniper_book_snapshot` per claimed signal:
+best bid/ask, spread, ask dollar depth at +2/+5/+10%, and bid dollar depth at
+-2/-5/-10%. Snapshot failures are swallowed and never block fan-out.
+
+New settings:
+- `sniper_max_below_pct=0.04`
+- `sniper_fee_headroom_pct=0.03`
+- `trade_ledger_update_attempts=3`
+- `trade_ledger_update_retry_sec=0.2`
+- `sniper_stake_frac=0.10`
+- `sniper_stake_cap_usdc=50`
+- `sniper_recommended_balance_usdc=200`
+
+### 29.3 Historical repair
+
+`scripts/repair_sniper_ledger.py` reads all settled sniper rows and authenticates a
+CLOB V2 client with the signing wallet recorded on each trade. It queries
+`get_trades(TradeParams(asset_id=token_id))`, groups BUY fills by taker order, and
+matches only an unambiguous token/order/time group. It recomputes cost as
+`Σ(size × price)`, shares as `Σ(size)`, then PnL as `shares-cost` for wins or
+`-cost` for losses. Missing or ambiguous history is reported and skipped.
+
+Default mode is read-only and prints every `было -> станет` change. `--apply` writes
+only `size_usdc`, `shares`, and `realized_pnl`; it must be run manually after review.
+Operator sequence: rebuild worker/beat, apply migration 020, run the repair dry-run
+again, then explicitly decide whether to run `--apply`.

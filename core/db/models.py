@@ -85,6 +85,7 @@ class CopyTrade(Base):
     status: Mapped[TradeStatus] = mapped_column(String(16), default=TradeStatus.PENDING)
     size_usdc: Mapped[float] = mapped_column(Float)
     fill_price: Mapped[float | None] = mapped_column(Float)
+    fee_usdc: Mapped[float | None] = mapped_column(Float)
     pnl_usdc: Mapped[float | None] = mapped_column(Float)
     error_msg: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
