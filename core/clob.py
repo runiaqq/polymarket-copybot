@@ -56,6 +56,15 @@ def _response_dict(response) -> dict:
     return {"raw": str(response)}
 
 
+def _checked_order_response(response) -> dict:
+    """Serialize the SDK response and raise on an explicit CLOB rejection."""
+    payload = _response_dict(response)
+    if payload.get("success") is False:
+        message = payload.get("errorMsg") or payload.get("error") or "CLOB rejected order"
+        raise RuntimeError(str(message))
+    return payload
+
+
 def _make_client(private_key: str, api_creds: dict | None = None, funder: str | None = None):
     """Build a CLOB v2 client.
 
@@ -272,7 +281,7 @@ def sell_position(
         )
         log.info("sell_placed", token=token_id[:20], shares=shares,
                  ref_price=price, worst_price=worst_price, neg_risk=neg_risk)
-        return _response_dict(resp)
+        return _checked_order_response(resp)
     except Exception:
         log.exception("sell_order_failed", token_id=token_id[:20])
         raise
@@ -347,7 +356,7 @@ def place_order(
             size_usdc=size_usdc,
             neg_risk=neg_risk,
         )
-        return _response_dict(resp)
+        return _checked_order_response(resp)
     except Exception:
         log.exception("place_order_failed", token_id=token_id[:20], side=side)
         raise

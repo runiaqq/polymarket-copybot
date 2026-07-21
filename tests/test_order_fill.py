@@ -20,6 +20,37 @@ def test_extract_buy_fill_decodes_fixed_six_buy_amounts() -> None:
     assert fill.status == "full"
 
 
+def test_extract_buy_fill_decodes_human_unit_decimal_strings() -> None:
+    fill = extract_buy_fill(
+        {
+            "status": "matched",
+            "makingAmount": "9.999999",
+            "takingAmount": "14.925372",
+        },
+        intended_usdc=10.0,
+    )
+
+    assert fill is not None
+    assert fill.filled_usdc == pytest.approx(9.999999)
+    assert fill.shares == pytest.approx(14.925372)
+    assert fill.fill_price == pytest.approx(0.67, rel=1e-4)
+
+
+def test_extract_buy_fill_treats_small_integer_as_human_units() -> None:
+    fill = extract_buy_fill(
+        {
+            "status": "matched",
+            "makingAmount": "10",
+            "takingAmount": "12.5",
+        },
+        intended_usdc=10.0,
+    )
+
+    assert fill is not None
+    assert fill.filled_usdc == pytest.approx(10.0)
+    assert fill.shares == pytest.approx(12.5)
+
+
 @pytest.mark.parametrize(
     ("making_amount", "expected"),
     [
@@ -34,7 +65,11 @@ def test_extract_buy_fill_uses_existing_fill_thresholds(
     expected: str,
 ) -> None:
     fill = extract_buy_fill(
-        {"makingAmount": making_amount, "takingAmount": "10000000"},
+        {
+            "status": "matched",
+            "makingAmount": making_amount,
+            "takingAmount": "10000000",
+        },
         intended_usdc=10.0,
     )
 
@@ -43,4 +78,18 @@ def test_extract_buy_fill_uses_existing_fill_thresholds(
 
 
 def test_extract_buy_fill_returns_none_without_both_amounts() -> None:
-    assert extract_buy_fill({"makingAmount": "5000000"}, 5.0) is None
+    assert extract_buy_fill(
+        {"status": "matched", "makingAmount": "5000000"},
+        5.0,
+    ) is None
+
+
+def test_extract_buy_fill_returns_none_for_non_matched_status() -> None:
+    assert extract_buy_fill(
+        {
+            "status": "unmatched",
+            "makingAmount": "10",
+            "takingAmount": "12.5",
+        },
+        10.0,
+    ) is None

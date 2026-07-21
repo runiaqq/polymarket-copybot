@@ -5620,10 +5620,12 @@ image rebuild**. Migration 020 and the historical repair remain operator actions
 Installed `py-clob-client-v2==1.0.1` and the CLOB V2 OpenAPI were checked before
 implementation. `create_and_post_market_order` returns the raw `SendOrderResponse`
 dict. For a BUY, matched `makingAmount` is pUSD spent and `takingAmount` is outcome
-shares received; both are fixed-math integer strings with 6 decimals. The entry path
-now decodes those exact fields, computes `fill_price = making / taking`, and uses the
-existing 5%/90% none/partial/full thresholds. Non-dict SDK responses are serialized
-without dropping fields.
+shares received. Installed 1.0.1 returns human-unit decimal strings in production
+(`"9.999999"`), while the OpenAPI examples show fixed-6 integer strings; the parser
+supports both representations and only trusts `status="matched"`. It computes
+`fill_price = making / taking` and uses the existing 5%/90% none/partial/full
+thresholds. Non-dict SDK responses are serialized without dropping fields, and an
+explicit `success=false` raises instead of being treated as a placed order.
 
 The old Data-API `_confirm_fill` is fallback-only when either response amount is
 missing/zero. Its cost is now `shares × avg_price`; `current_value` is never used.

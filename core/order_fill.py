@@ -29,12 +29,26 @@ def fill_status(filled_usdc: float, intended_usdc: float) -> str:
 
 def extract_buy_fill(response: dict[str, Any], intended_usdc: float) -> BuyFill | None:
     """Read exact BUY cost and shares from a CLOB V2 SendOrderResponse."""
-    filled_usdc = _fixed_six(response.get("makingAmount") or response.get("making_amount"))
-    shares = _fixed_six(response.get("takingAmount") or response.get("taking_amount"))
+    if str(response.get("status") or "").lower() != "matched":
+        return None
+
+    making_raw = _decimal(response.get("makingAmount") or response.get("making_amount"))
+    taking_raw = _decimal(response.get("takingAmount") or response.get("taking_amount"))
+    if making_raw <= 0 or taking_raw <= 0:
+        return None
+
+    # py-clob-client-v2 1.0.1 production responses use human-unit decimal
+    # strings (for example "9.999999"). The current OpenAPI examples show
+    # fixed-6 integer strings. Detect the representation from the BUY cost,
+    # which cannot legitimately exceed the requested amount by orders of magnitude.
+    human_limit = Decimal(str(max(intended_usdc * 2.0, 1.0)))
+    scale = Decimal(1) if making_raw <= human_limit else FIXED_MATH_SCALE
+    filled_usdc = float(making_raw / scale)
+    shares = float(taking_raw / scale)
     if filled_usdc <= 0 or shares <= 0:
         return None
 
-    fee_usdc = _optional_fee(response)
+    fee_usdc = _optional_fee(response, scale)
     return BuyFill(
         filled_usdc=filled_usdc,
         shares=shares,
@@ -44,20 +58,20 @@ def extract_buy_fill(response: dict[str, Any], intended_usdc: float) -> BuyFill 
     )
 
 
-def _fixed_six(value: Any) -> float:
-    """Decode CLOB fixed-math integer strings with six decimal places."""
+def _decimal(value: Any) -> Decimal:
+    """Parse an order-response amount without assuming its wire representation."""
     if value in (None, ""):
-        return 0.0
+        return Decimal(0)
     try:
-        return float(Decimal(str(value)) / FIXED_MATH_SCALE)
+        return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
-        return 0.0
+        return Decimal(0)
 
 
-def _optional_fee(response: dict[str, Any]) -> float | None:
+def _optional_fee(response: dict[str, Any], scale: Decimal) -> float | None:
     """Decode a future/extended response fee field when the API supplies one."""
     for key in ("feeAmount", "fee_amount", "feeUSDC", "fee_usdc"):
         if response.get(key) not in (None, ""):
-            fee = _fixed_six(response[key])
+            fee = float(_decimal(response[key]) / scale)
             return fee if fee >= 0 else None
     return None
