@@ -2,13 +2,63 @@ import pytest
 
 from core.shadow_model import (
     EwmaVolatility,
+    active_entry_variants,
+    build_entry_variants,
     fee_usdc,
     probability_up,
     walk_order_book,
 )
 
-
 MODEL_ARGS = {"sigma_floor": 1e-6, "z_cap": 8.0}
+
+
+def test_build_entry_variants_creates_full_and_adjacent_buckets() -> None:
+    variants = build_entry_variants(
+        20.0,
+        120.0,
+        [20.0, 30.0, 60.0, 90.0, 120.0],
+    )
+
+    assert variants == [
+        ("full", 20.0, 120.0),
+        ("t20-30", 20.0, 30.0),
+        ("t30-60", 30.0, 60.0),
+        ("t60-90", 60.0, 90.0),
+        ("t90-120", 90.0, 120.0),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("time_left", "expected_names"),
+    [
+        (19.999, []),
+        (20.0, ["full", "t20-30"]),
+        (30.0, ["full", "t20-30", "t30-60"]),
+        (45.0, ["full", "t30-60"]),
+        (60.0, ["full", "t30-60", "t60-90"]),
+        (90.0, ["full", "t60-90", "t90-120"]),
+        (120.0, ["full", "t90-120"]),
+        (120.001, []),
+    ],
+)
+def test_active_entry_variants_use_inclusive_boundaries(
+    time_left: float,
+    expected_names: list[str],
+) -> None:
+    variants = build_entry_variants(
+        20.0,
+        120.0,
+        [20.0, 30.0, 60.0, 90.0, 120.0],
+    )
+
+    active = active_entry_variants(variants, time_left)
+
+    assert [variant[0] for variant in active] == expected_names
+
+
+def test_build_entry_variants_rejects_unsorted_edges() -> None:
+    with pytest.raises(ValueError, match="strictly ascending"):
+        build_entry_variants(20.0, 120.0, [20.0, 60.0, 30.0])
 
 
 def test_probability_is_symmetric_at_open_price() -> None:

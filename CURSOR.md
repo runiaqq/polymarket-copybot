@@ -5753,7 +5753,7 @@ cost, consistent with the 1.2–2.0% production estimates.
   the fee at every level. Entry requires
   `model_p - effective_price - fee_per_share >= shadow_min_edge` and effective
   price at or below the ceiling. A unique DB index plus a pre-insert lookup allows
-  at most one virtual entry per condition.
+  at most one virtual entry per condition and entry-time variant.
 - Every completed asset/window emits one `shadow_window` log with the best
   observed edge, model probability, ask, entry flag, and skip reason. Entries and
   settlements have their own structured records.
@@ -5763,12 +5763,14 @@ cost, consistent with the 1.2–2.0% production estimates.
   `-stake-fee` on a loss. Rows still unresolved after the configurable 24-hour
   limit become void with zero PnL.
 - `scripts/shadow_report.py` reports count, winrate, gross/net PnL and ROI, asset,
-  edge, and entry-time buckets. It resolves same-period BTC donor signals from
-  `trade_signals` on-chain and reports their virtual hold-to-resolution result at
-  donor prices with the same fee curve.
+  edge, and entry-time buckets for the canonical `full` variant. It also compares
+  all entry-time variants overall and by strike distance. The same-period BTC
+  donor benchmark is resolved from `trade_signals` on-chain and reported at donor
+  prices with the same fee curve.
 
-Migration `021_shadow_trades.sql` owns the isolated ledger. Apply it manually
-before starting the service. The service is started only with:
+Migrations `021_shadow_trades.sql` and `022_shadow_variants.sql` own the isolated
+ledger and variant uniqueness. Apply them manually before starting the service.
+The service is started only with:
 
 ```
 docker compose up -d --build shadow
@@ -5796,3 +5798,20 @@ Do not proceed to live trading until the unchanged BP28 gate is met: at least tw
 weeks of shadow data, at least 300 settled virtual trades, net ROI after fees
 above +3%, and better same-period performance than the donor benchmark. Failure
 means recalibrating the model in shadow, not enabling the money path.
+
+### 30.4 BP30.1 parallel entry-time variants
+
+Each five-minute condition can now record one independent virtual trade per
+entry-time variant. `full` remains the canonical policy and keeps the unchanged
+inclusive `[shadow_entry_min_sec, shadow_entry_max_sec]` range. Adjacent pairs in
+`shadow_variant_edges_sec` define research buckets; the default edges
+`[20, 30, 60, 90, 120]` produce `t20-30`, `t30-60`, `t60-90`, and `t90-120`.
+Every variant enters on the first eligible one-second tick whose edge clears the
+same threshold. Boundary seconds are inclusive for both adjacent buckets.
+
+The probability, side, and CLOB walk are computed once per asset/tick and shared
+by all active variants. Deduplication is by `(condition_id, variant)`, and each
+row settles independently. Only `full` emits Telegram entry/settlement messages
+and contributes to the daily digest, the main report sections, donor comparison,
+and the unchanged BP28 Phase 2 gate (≥300 settled trades and net ROI above +3%).
+Research variants are silent and appear only in the report's comparative section.

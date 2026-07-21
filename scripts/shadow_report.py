@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import math
 from collections import defaultdict
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
-from typing import Callable
 
 from core.config import settings
 from core.db.session import get_supabase
@@ -14,7 +15,7 @@ from core.relayer import (
     get_payout_numerator,
     is_condition_resolved,
 )
-from core.shadow_model import fee_usdc
+from core.shadow_model import build_entry_variants, fee_usdc
 
 DONOR = "0xf7f20c0f7e93a745d0cb064f5f62850d7b30d881"
 PAGE_SIZE = 1000
@@ -31,12 +32,22 @@ def _parse_args() -> argparse.Namespace:
 def _as_utc(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(
+            tzinfo=timezone.utc  # noqa: UP017 - production currently runs Python 3.10.
+        )
+    return parsed.astimezone(
+        timezone.utc  # noqa: UP017 - production currently runs Python 3.10.
+    )
 
 
 def _period(args: argparse.Namespace) -> tuple[datetime, datetime]:
-    end = _as_utc(args.until) if args.until else datetime.now(timezone.utc)
+    end = (
+        _as_utc(args.until)
+        if args.until
+        else datetime.now(
+            timezone.utc  # noqa: UP017 - production currently runs Python 3.10.
+        )
+    )
     start = _as_utc(args.since) if args.since else end - timedelta(days=args.days)
     if start >= end:
         raise ValueError("--since must be earlier than --until")
@@ -62,7 +73,8 @@ def _shadow_rows(start: datetime, end: datetime) -> list[dict]:
             sb.table("shadow_trades")
             .select(
                 "asset,status,sim_shares,stake_usdc,fee_usdc,pnl_usdc,"
-                "edge,time_left_sec,entered_at"
+                "edge,time_left_sec,entered_at,variant,sim_fill_price,"
+                "model_p,spot,open_price"
             )
             .gte("entered_at", start.isoformat())
             .lt("entered_at", end.isoformat())
@@ -134,6 +146,25 @@ def _print_stats(label: str, rows: list[dict]) -> None:
     )
 
 
+def _print_variant_stats(label: str, rows: list[dict]) -> None:
+    settled = [row for row in rows if row.get("status") in {"win", "loss"}]
+    stats = _stats(settled)
+    average_fill = (
+        sum(float(row.get("sim_fill_price") or 0) for row in settled) / len(settled)
+        if settled
+        else 0.0
+    )
+    average_model_p = (
+        sum(float(row.get("model_p") or 0) for row in settled) / len(settled) if settled else 0.0
+    )
+    print(
+        f"{label:<18} n={int(stats['count']):4d}  "
+        f"WR={stats['winrate']:6.1%}  price={average_fill:.3f}  "
+        f"model_p={average_model_p:6.1%}  "
+        f"net=${stats['net']:+9.2f} ({stats['net_roi']:+6.1%})"
+    )
+
+
 def _bucket_label(value: float, boundaries: list[float], unit: str = "") -> str:
     ordered = sorted(boundaries)
     if not ordered:
@@ -157,6 +188,50 @@ def _print_breakdown(
     print(f"\n{title}")
     for label in sorted(grouped):
         _print_stats(label, grouped[label])
+
+
+def _strike_distance_bucket(row: dict) -> str:
+    spot = float(row.get("spot") or 0)
+    open_price = float(row.get("open_price") or 0)
+    if spot <= 0 or open_price <= 0:
+        return "unknown"
+    distance_bps = abs(math.log(spot / open_price)) * 10_000
+    return _bucket_label(
+        distance_bps,
+        settings.shadow_report_strike_bins_bps,
+        "bp",
+    )
+
+
+def _print_variant_breakdown(rows: list[dict]) -> None:
+    configured = build_entry_variants(
+        settings.shadow_entry_min_sec,
+        settings.shadow_entry_max_sec,
+        settings.shadow_variant_edges_sec,
+    )
+    configured_names = [variant[0] for variant in configured]
+    observed_names = {str(row.get("variant") or "full") for row in rows}
+    variant_names = configured_names + sorted(observed_names - set(configured_names))
+
+    print("\nВарианты времени входа")
+    for variant_name in variant_names:
+        variant_rows = [row for row in rows if str(row.get("variant") or "full") == variant_name]
+        _print_variant_stats(variant_name, variant_rows)
+
+    print("\nВарианты по расстоянию до страйка")
+    for variant_name in variant_names:
+        variant_rows = [
+            row
+            for row in rows
+            if str(row.get("variant") or "full") == variant_name
+            and row.get("status") in {"win", "loss"}
+        ]
+        grouped: dict[str, list[dict]] = defaultdict(list)
+        for row in variant_rows:
+            grouped[_strike_distance_bucket(row)].append(row)
+        print(f"  {variant_name}")
+        for label in sorted(grouped):
+            _print_variant_stats(label, grouped[label])
 
 
 def _donor_benchmark(rows: list[dict]) -> list[dict]:
@@ -212,12 +287,13 @@ def main() -> None:
     args = _parse_args()
     start, end = _period(args)
     rows = _shadow_rows(start, end)
-    settled = [row for row in rows if row.get("status") in {"win", "loss"}]
-    open_count = sum(1 for row in rows if row.get("status") == "open")
-    void_count = sum(1 for row in rows if row.get("status") == "void")
+    full_rows = [row for row in rows if str(row.get("variant") or "full") == "full"]
+    settled = [row for row in full_rows if row.get("status") in {"win", "loss"}]
+    open_count = sum(1 for row in full_rows if row.get("status") == "open")
+    void_count = sum(1 for row in full_rows if row.get("status") == "void")
 
     print(f"Период: {start.isoformat()} — {end.isoformat()}")
-    print(f"Shadow: всего {len(rows)}, open {open_count}, void {void_count}")
+    print(f"Shadow full: всего {len(full_rows)}, open {open_count}, void {void_count}")
     _print_stats("ВСЕГО SHADOW", settled)
     _print_breakdown("По активам", settled, lambda row: str(row.get("asset") or "?").upper())
     _print_breakdown(
@@ -237,6 +313,7 @@ def main() -> None:
             "s",
         ),
     )
+    _print_variant_breakdown(rows)
 
     donor_signals = _donor_rows(start, end)
     donor = _donor_benchmark(donor_signals)

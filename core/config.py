@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str
 
-    # Wallet encryption (Fernet key — generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+    # Wallet encryption (Fernet key). Generate with cryptography.fernet.Fernet.generate_key().
     encryption_key: str
 
     # Privy (legacy — kept for reference, not used for new wallets)
@@ -121,8 +121,8 @@ class Settings(BaseSettings):
     # been ruled out. Recycles capital instead of waiting for a $0 resolution.
     #
     # Percentage TP/SL are disabled (set to unreachable values).
-    take_profit_pct: float = 99.0   # disabled — hold to resolution
-    stop_loss_pct: float = 99.0     # disabled — use delta_drop_stop_pct instead
+    take_profit_pct: float = 99.0  # disabled — hold to resolution
+    stop_loss_pct: float = 99.0  # disabled — use delta_drop_stop_pct instead
     # Residual absolute floor (harmless no-op in normal operation — book is empty
     # by the time price hits 0.07, but kept as a last-resort safety net).
     hard_stop_abs_price: float = 0.07
@@ -294,6 +294,9 @@ class Settings(BaseSettings):
     shadow_assets: list[str] = Field(default_factory=lambda: ["btc", "eth", "sol", "xrp"])
     shadow_entry_min_sec: float = 20.0
     shadow_entry_max_sec: float = 120.0
+    shadow_variant_edges_sec: list[float] = Field(
+        default_factory=lambda: [20.0, 30.0, 60.0, 90.0, 120.0]
+    )
     shadow_min_edge: float = 0.05
     shadow_max_price: float = 0.95
     shadow_stake_usdc: float = 15.0
@@ -328,12 +331,9 @@ class Settings(BaseSettings):
     shadow_digest_minute_utc: int = 5
     shadow_digest_poll_sec: float = 60.0
     shadow_digest_throttle_sec: int = 2 * 86400
-    shadow_report_edge_bins: list[float] = Field(
-        default_factory=lambda: [0.05, 0.07, 0.10]
-    )
-    shadow_report_tau_bins_sec: list[float] = Field(
-        default_factory=lambda: [30.0, 60.0, 90.0]
-    )
+    shadow_report_edge_bins: list[float] = Field(default_factory=lambda: [0.05, 0.07, 0.10])
+    shadow_report_tau_bins_sec: list[float] = Field(default_factory=lambda: [30.0, 60.0, 90.0])
+    shadow_report_strike_bins_bps: list[float] = Field(default_factory=lambda: [3.0, 8.0, 15.0])
 
     # ── Wallet track-record filter (validate the edge before enforcing) ──────────
     # off     = ignore the buyer's history entirely
@@ -386,7 +386,7 @@ class Settings(BaseSettings):
     # Conviction fraction: threshold = max(abs_floor, conviction_frac * whale_avg_size).
     slice_conviction_frac: float = 0.5
     # Low-balance alert throttle: at most one nudge per user per this interval.
-    lowbal_alert_throttle_sec: int = 21600   # 6 h
+    lowbal_alert_throttle_sec: int = 21600  # 6 h
 
     # ── Blueprint 3: fractional Kelly position sizing ─────────────────────────
     # "fixed" = legacy flat cap; "kelly" = risk-based fractional Kelly.
@@ -435,7 +435,7 @@ class Settings(BaseSettings):
     # Drawdown circuit breaker: pause copying when equity falls this far from HWM.
     max_drawdown_pct: float = 0.25
     # How long (seconds) copying stays paused after a drawdown breaker trip.
-    drawdown_cooldown_sec: int = 86400    # 24 h
+    drawdown_cooldown_sec: int = 86400  # 24 h
     # Daily loss limit as a fraction of start-of-day equity.
     daily_loss_limit_pct: float = 0.10
 

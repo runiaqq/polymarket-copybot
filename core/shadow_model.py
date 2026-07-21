@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Iterable, Mapping
+from decimal import ROUND_HALF_UP, Decimal
 
 CRYPTO_FEE_RATE = 0.07
+EntryVariant = tuple[str, float, float]
 
 
 @dataclass(frozen=True)
@@ -59,8 +60,7 @@ class EwmaVolatility:
             self._variance_per_second = variance_per_second
         else:
             self._variance_per_second = (
-                self.alpha * variance_per_second
-                + (1.0 - self.alpha) * self._variance_per_second
+                self.alpha * variance_per_second + (1.0 - self.alpha) * self._variance_per_second
             )
         self._sample_price = price
         self._sample_timestamp = timestamp_sec
@@ -72,6 +72,33 @@ class EwmaVolatility:
         if self._variance_per_second is None:
             return None
         return math.sqrt(max(self._variance_per_second, 0.0))
+
+
+def build_entry_variants(
+    entry_min_sec: float,
+    entry_max_sec: float,
+    variant_edges_sec: Sequence[float],
+) -> list[EntryVariant]:
+    """Build the canonical entry range and adjacent research buckets."""
+    lower = float(entry_min_sec)
+    upper = float(entry_max_sec)
+    edges = [float(edge) for edge in variant_edges_sec]
+    if not math.isfinite(lower) or not math.isfinite(upper) or lower > upper:
+        raise ValueError("entry range must contain finite ascending bounds")
+    if len(edges) < 2 or any(not math.isfinite(edge) for edge in edges):
+        raise ValueError("variant edges must contain at least two finite values")
+    if any(low >= high for low, high in zip(edges, edges[1:])):
+        raise ValueError("variant edges must be strictly ascending")
+    buckets = [(f"t{low:g}-{high:g}", low, high) for low, high in zip(edges, edges[1:])]
+    return [("full", lower, upper), *buckets]
+
+
+def active_entry_variants(
+    variants: Iterable[EntryVariant],
+    time_left_sec: float,
+) -> list[EntryVariant]:
+    """Return variants whose inclusive entry range contains ``time_left_sec``."""
+    return [variant for variant in variants if variant[1] <= time_left_sec <= variant[2]]
 
 
 def probability_up(

@@ -16,7 +16,14 @@ import websockets
 from core.cache import clear_once, notify_once
 from core.config import settings
 from core.db.session import get_supabase
-from core.shadow_model import EwmaVolatility, probability_up, walk_order_book
+from core.shadow_model import (
+    EntryVariant,
+    EwmaVolatility,
+    active_entry_variants,
+    build_entry_variants,
+    probability_up,
+    walk_order_book,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -54,6 +61,7 @@ class WindowObservation:
     model_p: float | None = None
     ask: float | None = None
     entered: bool = False
+    entered_variants: set[str] = field(default_factory=set)
     reason: str = "not_evaluated"
 
 
@@ -64,6 +72,11 @@ class ShadowEngine:
         eligible_from = current_window + settings.shadow_window_sec
         assets = [asset.lower() for asset in settings.shadow_assets]
         self.assets = [asset for asset in assets if asset in SUPPORTED_ASSETS]
+        self.entry_variants: list[EntryVariant] = build_entry_variants(
+            settings.shadow_entry_min_sec,
+            settings.shadow_entry_max_sec,
+            settings.shadow_variant_edges_sec,
+        )
         self.spots = {
             asset: SpotState(
                 volatility=EwmaVolatility(
@@ -86,7 +99,7 @@ class ShadowEngine:
         self.logged_windows: set[tuple[str, int]] = {
             (asset, current_window - settings.shadow_window_sec) for asset in self.assets
         }
-        self.entered_conditions: set[str] = set()
+        self.entered_conditions: set[tuple[str, str]] = set()
         self.db_retry_after = 0.0
         self.last_spot_rx_monotonic = time.monotonic()
         self._signal_tasks: set[asyncio.Task] = set()
@@ -206,7 +219,7 @@ class ShadowEngine:
                                 websocket.recv(),
                                 timeout=settings.shadow_rtds_ping_sec,
                             )
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             continue
                         last_rx = time.monotonic()
                         await self._handle_rtds_message(raw)
@@ -302,14 +315,10 @@ class ShadowEngine:
             return
         fee_schedule = market.get("feeSchedule") or {}
         fee_rate = float(
-            fee_details.get("r")
-            or fee_schedule.get("rate")
-            or settings.shadow_fee_rate
+            fee_details.get("r") or fee_schedule.get("rate") or settings.shadow_fee_rate
         )
         fee_exponent = float(
-            fee_details.get("e")
-            or fee_schedule.get("exponent")
-            or settings.shadow_fee_exponent
+            fee_details.get("e") or fee_schedule.get("exponent") or settings.shadow_fee_exponent
         )
         discovered = MarketWindow(
             asset=asset,
@@ -360,9 +369,6 @@ class ShadowEngine:
         if market is None:
             observation.reason = "market_not_discovered"
             return
-        if market.condition_id in self.entered_conditions:
-            observation.reason = "already_entered"
-            return
         state = self.spots[asset]
         open_price = state.window_opens.get(start)
         if open_price is None:
@@ -379,8 +385,17 @@ class ShadowEngine:
             observation.reason = "vol_not_warm"
             return
         time_left = market.window_end - now
-        if not settings.shadow_entry_min_sec <= time_left <= settings.shadow_entry_max_sec:
+        active_variants = active_entry_variants(self.entry_variants, time_left)
+        if not active_variants:
             observation.reason = "outside_entry_window"
+            return
+        pending_variants = [
+            variant
+            for variant in active_variants
+            if (market.condition_id, variant[0]) not in self.entered_conditions
+        ]
+        if not pending_variants:
+            observation.reason = "already_entered"
             return
         p_up = probability_up(
             state.price,
@@ -445,39 +460,55 @@ class ShadowEngine:
         if time.monotonic() < self.db_retry_after:
             observation.reason = "db_retry_backoff"
             return
-        insert_result = await asyncio.to_thread(self._insert_trade, payload)
-        if insert_result == "error":
-            self.db_retry_after = time.monotonic() + settings.shadow_db_retry_sec
-            observation.reason = "db_unavailable"
-            return
-        if insert_result == "duplicate":
-            self.entered_conditions.add(market.condition_id)
-            observation.reason = "db_duplicate"
-            return
-        self.entered_conditions.add(market.condition_id)
-        observation.entered = True
-        observation.reason = "entered"
-        side_label = "Up ⬆️" if side == "up" else "Down ⬇️"
-        window_end_utc = datetime.fromtimestamp(market.window_end, tz=timezone.utc)
-        self._spawn_signal(
-            f"🎯 Сигнал: {asset.upper()} {side_label}\n"
-            f"Вход: {fill.effective_price:.3f} | Ставка: ${fill.filled_usdc:.2f}\n"
-            f"Модель: {model_p:.0%} | Edge: {edge:+.1%}\n"
-            f"Окно закрывается в {window_end_utc:%H:%M:%S} UTC"
-        )
-        log.info(
-            "shadow_virtual_entry",
-            asset=asset,
-            condition_id=market.condition_id,
-            side=side,
-            time_left_sec=round(time_left, 3),
-            model_p=round(model_p, 6),
-            fill_price=round(fill.effective_price, 6),
-            filled_usdc=round(fill.filled_usdc, 6),
-            requested_usdc=fill.requested_usdc,
-            depth_complete=fill.complete,
-            fee_usdc=fill.fee_usdc,
-            edge=round(edge, 6),
+        inserted_any = False
+        saw_duplicate = False
+        for variant_name, _, _ in pending_variants:
+            variant_payload = {**payload, "variant": variant_name}
+            insert_result = await asyncio.to_thread(self._insert_trade, variant_payload)
+            condition_variant = (market.condition_id, variant_name)
+            if insert_result == "error":
+                self.db_retry_after = time.monotonic() + settings.shadow_db_retry_sec
+                observation.reason = "db_unavailable"
+                return
+            self.entered_conditions.add(condition_variant)
+            if insert_result == "duplicate":
+                saw_duplicate = True
+                observation.entered = True
+                observation.entered_variants.add(variant_name)
+                continue
+
+            inserted_any = True
+            observation.entered = True
+            observation.entered_variants.add(variant_name)
+            if variant_name == "full":
+                side_label = "Up ⬆️" if side == "up" else "Down ⬇️"
+                window_end_utc = datetime.fromtimestamp(
+                    market.window_end,
+                    tz=timezone.utc,  # noqa: UP017 - production currently runs Python 3.10.
+                )
+                self._spawn_signal(
+                    f"🎯 Сигнал: {asset.upper()} {side_label}\n"
+                    f"Вход: {fill.effective_price:.3f} | Ставка: ${fill.filled_usdc:.2f}\n"
+                    f"Модель: {model_p:.0%} | Edge: {edge:+.1%}\n"
+                    f"Окно закрывается в {window_end_utc:%H:%M:%S} UTC"
+                )
+            log.info(
+                "shadow_virtual_entry",
+                asset=asset,
+                condition_id=market.condition_id,
+                variant=variant_name,
+                side=side,
+                time_left_sec=round(time_left, 3),
+                model_p=round(model_p, 6),
+                fill_price=round(fill.effective_price, 6),
+                filled_usdc=round(fill.filled_usdc, 6),
+                requested_usdc=fill.requested_usdc,
+                depth_complete=fill.complete,
+                fee_usdc=fill.fee_usdc,
+                edge=round(edge, 6),
+            )
+        observation.reason = (
+            "entered" if inserted_any else ("db_duplicate" if saw_duplicate else "already_entered")
         )
 
     @staticmethod
@@ -488,6 +519,7 @@ class ShadowEngine:
                 sb.table("shadow_trades")
                 .select("id")
                 .eq("condition_id", payload["condition_id"])
+                .eq("variant", payload["variant"])
                 .limit(1)
                 .execute()
                 .data
@@ -516,6 +548,7 @@ class ShadowEngine:
                 window_end=_iso(previous + settings.shadow_window_sec),
                 condition_id=observation.condition_id,
                 entered=observation.entered,
+                entered_variants=sorted(observation.entered_variants),
                 best_edge=observation.best_edge,
                 model_p=observation.model_p,
                 ask=observation.ask,
@@ -531,9 +564,7 @@ class ShadowEngine:
         while True:
             now = time.time()
             try:
-                await asyncio.gather(
-                    *(self._evaluate_asset(asset, now) for asset in self.assets)
-                )
+                await asyncio.gather(*(self._evaluate_asset(asset, now) for asset in self.assets))
                 self._log_completed_windows(now)
             except asyncio.CancelledError:
                 raise
@@ -548,7 +579,7 @@ class ShadowEngine:
             .table("shadow_trades")
             .select(
                 "id,condition_id,token_id,window_end,sim_shares,"
-                "stake_usdc,fee_usdc,asset,side,sim_fill_price"
+                "stake_usdc,fee_usdc,asset,side,sim_fill_price,variant"
             )
             .eq("status", "open")
             .order("window_end")
@@ -580,11 +611,12 @@ class ShadowEngine:
                     0.0,
                     now,
                 )
-                await self._broadcast_signal(
-                    f"⚠️ {str(row.get('asset') or '').upper()} "
-                    f"{str(row.get('side') or '').capitalize()}: "
-                    "рынок не резолвился за 24 часа, сделка аннулирована"
-                )
+                if row.get("variant") == "full":
+                    await self._broadcast_signal(
+                        f"⚠️ {str(row.get('asset') or '').upper()} "
+                        f"{str(row.get('side') or '').capitalize()}: "
+                        "рынок не резолвился за 24 часа, сделка аннулирована"
+                    )
             return
         outcome_index = await asyncio.to_thread(
             detect_outcome_index,
@@ -622,13 +654,14 @@ class ShadowEngine:
         cost = stake + fee
         roi = pnl / cost if cost > 0 else 0.0
         header = "✅ Победа" if won else "❌ Проигрыш"
-        self._spawn_signal(
-            f"{header}: {str(row.get('asset') or '').upper()} "
-            f"{str(row.get('side') or '').capitalize()}\n"
-            f"Вход: {float(row.get('sim_fill_price') or 0):.3f} | "
-            f"Ставка: ${stake:.2f}\n"
-            f"PnL: ${pnl:+.2f} ({roi:+.1%})"
-        )
+        if row.get("variant") == "full":
+            self._spawn_signal(
+                f"{header}: {str(row.get('asset') or '').upper()} "
+                f"{str(row.get('side') or '').capitalize()}\n"
+                f"Вход: {float(row.get('sim_fill_price') or 0):.3f} | "
+                f"Ставка: ${stake:.2f}\n"
+                f"PnL: ${pnl:+.2f} ({roi:+.1%})"
+            )
 
     @staticmethod
     def _settle_row(row_id: int, status: str, pnl: float, now: datetime) -> None:
@@ -645,7 +678,9 @@ class ShadowEngine:
         while True:
             try:
                 rows = await asyncio.to_thread(self._open_trades)
-                now = datetime.now(timezone.utc)
+                now = datetime.now(
+                    timezone.utc  # noqa: UP017 - production currently runs Python 3.10.
+                )
                 for row in rows:
                     await self._resolve_trade(row, now)
             except asyncio.CancelledError:
@@ -669,6 +704,7 @@ class ShadowEngine:
             .gte("entered_at", start.isoformat())
             .lt("entered_at", end.isoformat())
             .in_("status", ["win", "loss"])
+            .eq("variant", "full")
             .execute()
             .data
             or []
@@ -677,6 +713,7 @@ class ShadowEngine:
             sb.table("shadow_trades")
             .select("status,pnl_usdc,stake_usdc")
             .in_("status", ["win", "loss"])
+            .eq("variant", "full")
             .execute()
             .data
             or []
@@ -687,7 +724,9 @@ class ShadowEngine:
         if not settings.shadow_digest_telegram_ids:
             return
         while True:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(
+                timezone.utc  # noqa: UP017 - production currently runs Python 3.10.
+            )
             send_after = now.replace(
                 hour=settings.shadow_digest_hour_utc,
                 minute=settings.shadow_digest_minute_utc,
@@ -735,6 +774,7 @@ class ShadowEngine:
             stake_usdc=settings.shadow_stake_usdc,
             entry_min_sec=settings.shadow_entry_min_sec,
             entry_max_sec=settings.shadow_entry_max_sec,
+            entry_variants=self.entry_variants,
             min_edge=settings.shadow_min_edge,
         )
         await asyncio.gather(
@@ -755,10 +795,7 @@ def _market_tokens(market: dict[str, Any]) -> dict[str, str]:
         token_ids = json.loads(token_ids)
     if not isinstance(outcomes, list) or not isinstance(token_ids, list):
         return {}
-    return {
-        str(outcome).lower(): str(token_id)
-        for outcome, token_id in zip(outcomes, token_ids)
-    }
+    return {str(outcome).lower(): str(token_id) for outcome, token_id in zip(outcomes, token_ids)}
 
 
 def _clob_market_tokens(market: dict[str, Any]) -> dict[str, str]:
@@ -777,7 +814,10 @@ def _parse_timestamp(value: str) -> float:
 
 
 def _iso(timestamp_sec: int | float) -> str:
-    return datetime.fromtimestamp(timestamp_sec, tz=timezone.utc).isoformat()
+    return datetime.fromtimestamp(
+        timestamp_sec,
+        tz=timezone.utc,  # noqa: UP017 - production currently runs Python 3.10.
+    ).isoformat()
 
 
 def _summarize(rows: list[dict]) -> tuple[int, int, float, float]:
