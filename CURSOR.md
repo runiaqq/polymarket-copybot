@@ -5393,3 +5393,219 @@ New flow makes wallet creation an explicit, staged, verifiable act.
 
 Deploy: `git pull && docker compose up -d --build api` (image rebuild picks up
 PTB ≥ 21.7 for the copy button; no worker/beat changes).
+
+## Blueprint 28: Sniper economics audit, de-crutching plan & crypto-platform roadmap (2026-07-21)
+
+Analyst/architect pass — no code changes in this BP. Everything below is backed by
+prod data pulled 2026-07-21 (`scripts/audit_bp28*.py`): 109 settled sniper trades,
+118 donor signals over 7 days, donor's full Data-API history (823 closed markets).
+
+### 28.1 Verified findings (numbers first)
+
+**F1. The PnL ledger is corrupted by `_confirm_fill` — this is the root of "impossible
+PnL" AND most of the "chaotic sizes".** 64 of 109 settled sniper rows fail the sanity
+check `realized_pnl == shares − size_usdc` (wins) — some absurdly (id 1169: stake
+$6.21 @ 0.78 → recorded pnl +$21.40; math ceiling is +$1.75). Mechanism:
+- `_confirm_fill` (execute_copy.py) measures the fill by polling **Data-API positions
+  4–20 s after the order** and takes `current_value` = shares × *price at read time*.
+  In a 5-min market the price moves violently in those seconds, so the recorded
+  `size_usdc` (cost!) and derived `shares = current_value / entry_price` are both wrong
+  in either direction.
+- Redemption then credits the TRUE on-chain share balance, and
+  `pnl = true_payout − corrupted_cost` produces the phantom profits/losses users see.
+- Extreme case id 1126: true spend ≈ $19 @ 0.18 (≈107 shares), but a post-fill price
+  bounce made `current_value` = $91.28 → recorded loss −$91.28 on a $19 trade.
+- So the "$6–8 vs $20–30 entries" are ~half measurement artifact: true spend/donor
+  ratio has mean 0.99 / median 0.96; the real dispersion comes from (a) FAK partial
+  fills in a thin book (real), (b) the balance clamp when the wallet is short (real),
+  (c) `current_value` mis-measurement (artifact).
+- **Fix direction (P0):** take exact cost & shares from the CLOB order response
+  (`create_and_post_market_order` returns matched making/taking amounts) instead of
+  Data-API polling. Kills the 4–20 s confirm latency AND the corruption. Data-API
+  read stays only as a fallback when the response is missing fields.
+
+**F2. "Patient entry" is adverse selection in disguise.** Bucketing settled trades by
+our fill price vs the donor's price:
+- fill ≥5% BELOW donor: n=40, winrate 62.5%, ROI **−24.5%** (we caught falling knives —
+  the ask came back down because the market was turning against the donor's side);
+- fill 2–5% below donor: n=21, winrate 81.0%, ROI +12.6%;
+- fill within ±2% of donor: n=49, winrate 77.6%, ROI **+13.7%**;
+- fills above donor: n=0 (the 2% ceiling already blocks chasing up).
+The trades we MISS (price ran away, e.g. donor @ 0.90 and the chart kept climbing)
+are disproportionately the GOOD ones — 45/118 signals had no entry attempt and 11 more
+failed all attempts (47% missed overall, avg donor px of missed = 0.81). Copy-with-lag
+on 5-min markets systematically buys the bad fills and skips the good ones.
+**Fix direction:** tighten the entry band to [donor_px − ~4%, donor_px + 2%] — never
+"wait for a dip" below that; a skipped trade is cheaper than a −24.5% ROI bucket.
+This is a parameter/logic simplification, not a new mechanism.
+
+**F3. The donor's edge is razor-thin — copying it with fees and lag is structurally
+≤ 0 for followers.** Donor lifetime: 823 closed markets, 83.5% winrate, avg entry
+~0.82–0.83 → breakeven winrate 82.6% → net **+1.11% ROI** (+$105 on $9.5k turnover);
+last week −$133. Our copy sample: donor winrate 68.9% on the signals we saw,
+hypothetical hold-to-resolution at donor's own prices = −$187 on $1.1k. On top of
+that 5-min crypto markets charge a ~1–2% taker fee (observed fee estimates 1.2–2.0%
+in prod errors), pushing follower breakeven to ~84%+ winrate at 0.82 entries.
+**Conclusion: no amount of engineering makes copying THIS donor at THESE prices
+profitable for users. The edge must come from entering earlier at lower prices —
+which is exactly the own-bot plan.**
+
+**F4. Book depth / capacity.** The book on these markets is thin at signal time: the
+donor's own ~$19 sweeps it (prod: ask 0.81→0.86 right after his fill), and our two
+users already fight for the remainder (partial fills like $1.73). Within a ±2% band
+the immediate depth at signal time is tens of dollars, not hundreds. 50–100 users ×
+$15–20 = $1.5–2k demand per signal is 1–2 orders of magnitude above capacity on ONE
+market. Depth is NOT always thin (MMs requote from spot within seconds), but at the
+moment that matters — the last 30 s, right after the donor's sweep — it is.
+**Fix direction:** (a) log a book snapshot with every sniper signal (we already fetch
+the book — one structured log line, zero extra I/O) to measure capacity empirically
+for 2–4 weeks; (b) plan capacity as: more assets × more market instances × user
+sharding, not bigger orders in one book.
+
+**F5. $200 minimum balance recommendation is justified.** Worst observed day at donor
+mirror sizing (~$19/trade): −$159.74 across 32 trades; typical bad day −$40…−90.
+With mirror sizing a $100 wallet can be wiped in a day (and empirically got close).
+Recommendation stands as a SOFT floor. Better: switch sniper sizing from "mirror
+donor absolute $" to "fixed fraction of the user's bankroll" (e.g. 8–10% per trade,
+$5 exchange minimum still applies) — the $200 recommendation then becomes
+self-enforcing (10% × $200 = $20 ≈ donor size today) and scales both down AND up.
+
+### 28.2 De-crutching audit (what to remove/simplify, in priority order)
+
+Codebase: core 3.2k + tasks 4.0k + routers 3.4k lines. The accumulated BP1–BP27
+layers left overlapping mechanisms. Removal candidates, safest first:
+
+1. **`_confirm_fill` Data-API polling** → replace with order-response accounting (F1).
+   Deletes a 20 s latency tail, 5 retries, and the corruption source. ~40 lines → ~10.
+2. **Triple entry-guard overlap in the sniper path** — patient-entry loop + FAK retry
+   loop + price-drift ceiling are three band-checks around one decision. Collapse into
+   ONE entry loop with ONE band [−4%, +2%] and one retry budget (F2). Also deletes the
+   adverse-selection bug as a side effect.
+3. **Sizing pipeline** — `size_usdc` is currently mutated by up to 8 sequential
+   clamps/floors spread over 300 lines (kelly/fixed → depth cap → unified risk cap →
+   profit-protection cap → exchange-min floor → tradeable clamp → on-demand fund →
+   re-clamp → book cap → re-floor → risk-gate clamp). The double `exchange_min` floor
+   can resurrect a stake that a cap deliberately reduced. Extract one pure
+   `compute_stake(signal, user, balances, book) -> Decision` function with ordered
+   rules and unit tests; behavior-preserving except the floor-after-cap bug.
+4. **Drawdown gate (Gate 3) + equity HWM machinery** — highest incident density in the
+   project (phantom equity, 7 no-op manual unlocks, monitor race re-inflating HWM,
+   risk_override half-bypass). The daily-loss gate (Gate 4, DB-ledger based) covers
+   the same user story without Data-API equity. Proposal: retire Gate 3 + `equity_hwm`
+   entirely; keep exposure caps (Gates 1–2) + daily loss (Gate 4). One-way door —
+   do it AFTER the ledger is trustworthy (item 1), since Gate 4 reads the ledger.
+5. **Dual sniper feed** — RTDS WS (primary) + 3 s Data-API poller (redundant copy of
+   the same funnel incl. dedup). Keep WS; demote the poller to a 30–60 s watchdog that
+   only alerts (not fires) when WS misses fills, or delete it once the own-bot fan-out
+   ships (Phase 3 makes both feeds obsolete).
+6. **Legacy onboarding funnel** — BP15 demo-first screens now coexist with BP27
+   explicit creation; the `register` callback survives only as a repair path for
+   pre-BP27 users (a handful). After the last unregistered user converts, delete the
+   L0/L1 gate screens and `register`.
+7. **`outcome_index` triple safety net** — entry-time Yes/No fallback (wrong for
+   Up/Down), CLOB token-order fallback, and on-chain `detect_outcome_index` repair.
+   Make the CLOB token order the ONLY entry-time source, keep `detect_outcome_index`
+   as reconcile-time verification, delete the Yes/No string heuristic.
+8. **`scripts/` pile** — 20 one-off diagnostics accumulated; move to `scripts/archive/`
+   (they're documentation of past incidents, not runtime code).
+9. **Accepted crutches to keep (documented, not removed):** `users` ↔ `user_wallets`
+   mirror (BP24), Gamma `resolve_outcome_name` tiers, Redis `notify_once` leases —
+   each guards a real external-API deficiency and has been stable.
+
+### 28.3 Own-bot plan (the strategic answer) — architecture assessment
+
+The user's plan: replicate the donor's strategy in-house, run it on ALL 5-min crypto
+markets (BTC, ETH, SOL, XRP…), enter seconds EARLIER than the donor, and have users
+copy OUR bot. Assessment: **this is the only path that fixes the economics** (F3) —
+but the build must be sequenced to avoid betting user money on an unproven model.
+
+Key architecture decisions:
+- **Signal engine, not wallet-watching.** The strategy is mechanical: in the last
+  T seconds of a 5-min window, if spot momentum vs the strike implies P(win) ≥
+  threshold and the market still prices it ≤ P − margin, buy. Inputs: exchange spot
+  WS (Binance/Coinbase combined), the market's strike & window (CLOB), and the book.
+  No dependency on the donor, no RTDS `orders_matched` filtering, no Data-API lag.
+- **Internal fan-out beats on-chain copying.** When the signal is OURS, users don't
+  need to "copy" anything on-chain: the signal engine calls the existing
+  `execute_copy_trade` fan-out directly (same pipeline as sniper mode today, minus
+  the WS/poller detection stage). Latency budget collapses from 1.5–3 s to ~0.2 s,
+  and every user enters at effectively the same price. A master wallet trading our
+  own capital is OPTIONAL (track record / skin in the game), not a dependency.
+- **Enter earlier = the actual edge.** Entering 45–90 s before close at 0.70–0.78
+  instead of the donor's last-15-s 0.82–0.90 buys margin for fees (1–2%) and price
+  impact, and the book is deeper before the final scramble. The model must prove it
+  keeps winrate above breakeven at those earlier, cheaper entries.
+- **Capacity by sharding, not by size.** 4 assets × 12 windows/hour ≈ 50 tradeable
+  markets/hour. With per-signal capacity ~$100–300 (to be confirmed by F4 logging),
+  100 users × $15 needs ~10 concurrent signals or user rotation (each user gets every
+  N-th signal). Rotation must be fairness-aware (round-robin per user, not random).
+- **Fees are a first-class model input.** Every EV calc (entry threshold, stop-loss)
+  must subtract the taker fee curve; at 0.80+ entries the fee is ~25–50% of the gross
+  edge. The fee-headroom clamp from the 2026-07-21 finding (balance must cover
+  order + fee estimate) is part of this.
+
+### 28.4 Roadmap (strict order — each phase de-risks the next)
+
+**Phase 0 — Truth in the ledger (days).** Prereq for everything else; without it we
+cannot even measure whether any strategy works.
+- 0.1 Order-response fill accounting (F1) — exact cost/shares on every trade.
+- 0.2 Fee-aware balance clamp (yesterday's finding: reserve ~3% when clamping to
+  balance) + record the paid fee per trade in `copy_trades`.
+- 0.3 Book snapshot logging at signal time (F4 capacity measurement).
+- 0.4 One-off ledger repair: recompute `size_usdc`/`shares`/`realized_pnl` for the
+  109 settled sniper rows from on-chain transfers (script), so user-facing PnL stats
+  stop lying retroactively.
+
+**Phase 1 — Stop the bleeding on the existing donor copy (days, parallel with 0).**
+- 1.1 Entry band → [donor−4%, donor+2%], patient-entry dip-buying removed (F2).
+- 1.2 Sniper sizing → fraction-of-bankroll (default ~10%, min $5) instead of donor
+  mirror; $200 soft-minimum message at sniper opt-in and on low balance (F5).
+- 1.3 Honest expectation-setting for the two sniper users: this strategy at current
+  prices is ~breakeven-to-negative after fees (F3). Do NOT open donor copying to
+  50–100 users — capacity (F4) and economics (F3) both forbid it. The wide rollout
+  waits for the own bot.
+
+**Phase 2 — Signal engine in shadow mode (1–2 weeks).**
+- 2.1 Build the momentum/strike model service (spot WS + CLOB meta + book reader).
+- 2.2 Run it in shadow: log would-be entries (time, price, size cap) on ALL 4+ assets,
+  settle them virtually against actual resolutions. Zero user money.
+- 2.3 Success gate: ≥2 weeks shadow, ≥300 virtual trades, net ROI after fees > +3%,
+  AND beats a same-period virtual copy of the donor. If it fails — iterate on the
+  model, not on the pipeline.
+
+**Phase 3 — Master bot live, small (1–2 weeks).**
+- 3.1 Trade house capital ($200–500) via the existing pipeline; users still on donor.
+- 3.2 Compare live fills vs shadow assumptions (slippage, fee, partial fills).
+- 3.3 Success gate: live ROI after fees > 0 over ≥150 trades, max daily drawdown
+  within model expectations.
+
+**Phase 4 — Users switch to the internal signal (weeks).**
+- 4.1 Fan-out from the signal engine (direct, no WS detection); per-user
+  fraction-of-bankroll sizing; round-robin sharding across concurrent markets once
+  per-signal demand approaches measured capacity.
+- 4.2 Migrate the two sniper users first, then staged rollout (10 → 30 → all),
+  watching aggregate price impact per signal.
+- 4.3 Donor copying demoted to legacy; RTDS/poller feeds retired (de-crutch item 5).
+
+**Phase 5 — Cleanup & scale (ongoing).**
+- 5.1 De-crutch items 3, 4, 6, 7, 8 (sizing function, Gate 3 retirement, legacy
+  onboarding, outcome_index, scripts archive).
+- 5.2 Add assets/windows as capacity data justifies; consider maker-side entries
+  (resting bids 60–120 s out) to earn spread instead of paying it — the single
+  biggest potential edge improvement, but only after Phase 3 proves the base model.
+
+### 28.5 Explicit answers to the four questions
+
+1. **Chaotic sums** — half accounting artifact (F1, fix in Phase 0), half real
+   (partial fills + balance clamp; Phase 1 sizing makes the real part deterministic).
+2. **Missed volatile entries** — mostly the system protecting users (F2: the chased
+   fills lose 24.5% ROI); the miss-rate is solved structurally by entering earlier
+   with our own signal (Phase 2–4), not by loosening the band for donor copying.
+3. **"PnL counted from the donor's entry"** — close: PnL is counted from a corrupted
+   cost basis recorded via Data-API `current_value` (F1). Confirmed on 64/109 rows.
+   Real profitability of the sniper is worse than the notifications suggested:
+   ledger says −$73 total, and even that is distorted.
+4. **Is the book always thin?** At the moment we trade (post-donor-sweep, last 30 s) —
+   yes, tens of dollars within ±2%. Between signals MMs requote quickly. Capacity for
+   more users comes from more markets and sharding, not from deeper single books;
+   Phase 0.3 logging turns this from estimate into measurement.
