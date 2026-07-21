@@ -21,6 +21,7 @@ from core.shadow_model import EwmaVolatility, probability_up, walk_order_book
 log = structlog.get_logger(__name__)
 
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+CLOB_MARKETS_URL = "https://clob.polymarket.com/clob-markets"
 SUPPORTED_ASSETS = {"btc", "eth", "sol", "xrp"}
 
 
@@ -216,6 +217,8 @@ class ShadowEngine:
         if not markets:
             return
         market = markets[0]
+        if not market.get("acceptingOrders"):
+            return
         resolution_source = str(
             market.get("resolutionSource") or event.get("resolutionSource") or ""
         ).lower()
@@ -261,12 +264,40 @@ class ShadowEngine:
         if set(tokens) != {"up", "down"}:
             log.error("shadow_market_bad_tokens", asset=asset, slug=slug, outcomes=list(tokens))
             return
+        condition_id = str(market["conditionId"])
+        clob_response = await client.get(f"{CLOB_MARKETS_URL}/{condition_id}")
+        clob_response.raise_for_status()
+        clob_market = clob_response.json()
+        if not clob_market.get("ao"):
+            return
+        clob_tokens = _clob_market_tokens(clob_market)
+        if clob_tokens != tokens:
+            log.error(
+                "shadow_market_token_mismatch",
+                asset=asset,
+                slug=slug,
+                gamma_tokens=tokens,
+                clob_tokens=clob_tokens,
+            )
+            return
+        fee_details = clob_market.get("fd") or {}
+        if fee_details and fee_details.get("to") is not True:
+            log.error("shadow_market_fee_not_taker_only", asset=asset, slug=slug)
+            return
         fee_schedule = market.get("feeSchedule") or {}
-        fee_rate = float(fee_schedule.get("rate") or settings.shadow_fee_rate)
-        fee_exponent = float(fee_schedule.get("exponent") or settings.shadow_fee_exponent)
+        fee_rate = float(
+            fee_details.get("r")
+            or fee_schedule.get("rate")
+            or settings.shadow_fee_rate
+        )
+        fee_exponent = float(
+            fee_details.get("e")
+            or fee_schedule.get("exponent")
+            or settings.shadow_fee_exponent
+        )
         discovered = MarketWindow(
             asset=asset,
-            condition_id=str(market["conditionId"]),
+            condition_id=condition_id,
             window_start=start,
             window_end=expected_end,
             tokens=tokens,
@@ -685,6 +716,17 @@ def _market_tokens(market: dict[str, Any]) -> dict[str, str]:
     return {
         str(outcome).lower(): str(token_id)
         for outcome, token_id in zip(outcomes, token_ids)
+    }
+
+
+def _clob_market_tokens(market: dict[str, Any]) -> dict[str, str]:
+    tokens = market.get("t") or []
+    if not isinstance(tokens, list):
+        return {}
+    return {
+        str(token.get("o") or "").lower(): str(token.get("t") or "")
+        for token in tokens
+        if isinstance(token, dict) and token.get("o") and token.get("t")
     }
 
 

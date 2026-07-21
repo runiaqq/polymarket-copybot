@@ -5707,7 +5707,9 @@ for `window_start+300` returned the next event before that window began. This
 worked for all four assets. Discovery therefore fetches current and next slugs
 every 30 seconds, takes the nested market's `conditionId`, `clobTokenIds`, and
 `outcomes`, and validates `eventStartTime`/`endDate` against the expected
-five-minute boundaries. It does not depend on broad Gamma search ordering.
+five-minute boundaries. It then validates `ao`, canonical token/outcome order,
+and fee details against `GET /clob-markets/{conditionId}`. It does not depend on
+broad Gamma search ordering or Gamma's misleading creation-time `startDate`.
 
 **Resolution price.** Live Gamma descriptions for BTC, ETH, SOL, and XRP all say
 that Up wins when the Chainlink Data Streams USD price at the end of the named
@@ -5726,12 +5728,13 @@ Chainlink tick as S0.
 `fee = shares × rate × (price × (1-price))^exponent`, rounded to five decimal
 places. Live Gamma market metadata for every tested 5-minute asset had
 `feesEnabled=true`, `feeType=crypto_fees_v2`, and
-`feeSchedule={rate: 0.07, exponent: 1, takerOnly: true}`. The older
+`feeSchedule={rate: 0.07, exponent: 1, takerOnly: true}`; canonical CLOB V2
+metadata independently returned `fd={r: 0.07, e: 1, to: true}`. The older
 `makerBaseFee`/`takerBaseFee=1000` fields are not sufficient to reproduce this
 curve. `core/shadow_model.py::fee_usdc` implements the documented formula and
-the engine reads the per-market Gamma schedule, falling back to the verified
-0.07/1 defaults. At an 0.80 entry this is 1.4% of cash cost, consistent with the
-1.2–2.0% production estimates.
+the engine uses canonical CLOB `fd`, with Gamma's per-market schedule and the
+verified 0.07/1 settings only as fallbacks. At an 0.80 entry this is 1.4% of cash
+cost, consistent with the 1.2–2.0% production estimates.
 
 ### 30.2 Architecture and model
 
