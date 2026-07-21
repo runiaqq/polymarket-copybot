@@ -45,12 +45,15 @@ def _timestamp(value: str | int | None) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
+        # dateutil, not fromisoformat: Python 3.10 rejects Supabase timestamps
+        # with non-3/6-digit fractional seconds (e.g. "…:47.63253+00:00").
         try:
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            from dateutil.parser import parse as _parse_dt
+            parsed = _parse_dt(str(value))
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             return int(parsed.timestamp())
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return 0
 
 
