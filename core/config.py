@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -287,6 +288,50 @@ class Settings(BaseSettings):
     # RTDS connections are known to die silently). BP26.6: 25 s — prod showed
     # hourly silent drops; a 60 s window + 30 s backoff cost a real donor fill.
     sniper_ws_silence_reconnect_sec: int = 25
+
+    # ── Blueprint 30: own signal engine in isolated shadow mode ───────────────
+    shadow_enabled: bool = True
+    shadow_assets: list[str] = Field(default_factory=lambda: ["btc", "eth", "sol", "xrp"])
+    shadow_entry_min_sec: float = 20.0
+    shadow_entry_max_sec: float = 120.0
+    shadow_min_edge: float = 0.05
+    shadow_max_price: float = 0.95
+    shadow_stake_usdc: float = 15.0
+    shadow_window_sec: int = 300
+    shadow_market_refresh_sec: float = 30.0
+    shadow_market_time_tolerance_sec: float = 2.0
+    shadow_evaluation_interval_sec: float = 1.0
+    shadow_spot_stale_sec: float = 5.0
+    shadow_http_timeout_sec: float = 10.0
+    shadow_rtds_url: str = "wss://ws-live-data.polymarket.com"
+    shadow_rtds_ping_sec: float = 5.0
+    shadow_rtds_silence_sec: float = 15.0
+    shadow_reconnect_initial_sec: float = 1.0
+    shadow_reconnect_max_sec: float = 30.0
+    # alpha≈0.003 on one-second returns gives an effective 10–15 minute EWMA.
+    shadow_ewma_alpha: float = 0.003
+    shadow_vol_sample_sec: float = 1.0
+    shadow_vol_min_samples: int = 120
+    shadow_sigma_floor: float = 0.000001
+    shadow_model_z_cap: float = 8.0
+    # Gamma feeSchedule for crypto_fees_v2; verified against CLOB docs per market.
+    shadow_fee_rate: float = 0.07
+    shadow_fee_exponent: float = 1.0
+    shadow_fill_epsilon_usdc: float = 0.00001
+    shadow_resolution_poll_sec: float = 60.0
+    shadow_resolution_void_after_sec: int = 86400
+    shadow_db_retry_sec: float = 30.0
+    shadow_digest_telegram_ids: list[int] = Field(default_factory=list)
+    shadow_digest_hour_utc: int = 0
+    shadow_digest_minute_utc: int = 5
+    shadow_digest_poll_sec: float = 60.0
+    shadow_digest_throttle_sec: int = 2 * 86400
+    shadow_report_edge_bins: list[float] = Field(
+        default_factory=lambda: [0.05, 0.07, 0.10]
+    )
+    shadow_report_tau_bins_sec: list[float] = Field(
+        default_factory=lambda: [30.0, 60.0, 90.0]
+    )
 
     # ── Wallet track-record filter (validate the edge before enforcing) ──────────
     # off     = ignore the buyer's history entirely

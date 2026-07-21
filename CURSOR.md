@@ -5681,3 +5681,108 @@ Default mode is read-only and prints every `было -> станет` change. `-
 only `size_usdc`, `shares`, and `realized_pnl`; it must be run manually after review.
 Operator sequence: rebuild worker/beat, apply migration 020, run the repair dry-run
 again, then explicitly decide whether to run `--apply`.
+
+## Blueprint 30: Own 5-minute crypto signal engine, shadow phase (2026-07-21)
+
+Implements BP28 Phase 2 as a separate `shadow` compose service. It reads Gamma,
+Chainlink RTDS, CLOB books, and on-chain resolution state; its only write is to the
+new `shadow_trades` table. It does not import or call `place_order`, `sell_position`,
+`redeem_winnings`, copy fan-out, or any other money-moving path. Worker, beat, and
+API behavior are unchanged.
+
+### 30.1 Pre-implementation research
+
+**Market discovery.** The four recurring series use deterministic event/market
+slugs:
+
+```
+{asset}-updown-5m-{window_start_unix}
+```
+
+where `asset` is `btc|eth|sol|xrp` and `window_start_unix` is UTC Unix time
+floored to 300 seconds. A direct
+`GET https://gamma-api.polymarket.com/events?slug=btc-updown-5m-1784651400`
+returned exactly one event for the live 12:30–12:35 ET window; the same request
+for `window_start+300` returned the next event before that window began. This
+worked for all four assets. Discovery therefore fetches current and next slugs
+every 30 seconds, takes the nested market's `conditionId`, `clobTokenIds`, and
+`outcomes`, and validates `eventStartTime`/`endDate` against the expected
+five-minute boundaries. It does not depend on broad Gamma search ordering.
+
+**Resolution price.** Live Gamma descriptions for BTC, ETH, SOL, and XRP all say
+that Up wins when the Chainlink Data Streams USD price at the end of the named
+range is greater than or equal to its price at the beginning; otherwise Down
+wins. Their `resolutionSource` values are respectively
+`data.chain.link/streams/btc-usd`, `eth-usd`, `sol-usd`, and `xrp-usd`, and the
+description explicitly says not to use another spot source. The engine therefore
+uses Polymarket RTDS `crypto_prices_chainlink` (`btc/usd`, `eth/usd`, `sol/usd`,
+`xrp/usd`), not Binance or Pyth. RTDS sends a roughly two-minute subscription
+snapshot under topic `crypto_prices`/type `subscribe`, then Chainlink updates;
+both envelope forms are accepted. A restart always skips the current window even
+if the snapshot contains its opening tick. The next window records its first
+Chainlink tick as S0.
+
+**Taker fee.** The official CLOB V2 fee documentation defines
+`fee = shares × rate × (price × (1-price))^exponent`, rounded to five decimal
+places. Live Gamma market metadata for every tested 5-minute asset had
+`feesEnabled=true`, `feeType=crypto_fees_v2`, and
+`feeSchedule={rate: 0.07, exponent: 1, takerOnly: true}`. The older
+`makerBaseFee`/`takerBaseFee=1000` fields are not sufficient to reproduce this
+curve. `core/shadow_model.py::fee_usdc` implements the documented formula and
+the engine reads the per-market Gamma schedule, falling back to the verified
+0.07/1 defaults. At an 0.80 entry this is 1.4% of cash cost, consistent with the
+1.2–2.0% production estimates.
+
+### 30.2 Architecture and model
+
+- `worker/shadow_engine.py` runs five independent asyncio loops: Chainlink RTDS
+  with PING/liveness/reconnect backoff, deterministic Gamma discovery, CLOB book
+  evaluation, on-chain virtual settlement, and the optional daily admin digest.
+  External and missing-table failures are logged and retried without terminating
+  the process.
+- Spot is sampled at fixed one-second intervals. EWMA variance is calculated from
+  squared log returns per second, so sigma has the units required by
+  `P(Up)=Φ(log(S/S0)/(sigma*sqrt(tau)))`. The default alpha 0.003 has an effective
+  10–15 minute memory. A minimum sample count and sigma floor guard cold/flat data.
+- In the final 20–120 seconds, the side with model probability at least 0.5 is
+  evaluated. `walk_order_book` consumes asks cheapest-first for the configured
+  virtual stake, records partial depth, and computes shares, effective price, and
+  the fee at every level. Entry requires
+  `model_p - effective_price - fee_per_share >= shadow_min_edge` and effective
+  price at or below the ceiling. A unique DB index plus a pre-insert lookup allows
+  at most one virtual entry per condition.
+- Every completed asset/window emits one `shadow_window` log with the best
+  observed edge, model probability, ask, entry flag, and skip reason. Entries and
+  settlements have their own structured records.
+- Open rows are settled from ConditionalTokens
+  `payoutDenominator`/`payoutNumerators`; the token's real outcome index is derived
+  with `detect_outcome_index`. Net PnL is `shares-stake-fee` on a win and
+  `-stake-fee` on a loss. Rows still unresolved after the configurable 24-hour
+  limit become void with zero PnL.
+- `scripts/shadow_report.py` reports count, winrate, gross/net PnL and ROI, asset,
+  edge, and entry-time buckets. It resolves same-period BTC donor signals from
+  `trade_signals` on-chain and reports their virtual hold-to-resolution result at
+  donor prices with the same fee curve.
+
+Migration `021_shadow_trades.sql` owns the isolated ledger. Apply it manually
+before starting the service. The service is started only with:
+
+```
+docker compose up -d --build shadow
+```
+
+### 30.3 Settings and Phase 2 gate
+
+Primary strategy settings: `shadow_assets`, `shadow_entry_min_sec`,
+`shadow_entry_max_sec`, `shadow_min_edge`, `shadow_max_price`, and
+`shadow_stake_usdc`. Feed/model settings are grouped under `shadow_rtds_*`,
+`shadow_ewma_alpha`, `shadow_vol_sample_sec`, `shadow_vol_min_samples`,
+`shadow_sigma_floor`, and `shadow_model_z_cap`. Fee, discovery, retry,
+resolution, report-bucket, and digest timing also have `shadow_*` settings; there
+are no strategy magic numbers in the service. `shadow_digest_telegram_ids=[]`
+disables Telegram delivery by default.
+
+Do not proceed to live trading until the unchanged BP28 gate is met: at least two
+weeks of shadow data, at least 300 settled virtual trades, net ROI after fees
+above +3%, and better same-period performance than the donor benchmark. Failure
+means recalibrating the model in shadow, not enabling the money path.

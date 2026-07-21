@@ -46,6 +46,21 @@ services:
       redis:
         condition: service_healthy
 
+  # BP30: isolated signal engine. Reads live data and writes virtual trades only.
+  shadow:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      AUTO_COPY_ENABLED: "true"
+      REDIS_URL: "redis://redis:6379"
+    command: ["python", "-m", "worker.shadow_engine"]
+    depends_on:
+      redis:
+        condition: service_healthy
+
   # Periodic scheduler — separate process (gevent pool can't embed --beat).
   # Keep exactly ONE replica so periodic tasks aren't double-fired.
   beat:
