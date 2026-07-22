@@ -74,7 +74,7 @@ def _shadow_rows(start: datetime, end: datetime) -> list[dict]:
             .select(
                 "asset,status,sim_shares,stake_usdc,fee_usdc,pnl_usdc,"
                 "edge,time_left_sec,entered_at,variant,sim_fill_price,"
-                "model_p,spot,open_price"
+                "model_p,spot,open_price,placed_at,note"
             )
             .gte("entered_at", start.isoformat())
             .lt("entered_at", end.isoformat())
@@ -163,6 +163,37 @@ def _print_variant_stats(label: str, rows: list[dict]) -> None:
         f"model_p={average_model_p:6.1%}  "
         f"net=${stats['net']:+9.2f} ({stats['net_roi']:+6.1%})"
     )
+
+
+def _print_maker_metrics(label: str, rows: list[dict]) -> None:
+    stats = _stats(rows)
+    average_bid = (
+        sum(float(row.get("sim_fill_price") or 0) for row in rows) / len(rows) if rows else 0.0
+    )
+    average_model_p = (
+        sum(float(row.get("model_p") or 0) for row in rows) / len(rows) if rows else 0.0
+    )
+    print(
+        f"{label:<18} n={len(rows):4d}  settled={int(stats['count']):4d}  "
+        f"WR={stats['winrate']:6.1%}  bid={average_bid:.3f}  "
+        f"model_p={average_model_p:6.1%}  "
+        f"net=${stats['net']:+9.2f} ({stats['net_roi']:+6.1%})"
+    )
+
+
+def _print_maker_section(rows: list[dict], full_rows: list[dict]) -> None:
+    maker_rows = [row for row in rows if str(row.get("variant") or "") == "maker"]
+    filled = [row for row in maker_rows if row.get("note") == "filled"]
+    cancelled = [row for row in maker_rows if row.get("note") == "cancelled_edge_lost"]
+    expired = [row for row in maker_rows if row.get("note") == "expired"]
+    fill_rate = len(filled) / len(maker_rows) if maker_rows else 0.0
+    print("\nMaker")
+    print(
+        f"Размещено {len(maker_rows)}, заполнено {len(filled)} ({fill_rate:.1%}), "
+        f"отменено {len(cancelled)}, истекло {len(expired)}"
+    )
+    _print_maker_metrics("MAKER FILLED", filled)
+    _print_maker_metrics("FULL TAKER", full_rows)
 
 
 def _bucket_label(value: float, boundaries: list[float], unit: str = "") -> str:
@@ -325,6 +356,7 @@ def main() -> None:
         ),
     )
     _print_divergence_breakdown(settled)
+    _print_maker_section(rows, full_rows)
     _print_variant_breakdown(rows)
 
     donor_signals = _donor_rows(start, end)

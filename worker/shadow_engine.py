@@ -23,6 +23,9 @@ from core.shadow_model import (
     build_entry_variants,
     calibrated_probability,
     divergence_exceeds_ceiling,
+    maker_bid_price,
+    maker_fill,
+    maker_should_cancel,
     probability_up,
     stressed_sigma,
     walk_order_book,
@@ -54,6 +57,21 @@ class MarketWindow:
     tokens: dict[str, str]
     fee_rate: float
     fee_exponent: float
+    tick_size: float
+
+
+@dataclass
+class MakerOrder:
+    market: MarketWindow
+    side: str
+    bid: float
+    edge: float
+    placed_at: float
+    placement_payload: dict[str, Any]
+    terminal_status: str | None = None
+    note: str | None = None
+    entered_at: float | None = None
+    terminal_time_left: float | None = None
 
 
 @dataclass
@@ -108,6 +126,8 @@ class ShadowEngine:
             (asset, current_window - settings.shadow_window_sec) for asset in self.assets
         }
         self.entered_conditions: set[tuple[str, str]] = set()
+        self.maker_orders: dict[tuple[str, int], MakerOrder] = {}
+        self.maker_attempted_conditions: set[str] = set()
         self.db_retry_after = 0.0
         self.last_spot_rx_monotonic = time.monotonic()
         self._signal_tasks: set[asyncio.Task] = set()
@@ -329,6 +349,12 @@ class ShadowEngine:
         fee_exponent = float(
             fee_details.get("e") or fee_schedule.get("exponent") or settings.shadow_fee_exponent
         )
+        try:
+            tick_size = float(market.get("orderPriceMinTickSize") or 0.01)
+        except (TypeError, ValueError):
+            tick_size = 0.01
+        if not 0 < tick_size < 1:
+            tick_size = 0.01
         discovered = MarketWindow(
             asset=asset,
             condition_id=condition_id,
@@ -337,6 +363,7 @@ class ShadowEngine:
             tokens=tokens,
             fee_rate=fee_rate,
             fee_exponent=fee_exponent,
+            tick_size=tick_size,
         )
         self.markets[(asset, start)] = discovered
 
@@ -371,7 +398,75 @@ class ShadowEngine:
             observation.condition_id = market.condition_id
         return observation
 
+    @staticmethod
+    def _complete_maker_order(
+        order: MakerOrder,
+        *,
+        status: str,
+        note: str,
+        entered_at: float,
+        time_left: float,
+    ) -> None:
+        order.terminal_status = status
+        order.note = note
+        order.entered_at = entered_at
+        order.terminal_time_left = time_left
+
+    async def _persist_maker_order(
+        self,
+        key: tuple[str, int],
+        order: MakerOrder,
+    ) -> bool:
+        if order.terminal_status is None or order.note is None or order.entered_at is None:
+            return False
+        if time.monotonic() < self.db_retry_after:
+            return False
+        payload = {
+            **order.placement_payload,
+            "variant": "maker",
+            "status": order.terminal_status,
+            "note": order.note,
+            "entered_at": _iso(order.entered_at),
+        }
+        result = await asyncio.to_thread(self._insert_trade, payload)
+        if result == "error":
+            self.db_retry_after = time.monotonic() + settings.shadow_db_retry_sec
+            return False
+        if self.maker_orders.get(key) is order:
+            del self.maker_orders[key]
+        event = {
+            "filled": "shadow_maker_filled",
+            "cancelled_edge_lost": "shadow_maker_cancelled",
+            "expired": "shadow_maker_expired",
+        }[order.note]
+        log.info(
+            event,
+            asset=order.market.asset,
+            condition_id=order.market.condition_id,
+            side=order.side,
+            bid=round(order.bid, 6),
+            edge=round(order.edge, 6),
+            time_left=round(order.terminal_time_left or 0.0, 3),
+        )
+        return True
+
+    async def _expire_maker_orders(self, asset: str, now: float) -> None:
+        for key, order in list(self.maker_orders.items()):
+            if order.market.asset != asset:
+                continue
+            if order.terminal_status is None and now >= order.market.window_end:
+                self._complete_maker_order(
+                    order,
+                    status="unfilled",
+                    note="expired",
+                    entered_at=order.placed_at,
+                    time_left=order.market.window_end - now,
+                )
+            if order.terminal_status is not None:
+                await self._persist_maker_order(key, order)
+
     async def _evaluate_asset(self, asset: str, now: float) -> None:
+        await self._expire_maker_orders(asset, now)
         start = self._window_start(now)
         observation = self._observation(asset, start)
         market = self.markets.get((asset, start))
@@ -404,16 +499,21 @@ class ShadowEngine:
             return
         time_left = market.window_end - now
         active_variants = active_entry_variants(self.entry_variants, time_left)
-        if not active_variants:
-            observation.reason = "outside_entry_window"
-            return
         pending_variants = [
             variant
             for variant in active_variants
             if (market.condition_id, variant[0]) not in self.entered_conditions
         ]
-        if not pending_variants:
-            observation.reason = "already_entered"
+        maker_key = (asset, start)
+        maker_order = self.maker_orders.get(maker_key)
+        maker_can_place = (
+            settings.shadow_maker_enabled
+            and maker_order is None
+            and market.condition_id not in self.maker_attempted_conditions
+            and settings.shadow_entry_min_sec <= time_left <= settings.shadow_entry_max_sec
+        )
+        if not pending_variants and maker_order is None and not maker_can_place:
+            observation.reason = "already_entered" if active_variants else "outside_entry_window"
             return
         p_up = probability_up(
             state.price,
@@ -425,10 +525,111 @@ class ShadowEngine:
         )
         side = "up" if p_up >= 0.5 else "down"
         model_p = p_up if side == "up" else 1.0 - p_up
-        token_id = market.tokens[side]
         from core.polymarket import get_order_book
 
-        book = await asyncio.to_thread(get_order_book, token_id)
+        books: dict[str, dict | None] = {}
+
+        async def load_book(book_side: str) -> dict | None:
+            token = market.tokens[book_side]
+            if token not in books:
+                books[token] = await asyncio.to_thread(get_order_book, token)
+            return books[token]
+
+        if maker_order is not None and maker_order.terminal_status is None:
+            maker_book = await load_book(maker_order.side)
+            best_ask = maker_book.get("best_ask") if maker_book else None
+            p_side = p_up if maker_order.side == "up" else 1.0 - p_up
+            if maker_fill(best_ask, maker_order.bid):
+                self._complete_maker_order(
+                    maker_order,
+                    status="open",
+                    note="filled",
+                    entered_at=now,
+                    time_left=time_left,
+                )
+            elif maker_should_cancel(
+                p_side,
+                maker_order.bid,
+                settings.shadow_maker_cancel_edge,
+            ):
+                self._complete_maker_order(
+                    maker_order,
+                    status="unfilled",
+                    note="cancelled_edge_lost",
+                    entered_at=maker_order.placed_at,
+                    time_left=time_left,
+                )
+            if maker_order.terminal_status is not None:
+                await self._persist_maker_order(maker_key, maker_order)
+
+        if maker_can_place:
+            placement_book = await load_book(side)
+            best_bid = placement_book.get("best_bid") if placement_book else None
+            best_ask = placement_book.get("best_ask") if placement_book else None
+            bid = maker_bid_price(best_bid, best_ask, market.tick_size)
+            if bid is not None:
+                maker_edge = model_p - bid
+                if (
+                    maker_edge >= settings.shadow_maker_min_edge
+                    and not divergence_exceeds_ceiling(
+                        model_p,
+                        bid,
+                        settings.shadow_max_model_divergence,
+                    )
+                    and bid <= settings.shadow_max_price
+                ):
+                    placement_payload = {
+                        "asset": asset,
+                        "condition_id": market.condition_id,
+                        "token_id": market.tokens[side],
+                        "side": side,
+                        "window_start": _iso(start),
+                        "window_end": _iso(market.window_end),
+                        "placed_at": _iso(now),
+                        "time_left_sec": round(time_left, 3),
+                        "model_p": round(model_p, 8),
+                        "spot": state.price,
+                        "open_price": open_price,
+                        "sigma": sigma,
+                        "sigma_fast": sigma_fast,
+                        "q_cal": calibrated_probability(
+                            model_p,
+                            bid,
+                            settings.shadow_calibration_lambda,
+                        ),
+                        "book_best_ask": best_ask,
+                        "sim_fill_price": bid,
+                        "sim_shares": settings.shadow_stake_usdc / bid,
+                        "stake_usdc": settings.shadow_stake_usdc,
+                        "fee_usdc": 0.0,
+                        "edge": maker_edge,
+                    }
+                    maker_order = MakerOrder(
+                        market=market,
+                        side=side,
+                        bid=bid,
+                        edge=maker_edge,
+                        placed_at=now,
+                        placement_payload=placement_payload,
+                    )
+                    self.maker_orders[maker_key] = maker_order
+                    self.maker_attempted_conditions.add(market.condition_id)
+                    log.info(
+                        "shadow_maker_placed",
+                        asset=asset,
+                        condition_id=market.condition_id,
+                        side=side,
+                        bid=round(bid, 6),
+                        edge=round(maker_edge, 6),
+                        time_left=round(time_left, 3),
+                    )
+
+        if not pending_variants:
+            observation.reason = "already_entered"
+            return
+
+        token_id = market.tokens[side]
+        book = await load_book(side)
         if not book:
             observation.reason = "book_unavailable"
             return

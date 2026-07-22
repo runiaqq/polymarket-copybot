@@ -321,6 +321,9 @@ class Settings(BaseSettings):
     shadow_model_z_cap: float = 8.0
     shadow_max_model_divergence: float = 0.12
     shadow_calibration_lambda: float = 0.5
+    shadow_maker_enabled: bool = True
+    shadow_maker_min_edge: float = 0.05
+    shadow_maker_cancel_edge: float = 0.0
     # Gamma feeSchedule for crypto_fees_v2; verified against CLOB docs per market.
     shadow_fee_rate: float = 0.07
     shadow_fee_exponent: float = 1.0

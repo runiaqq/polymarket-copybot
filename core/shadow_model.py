@@ -90,6 +90,40 @@ def divergence_exceeds_ceiling(model_p: float, market_price: float, ceiling: flo
     return model_p - market_price > ceiling
 
 
+def maker_bid_price(
+    best_bid: float | None,
+    best_ask: float | None,
+    tick: float,
+) -> float | None:
+    """Improve the best bid by one tick without crossing the ask."""
+    if best_bid is None or best_ask is None:
+        return None
+    values = (best_bid, best_ask, tick)
+    if any(not math.isfinite(value) for value in values):
+        return None
+    if best_bid <= 0 or best_ask <= best_bid or best_ask > 1 or tick <= 0:
+        return None
+    bid = min(best_bid + tick, best_ask - tick)
+    return bid if bid > 0 else None
+
+
+def maker_fill(best_ask: float | None, bid: float) -> bool:
+    """Conservatively fill only after the best ask reaches the maker bid."""
+    return (
+        best_ask is not None
+        and math.isfinite(best_ask)
+        and math.isfinite(bid)
+        and best_ask > 0
+        and bid > 0
+        and best_ask <= bid
+    )
+
+
+def maker_should_cancel(p_side: float, bid: float, cancel_edge: float) -> bool:
+    """Cancel only when edge falls strictly below the configured threshold."""
+    return p_side - bid < cancel_edge
+
+
 def build_entry_variants(
     entry_min_sec: float,
     entry_max_sec: float,

@@ -7,6 +7,9 @@ from core.shadow_model import (
     calibrated_probability,
     divergence_exceeds_ceiling,
     fee_usdc,
+    maker_bid_price,
+    maker_fill,
+    maker_should_cancel,
     probability_up,
     stressed_sigma,
     walk_order_book,
@@ -54,6 +57,41 @@ def test_calibrated_probability_shrinks_and_clamps(
 def test_divergence_above_ceiling_is_blocked() -> None:
     assert divergence_exceeds_ceiling(0.83, 0.70, 0.12) is True
     assert divergence_exceeds_ceiling(0.82, 0.70, 0.12) is False
+
+
+@pytest.mark.parametrize(
+    ("best_bid", "best_ask", "tick", "expected"),
+    [
+        (None, 0.60, 0.01, None),
+        (0.58, None, 0.01, None),
+        (0.59, 0.60, 0.01, 0.59),
+        (0.58, 0.60, 0.01, 0.59),
+        (0.58, 0.59, 0.60, None),
+    ],
+)
+def test_maker_bid_price_improves_without_crossing(
+    best_bid: float | None,
+    best_ask: float | None,
+    tick: float,
+    expected: float | None,
+) -> None:
+    result = maker_bid_price(best_bid, best_ask, tick)
+    if expected is None:
+        assert result is None
+    else:
+        assert result == pytest.approx(expected)
+
+
+def test_maker_fill_requires_ask_to_reach_bid() -> None:
+    assert maker_fill(None, 0.60) is False
+    assert maker_fill(0.61, 0.60) is False
+    assert maker_fill(0.60, 0.60) is True
+    assert maker_fill(0.59, 0.60) is True
+
+
+def test_maker_cancel_is_strictly_below_threshold() -> None:
+    assert maker_should_cancel(0.65, 0.60, 0.05) is False
+    assert maker_should_cancel(0.649, 0.60, 0.05) is True
 
 
 def test_build_entry_variants_creates_full_and_adjacent_buckets() -> None:

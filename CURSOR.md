@@ -5768,9 +5768,10 @@ cost, consistent with the 1.2–2.0% production estimates.
   donor benchmark is resolved from `trade_signals` on-chain and reported at donor
   prices with the same fee curve.
 
-Migrations `021_shadow_trades.sql`, `022_shadow_variants.sql`, and
-`023_shadow_stress_sigma.sql` own the isolated ledger, variant uniqueness, and
-BP30.2 diagnostics. Apply them manually before starting the service.
+Migrations `021_shadow_trades.sql`, `022_shadow_variants.sql`,
+`023_shadow_stress_sigma.sql`, and `024_shadow_maker.sql` own the isolated
+ledger, variant uniqueness, BP30.2 diagnostics, and BP30.3 maker lifecycle.
+Apply them manually before starting the service.
 The service is started only with:
 
 ```
@@ -5839,3 +5840,28 @@ fast sigma and `q_cal`, the model probability shrunk halfway toward execution
 price by default. `q_cal` is diagnostic only: it is logged to
 `shadow_trades` and does not gate entries or choose sides. The report adds a
 `full`-variant breakdown by model-price divergence.
+
+### 30.6 BP30.3 virtual maker entries
+
+Canonical CLOB metadata marks the crypto fee schedule as taker-only. Since the
+taker fee and ask spread erased the observed edge, the shadow service now runs
+one parallel virtual maker attempt per condition. It improves the best bid by
+one Gamma `orderPriceMinTickSize` tick without crossing the ask, requires the
+configured maker edge, divergence, and price gates, and charges no fee. The
+order remains entirely virtual; no money-moving path or real order API is used.
+
+Pending maker orders live only in memory. On each later tick, an order fills at
+its bid only when the token's best ask is at or below that bid, cancels when its
+current model edge falls strictly below `shadow_maker_cancel_edge`, or expires
+at the window end. The ask-touch rule deliberately ignores market sells that
+may have traded into the bid between one-second snapshots, so reported fill
+rate is a conservative lower bound. A model-side book is reused when possible;
+an opposite-side pending order adds at most one CLOB request per asset/tick.
+
+Maker outcomes use `variant='maker'`: fills enter settlement as `open` with
+zero fee, while cancellations and expirations are stored as `unfilled`.
+Placement diagnostics remain fixed at order creation in `placed_at`, and
+`note` records `filled`, `cancelled_edge_lost`, or `expired`. The report shows
+maker placement, fill, cancellation, expiry, settled performance, and the
+same-period `full` taker comparison. Maker entries and settlements never send
+Telegram signals and do not affect the BP28 Phase 2 gate.
