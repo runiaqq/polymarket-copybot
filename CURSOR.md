@@ -5768,8 +5768,9 @@ cost, consistent with the 1.2–2.0% production estimates.
   donor benchmark is resolved from `trade_signals` on-chain and reported at donor
   prices with the same fee curve.
 
-Migrations `021_shadow_trades.sql` and `022_shadow_variants.sql` own the isolated
-ledger and variant uniqueness. Apply them manually before starting the service.
+Migrations `021_shadow_trades.sql`, `022_shadow_variants.sql`, and
+`023_shadow_stress_sigma.sql` own the isolated ledger, variant uniqueness, and
+BP30.2 diagnostics. Apply them manually before starting the service.
 The service is started only with:
 
 ```
@@ -5815,3 +5816,26 @@ row settles independently. Only `full` emits Telegram entry/settlement messages
 and contributes to the daily digest, the main report sections, donor comparison,
 and the unchanged BP28 Phase 2 gate (≥300 settled trades and net ROI above +3%).
 Research variants are silent and appear only in the report's comparative section.
+
+### 30.5 BP30.2 stressed volatility and divergence ceiling
+
+The first 283 settled `full` trades exposed two systematic leaks. Near-strike
+entries below 3 bp during volatile European-morning periods used a slow EWMA
+that understated current volatility: model probabilities of 70–75% produced
+only 38–44% wins. Entries where model probability exceeded execution price by
+more than 10–12 points were also usually wrong relative to the market.
+
+Each asset now maintains the original slow EWMA plus a fast EWMA with a
+configurable 0.02 alpha and 30-sample warm-up. The slow estimate must still pass
+its original warm-up gate. Once the fast estimate is warm, the model uses the
+maximum of both sigmas, so short volatility spikes increase uncertainty without
+discarding the stable baseline.
+
+After the single CLOB walk per asset/tick, entry is rejected with
+`model_divergence_ceiling` when `model_p - effective_price` exceeds the
+configurable 0.12 ceiling. Existing edge, fee, price, variants, signals,
+settlement, and digest behavior remains unchanged. New rows store the warmed
+fast sigma and `q_cal`, the model probability shrunk halfway toward execution
+price by default. `q_cal` is diagnostic only: it is logged to
+`shadow_trades` and does not gate entries or choose sides. The report adds a
+`full`-variant breakdown by model-price divergence.

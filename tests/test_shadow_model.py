@@ -4,12 +4,56 @@ from core.shadow_model import (
     EwmaVolatility,
     active_entry_variants,
     build_entry_variants,
+    calibrated_probability,
+    divergence_exceeds_ceiling,
     fee_usdc,
     probability_up,
+    stressed_sigma,
     walk_order_book,
 )
 
 MODEL_ARGS = {"sigma_floor": 1e-6, "z_cap": 8.0}
+
+
+@pytest.mark.parametrize(
+    ("slow", "fast", "expected"),
+    [
+        (None, None, None),
+        (0.001, None, 0.001),
+        (None, 0.002, 0.002),
+        (0.001, 0.002, 0.002),
+        (0.003, 0.002, 0.003),
+    ],
+)
+def test_stressed_sigma_uses_highest_available_estimate(
+    slow: float | None,
+    fast: float | None,
+    expected: float | None,
+) -> None:
+    assert stressed_sigma(slow, fast) == expected
+
+
+@pytest.mark.parametrize(
+    ("model_p", "market_price", "lam", "expected"),
+    [
+        (0.8, 0.6, 0.0, 0.6),
+        (0.8, 0.6, 1.0, 0.8),
+        (0.9, 0.7, 2.0, 1.0),
+        (0.1, 0.3, 2.0, 0.0),
+    ],
+)
+def test_calibrated_probability_shrinks_and_clamps(
+    model_p: float,
+    market_price: float,
+    lam: float,
+    expected: float,
+) -> None:
+    assert calibrated_probability(model_p, market_price, lam) == pytest.approx(expected)
+
+
+def test_divergence_above_ceiling_is_blocked() -> None:
+    assert divergence_exceeds_ceiling(0.83, 0.70, 0.12) is True
+    assert divergence_exceeds_ceiling(0.82, 0.70, 0.12) is False
 
 
 def test_build_entry_variants_creates_full_and_adjacent_buckets() -> None:

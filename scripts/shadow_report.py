@@ -234,6 +234,17 @@ def _print_variant_breakdown(rows: list[dict]) -> None:
             _print_variant_stats(label, grouped[label])
 
 
+def _print_divergence_breakdown(rows: list[dict]) -> None:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        divergence = float(row.get("model_p") or 0) - float(row.get("sim_fill_price") or 0)
+        grouped[_bucket_label(divergence, settings.shadow_report_divergence_bins)].append(row)
+
+    print("\nПо расхождению model−price")
+    for label in sorted(grouped):
+        _print_variant_stats(label, grouped[label])
+
+
 def _donor_benchmark(rows: list[dict]) -> list[dict]:
     benchmark: list[dict] = []
     resolution_cache: dict[tuple[str, str], bool | None] = {}
@@ -313,6 +324,7 @@ def main() -> None:
             "s",
         ),
     )
+    _print_divergence_breakdown(settled)
     _print_variant_breakdown(rows)
 
     donor_signals = _donor_rows(start, end)

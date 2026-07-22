@@ -313,10 +313,14 @@ class Settings(BaseSettings):
     shadow_reconnect_max_sec: float = 30.0
     # alpha≈0.003 on one-second returns gives an effective 10–15 minute EWMA.
     shadow_ewma_alpha: float = 0.003
+    shadow_ewma_fast_alpha: float = 0.02
     shadow_vol_sample_sec: float = 1.0
     shadow_vol_min_samples: int = 120
+    shadow_vol_fast_min_samples: int = 30
     shadow_sigma_floor: float = 0.000001
     shadow_model_z_cap: float = 8.0
+    shadow_max_model_divergence: float = 0.12
+    shadow_calibration_lambda: float = 0.5
     # Gamma feeSchedule for crypto_fees_v2; verified against CLOB docs per market.
     shadow_fee_rate: float = 0.07
     shadow_fee_exponent: float = 1.0
@@ -332,6 +336,9 @@ class Settings(BaseSettings):
     shadow_digest_poll_sec: float = 60.0
     shadow_digest_throttle_sec: int = 2 * 86400
     shadow_report_edge_bins: list[float] = Field(default_factory=lambda: [0.05, 0.07, 0.10])
+    shadow_report_divergence_bins: list[float] = Field(
+        default_factory=lambda: [0.07, 0.10, 0.12]
+    )
     shadow_report_tau_bins_sec: list[float] = Field(default_factory=lambda: [30.0, 60.0, 90.0])
     shadow_report_strike_bins_bps: list[float] = Field(default_factory=lambda: [3.0, 8.0, 15.0])
 

@@ -21,7 +21,10 @@ from core.shadow_model import (
     EwmaVolatility,
     active_entry_variants,
     build_entry_variants,
+    calibrated_probability,
+    divergence_exceeds_ceiling,
     probability_up,
+    stressed_sigma,
     walk_order_book,
 )
 
@@ -35,6 +38,7 @@ SUPPORTED_ASSETS = {"btc", "eth", "sol", "xrp"}
 @dataclass
 class SpotState:
     volatility: EwmaVolatility
+    fast_volatility: EwmaVolatility
     eligible_from_window: int
     price: float | None = None
     timestamp_sec: float | None = None
@@ -81,6 +85,10 @@ class ShadowEngine:
             asset: SpotState(
                 volatility=EwmaVolatility(
                     alpha=settings.shadow_ewma_alpha,
+                    sample_interval_sec=settings.shadow_vol_sample_sec,
+                ),
+                fast_volatility=EwmaVolatility(
+                    alpha=settings.shadow_ewma_fast_alpha,
                     sample_interval_sec=settings.shadow_vol_sample_sec,
                 ),
                 eligible_from_window=eligible_from,
@@ -132,6 +140,7 @@ class ShadowEngine:
         state.timestamp_sec = timestamp_sec
         self.last_spot_rx_monotonic = time.monotonic()
         state.volatility.update(price, timestamp_sec)
+        state.fast_volatility.update(price, timestamp_sec)
         window_start = self._window_start(timestamp_sec)
         if window_start >= state.eligible_from_window:
             state.window_opens.setdefault(window_start, price)
@@ -380,8 +389,17 @@ class ShadowEngine:
         if now - state.timestamp_sec > settings.shadow_spot_stale_sec:
             observation.reason = "stale_spot"
             return
-        sigma = state.volatility.sigma
-        if sigma is None or state.volatility.samples < settings.shadow_vol_min_samples:
+        slow_sigma = state.volatility.sigma
+        if slow_sigma is None or state.volatility.samples < settings.shadow_vol_min_samples:
+            observation.reason = "vol_not_warm"
+            return
+        sigma_fast = (
+            state.fast_volatility.sigma
+            if state.fast_volatility.samples >= settings.shadow_vol_fast_min_samples
+            else None
+        )
+        sigma = stressed_sigma(slow_sigma, sigma_fast)
+        if sigma is None:
             observation.reason = "vol_not_warm"
             return
         time_left = market.window_end - now
@@ -429,6 +447,13 @@ class ShadowEngine:
             observation.best_edge = edge
             observation.model_p = model_p
             observation.ask = fill.best_ask
+        if divergence_exceeds_ceiling(
+            model_p,
+            fill.effective_price,
+            settings.shadow_max_model_divergence,
+        ):
+            observation.reason = "model_divergence_ceiling"
+            return
         if fill.effective_price > settings.shadow_max_price:
             observation.reason = "price_above_ceiling"
             return
@@ -449,6 +474,12 @@ class ShadowEngine:
             "spot": state.price,
             "open_price": open_price,
             "sigma": sigma,
+            "sigma_fast": sigma_fast,
+            "q_cal": calibrated_probability(
+                model_p,
+                fill.effective_price,
+                settings.shadow_calibration_lambda,
+            ),
             "book_best_ask": fill.best_ask,
             "sim_fill_price": fill.effective_price,
             "sim_shares": fill.shares,

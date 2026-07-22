@@ -74,6 +74,22 @@ class EwmaVolatility:
         return math.sqrt(max(self._variance_per_second, 0.0))
 
 
+def stressed_sigma(slow: float | None, fast: float | None) -> float | None:
+    """Return the highest available volatility estimate."""
+    available = [sigma for sigma in (slow, fast) if sigma is not None]
+    return max(available) if available else None
+
+
+def calibrated_probability(model_p: float, market_price: float, lam: float) -> float:
+    """Shrink model probability toward the execution price."""
+    return max(0.0, min(1.0, market_price + lam * (model_p - market_price)))
+
+
+def divergence_exceeds_ceiling(model_p: float, market_price: float, ceiling: float) -> bool:
+    """Return whether model probability is too far above execution price."""
+    return model_p - market_price > ceiling
+
+
 def build_entry_variants(
     entry_min_sec: float,
     entry_max_sec: float,
