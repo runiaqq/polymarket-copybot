@@ -391,7 +391,18 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
                      market=(cond or "")[:14], consensus=consensus)
             return {"skipped": True, "reason": "already_in_market"}
 
-        open_count = sum(1 for p in positions if p["shares"] > 0)
+        # BP31: count only economically live positions. Resolved leftovers stay in
+        # the Data-API forever with shares>0 (losing tokens are never redeemed,
+        # redeemable winners are freed shortly) — they must not consume the
+        # max_open_positions slots, or lost 5-min sniper trades permanently
+        # starve regular whale copying.
+        open_count = sum(
+            1
+            for p in positions
+            if p["shares"] > 0
+            and not p.get("redeemable")
+            and float(p.get("current_value") or 0) >= 0.01
+        )
         if not is_sniper and open_count >= settings.max_open_positions:
             log.info("skip_max_positions", user_id=user_id, open=open_count)
             return {"skipped": True, "reason": "max_positions"}

@@ -5865,3 +5865,16 @@ Placement diagnostics remain fixed at order creation in `placed_at`, and
 maker placement, fill, cancellation, expiry, settled performance, and the
 same-period `full` taker comparison. Maker entries and settlements never send
 Telegram signals and do not affect the BP28 Phase 2 gate.
+
+## Blueprint 31: live-position counting for the max_open_positions guard (2026-07-23)
+
+Data-API `/positions` reports resolved leftovers forever: losing tokens are never
+redeemed, so they sit with `shares>0`, `current_value=0`, `redeemable=true`. Every
+lost 5-min sniper trade therefore consumed a `max_open_positions` slot permanently;
+both real traders accumulated 20+ dead rows and regular whale copying was silently
+skipped with `skip_max_positions` (after they switched off Kelly — before that the
+`zero_edge` gate fired first and masked it). Fix in `execute_copy_trade`: the guard
+now counts only economically live positions (`shares>0` AND not `redeemable` AND
+`current_value >= $0.01`). Redeemable winners are also excluded — their capital is
+freed by the redemption task within minutes. The `already_in_market` guard is
+unchanged (resolved markets emit no new BUY signals).
