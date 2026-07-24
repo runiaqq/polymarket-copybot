@@ -10,8 +10,10 @@ from core.shadow_model import (
     maker_bid_price,
     maker_fill,
     maker_should_cancel,
+    passes_signal_filter,
     probability_up,
     stressed_sigma,
+    strike_distance_bp,
     walk_order_book,
 )
 
@@ -57,6 +59,43 @@ def test_calibrated_probability_shrinks_and_clamps(
 def test_divergence_above_ceiling_is_blocked() -> None:
     assert divergence_exceeds_ceiling(0.83, 0.70, 0.12) is True
     assert divergence_exceeds_ceiling(0.82, 0.70, 0.12) is False
+
+
+def test_strike_distance_bp() -> None:
+    # 100_000 -> 100_050 is ~5 bp in log space.
+    assert strike_distance_bp(100_050.0, 100_000.0) == pytest.approx(5.0, abs=0.01)
+    assert strike_distance_bp(99_950.0, 100_000.0) == pytest.approx(5.0, abs=0.01)
+    assert strike_distance_bp(100_000.0, 100_000.0) == 0.0
+    assert strike_distance_bp(0.0, 100_000.0) is None
+    assert strike_distance_bp(100_000.0, -1.0) is None
+
+
+FILTER_ARGS = {"min_edge": 0.07, "min_strike_bp": 3.0}
+
+
+@pytest.mark.parametrize(
+    ("edge", "spot", "open_price", "expected"),
+    [
+        # edge and distance both above thresholds -> signal
+        (0.08, 100_050.0, 100_000.0, True),
+        # edge below threshold
+        (0.069, 100_050.0, 100_000.0, False),
+        # distance below threshold (~2 bp)
+        (0.10, 100_020.0, 100_000.0, False),
+        # exactly at both thresholds (inclusive): edge 0.07, distance 3 bp
+        (0.07, 100_030.0451, 100_000.0, True),
+        # broken inputs never signal
+        (0.10, 0.0, 100_000.0, False),
+        (float("nan"), 100_050.0, 100_000.0, False),
+    ],
+)
+def test_passes_signal_filter(
+    edge: float,
+    spot: float,
+    open_price: float,
+    expected: bool,
+) -> None:
+    assert passes_signal_filter(edge, spot, open_price, **FILTER_ARGS) is expected
 
 
 @pytest.mark.parametrize(

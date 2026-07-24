@@ -26,6 +26,7 @@ from core.shadow_model import (
     maker_bid_price,
     maker_fill,
     maker_should_cancel,
+    passes_signal_filter,
     probability_up,
     stressed_sigma,
     walk_order_book,
@@ -692,6 +693,13 @@ class ShadowEngine:
         if time.monotonic() < self.db_retry_after:
             observation.reason = "db_retry_backoff"
             return
+        is_signal = passes_signal_filter(
+            edge,
+            state.price,
+            open_price,
+            min_edge=settings.shadow_filter_min_edge,
+            min_strike_bp=settings.shadow_filter_min_strike_bp,
+        )
         inserted_any = False
         saw_duplicate = False
         for variant_name, _, _ in pending_variants:
@@ -712,7 +720,7 @@ class ShadowEngine:
             inserted_any = True
             observation.entered = True
             observation.entered_variants.add(variant_name)
-            if variant_name == "full":
+            if variant_name == "full" and is_signal:
                 side_label = "Up ⬆️" if side == "up" else "Down ⬇️"
                 window_end_utc = datetime.fromtimestamp(
                     market.window_end,
@@ -738,6 +746,7 @@ class ShadowEngine:
                 depth_complete=fill.complete,
                 fee_usdc=fill.fee_usdc,
                 edge=round(edge, 6),
+                signal=is_signal,
             )
         observation.reason = (
             "entered" if inserted_any else ("db_duplicate" if saw_duplicate else "already_entered")
@@ -811,13 +820,25 @@ class ShadowEngine:
             .table("shadow_trades")
             .select(
                 "id,condition_id,token_id,window_end,sim_shares,"
-                "stake_usdc,fee_usdc,asset,side,sim_fill_price,variant"
+                "stake_usdc,fee_usdc,asset,side,sim_fill_price,variant,"
+                "edge,spot,open_price"
             )
             .eq("status", "open")
             .order("window_end")
             .execute()
             .data
             or []
+        )
+
+    @staticmethod
+    def _row_is_signal(row: dict[str, Any]) -> bool:
+        """Settlement notifications must mirror the entry-side signal filter."""
+        return row.get("variant") == "full" and passes_signal_filter(
+            float(row.get("edge") or 0),
+            float(row.get("spot") or 0),
+            float(row.get("open_price") or 0),
+            min_edge=settings.shadow_filter_min_edge,
+            min_strike_bp=settings.shadow_filter_min_strike_bp,
         )
 
     async def _resolve_trade(self, row: dict[str, Any], now: datetime) -> None:
@@ -843,7 +864,7 @@ class ShadowEngine:
                     0.0,
                     now,
                 )
-                if row.get("variant") == "full":
+                if self._row_is_signal(row):
                     await self._broadcast_signal(
                         f"⚠️ {str(row.get('asset') or '').upper()} "
                         f"{str(row.get('side') or '').capitalize()}: "
@@ -886,7 +907,7 @@ class ShadowEngine:
         cost = stake + fee
         roi = pnl / cost if cost > 0 else 0.0
         header = "✅ Победа" if won else "❌ Проигрыш"
-        if row.get("variant") == "full":
+        if self._row_is_signal(row):
             self._spawn_signal(
                 f"{header}: {str(row.get('asset') or '').upper()} "
                 f"{str(row.get('side') or '').capitalize()}\n"

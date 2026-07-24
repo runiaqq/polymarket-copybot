@@ -5866,6 +5866,23 @@ maker placement, fill, cancellation, expiry, settled performance, and the
 same-period `full` taker comparison. Maker entries and settlements never send
 Telegram signals and do not affect the BP28 Phase 2 gate.
 
+## Blueprint 30.4: hard signal filter for shadow signals (2026-07-24)
+
+Analysis of 682 settled full-variant trades showed every execution slice losing
+(taker −4.6%, maker −5.7%, all entry windows, all hours), while the only
+positive-expectancy pockets were edge ≥ 0.07 (+2.8…+7.1% ROI) combined with spot
+≥ 3 bp from the strike (near-strike entries are toxic: WR ~60% at price ~0.63).
+`passes_signal_filter` in `core/shadow_model.py` encodes this
+(`shadow_filter_min_edge=0.07`, `shadow_filter_min_strike_bp=3.0`). Collection is
+deliberately NOT filtered — all variants keep accruing rows for research. The
+filter gates only: (1) real-time Telegram entry/settlement signals (full variant
+only; settlement re-evaluates the filter from the stored `edge`/`spot`/`open_price`
+via `_row_is_signal`), and (2) the "Фильтр BP30.4" section in `shadow_report`,
+which prints ПРОШЛИ/ОТСЕЯНЫ side by side for forward validation. Backtest on
+collected data: passed n=184 WR 81.0% net −0.6% vs rejected −6.8%; BP30.2-era
+passed n=102 WR 83.3% net +0.9% vs rejected −6.0%. `shadow_virtual_entry` logs
+now carry `signal=true/false`.
+
 ## Blueprint 31: live-position counting for the max_open_positions guard (2026-07-23)
 
 Data-API `/positions` reports resolved leftovers forever: losing tokens are never

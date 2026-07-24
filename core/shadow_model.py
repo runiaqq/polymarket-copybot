@@ -90,6 +90,40 @@ def divergence_exceeds_ceiling(model_p: float, market_price: float, ceiling: flo
     return model_p - market_price > ceiling
 
 
+def strike_distance_bp(spot: float, open_price: float) -> float | None:
+    """Absolute log distance between spot and the window strike, in basis points."""
+    if (
+        spot <= 0
+        or open_price <= 0
+        or not math.isfinite(spot)
+        or not math.isfinite(open_price)
+    ):
+        return None
+    return abs(math.log(spot / open_price)) * 10_000
+
+
+def passes_signal_filter(
+    edge: float,
+    spot: float,
+    open_price: float,
+    *,
+    min_edge: float,
+    min_strike_bp: float,
+) -> bool:
+    """BP30.4 hard signal filter.
+
+    Collected data showed the only positive-expectancy slices are edge >= 0.07
+    combined with spot at least ~3 bp away from the strike; entries hugging the
+    strike are toxic (WR ~60% at price ~0.63). The engine keeps *collecting*
+    unfiltered trades for research; this filter gates only what counts as a
+    tradeable signal (Telegram notifications, filtered report section).
+    """
+    if not math.isfinite(edge) or edge < min_edge:
+        return False
+    distance = strike_distance_bp(spot, open_price)
+    return distance is not None and distance >= min_strike_bp
+
+
 def maker_bid_price(
     best_bid: float | None,
     best_ask: float | None,

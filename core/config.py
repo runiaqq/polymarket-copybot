@@ -324,6 +324,12 @@ class Settings(BaseSettings):
     shadow_maker_enabled: bool = True
     shadow_maker_min_edge: float = 0.05
     shadow_maker_cancel_edge: float = 0.0
+    # BP30.4 hard signal filter: the only positive-expectancy slices in collected
+    # data (edge >= 0.07, spot >= 3 bp from strike). Gates Telegram signals and the
+    # filtered report section only — collection itself stays unfiltered so every
+    # bucket keeps accruing forward data.
+    shadow_filter_min_edge: float = 0.07
+    shadow_filter_min_strike_bp: float = 3.0
     # Gamma feeSchedule for crypto_fees_v2; verified against CLOB docs per market.
     shadow_fee_rate: float = 0.07
     shadow_fee_exponent: float = 1.0

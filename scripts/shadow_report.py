@@ -15,7 +15,7 @@ from core.relayer import (
     get_payout_numerator,
     is_condition_resolved,
 )
-from core.shadow_model import build_entry_variants, fee_usdc
+from core.shadow_model import build_entry_variants, fee_usdc, passes_signal_filter
 
 DONOR = "0xf7f20c0f7e93a745d0cb064f5f62850d7b30d881"
 PAGE_SIZE = 1000
@@ -221,6 +221,27 @@ def _print_breakdown(
         _print_stats(label, grouped[label])
 
 
+def _row_passes_filter(row: dict) -> bool:
+    return passes_signal_filter(
+        float(row.get("edge") or 0),
+        float(row.get("spot") or 0),
+        float(row.get("open_price") or 0),
+        min_edge=settings.shadow_filter_min_edge,
+        min_strike_bp=settings.shadow_filter_min_strike_bp,
+    )
+
+
+def _print_filter_section(settled: list[dict]) -> None:
+    passed = [row for row in settled if _row_passes_filter(row)]
+    rejected = [row for row in settled if not _row_passes_filter(row)]
+    print(
+        f"\nФильтр BP30.4 (edge>={settings.shadow_filter_min_edge:g}, "
+        f"дистанция>={settings.shadow_filter_min_strike_bp:g}bp)"
+    )
+    _print_stats("ПРОШЛИ ФИЛЬТР", passed)
+    _print_stats("ОТСЕЯНЫ", rejected)
+
+
 def _strike_distance_bucket(row: dict) -> str:
     spot = float(row.get("spot") or 0)
     open_price = float(row.get("open_price") or 0)
@@ -337,6 +358,7 @@ def main() -> None:
     print(f"Период: {start.isoformat()} — {end.isoformat()}")
     print(f"Shadow full: всего {len(full_rows)}, open {open_count}, void {void_count}")
     _print_stats("ВСЕГО SHADOW", settled)
+    _print_filter_section(settled)
     _print_breakdown("По активам", settled, lambda row: str(row.get("asset") or "?").upper())
     _print_breakdown(
         "По edge",
