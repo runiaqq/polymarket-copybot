@@ -799,6 +799,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 def build_application() -> Application:
     app = Application.builder().token(settings.telegram_bot_token).post_init(_set_commands).build()
     app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("onboarding", cmd_onboarding))
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("wallet",    cmd_wallet))
     app.add_handler(CommandHandler("positions", cmd_positions))
@@ -895,6 +896,29 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="HTML",
                 reply_markup=_main_kb(is_paused=_is_risk_paused(db_user)),
             )
+
+
+async def cmd_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """BP32: replay the wallet-creation onboarding from screen A (partner review).
+
+    Safe for everyone: the create step is idempotent — an existing registered
+    wallet only replays the staged messages and re-renders the card, so repeat
+    runs never generate new keys or deploy anything.
+    """
+    tg_user = update.effective_user
+    if not tg_user:
+        return
+    if not settings.auto_copy_enabled:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Онбординг с кошельком доступен только в режиме автокопирования.",
+        )
+        return
+    upsert_user(tg_user.id)
+    await update.message.reply_text(  # type: ignore[union-attr]
+        _onb_create_text(),
+        parse_mode="HTML",
+        reply_markup=_onb_create_kb(),
+    )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2181,8 +2205,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         db_user = get_user_by_telegram_id(tg_user.id) or upsert_user(tg_user.id)
 
-        # Idempotent re-entry: everything already set up → just show the card.
+        # Idempotent re-entry / partner demo replay (BP32, /onboarding): the
+        # wallet already exists — replay the staged UX with zero writes and no
+        # relayer calls, then land on the same card. Repeat runs can never
+        # create a second wallet.
         if db_user.get("wallet_address") and db_user.get("wallet_registered"):
+            await query.edit_message_text(_ONB_CREATING_STAGE1, parse_mode="HTML")
+            await asyncio.sleep(7)
+            await query.edit_message_text(_ONB_CREATING_STAGE2, parse_mode="HTML")
+            await asyncio.sleep(5)
             await _show_wallet_card(query, db_user)
             return
 

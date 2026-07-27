@@ -5883,6 +5883,17 @@ collected data: passed n=184 WR 81.0% net −0.6% vs rejected −6.8%; BP30.2-er
 passed n=102 WR 83.3% net +0.9% vs rejected −6.0%. `shadow_virtual_entry` logs
 now carry `signal=true/false`.
 
+## Blueprint 32: replayable onboarding for partner review (2026-07-27)
+
+Partners need to walk through the BP27 wallet-creation onboarding repeatedly
+without minting a new wallet each time. `/onboarding` (available to any user in
+auto-copy mode) re-opens Screen A. The `onb_create_wallet` idempotent re-entry
+now *replays* the staged UX — stage 1 (7 s) → stage 2 (5 s) → wallet card —
+with zero DB writes and no relayer calls when `wallet_address` and
+`wallet_registered` are already set. First-ever run still creates the wallet
+for real; a user stuck between key generation and registration resumes the real
+registration (no new keys). Repeat runs can never create a second wallet.
+
 ## Blueprint 31: live-position counting for the max_open_positions guard (2026-07-23)
 
 Data-API `/positions` reports resolved leftovers forever: losing tokens are never
