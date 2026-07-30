@@ -61,6 +61,21 @@ services:
       redis:
         condition: service_healthy
 
+  # BP33: standalone BTC-bot pilot — separate Telegram bot + real-money executor.
+  # Consumes shadow-engine signals via Redis pub/sub. Gated by CRYPTO_BOT_ENABLED.
+  cryptobot:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: "redis://redis:6379"
+    command: ["python", "-m", "cryptobot.main"]
+    depends_on:
+      redis:
+        condition: service_healthy
+
   # Periodic scheduler — separate process (gevent pool can't embed --beat).
   # Keep exactly ONE replica so periodic tasks aren't double-fired.
   beat:

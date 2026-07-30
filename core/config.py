@@ -485,5 +485,32 @@ class Settings(BaseSettings):
     # 0.0 = disabled.  0.25 = no single trade can give back >25% of profit cushion.
     max_trade_loss_vs_profit_pct: float = 0.25
 
+    # ── Blueprint 33: standalone BTC-bot real-money pilot ─────────────────────
+    # Separate Telegram bot + executor consuming shadow-engine signals via Redis.
+    crypto_bot_enabled: bool = False
+    crypto_bot_token: str = ""
+    # Redis pub/sub channel the shadow engine publishes filter-passing signals to.
+    crypto_signals_channel: str = "crypto_signals"
+    # Pilot access control: only these telegram_ids may trade. Empty = closed.
+    crypto_whitelist_telegram_ids: list[int] = []
+    # Global kill switch for order placement (bot UI keeps working).
+    crypto_trading_enabled: bool = True
+    # Stake per trade: user picks a preset; capped by free pUSD minus fee headroom.
+    crypto_stake_presets: list[float] = [5.0, 10.0, 15.0]
+    crypto_default_stake_usdc: float = 5.0
+    crypto_fee_headroom_pct: float = 0.03
+    # Entry guards: skip when the signal ask already exceeds the ceiling; the
+    # FAK worst-price band bounds slippage beyond the signal price.
+    crypto_max_entry_price: float = 0.95
+    crypto_entry_slippage_pct: float = 0.015
+    # Discard signals older than this (Redis lag / executor restart).
+    crypto_signal_max_age_sec: float = 4.0
+    # Stop trading for the day when realized PnL <= -(mult × stake).
+    crypto_daily_loss_mult: float = 3.0
+    crypto_resolution_poll_sec: float = 20.0
+    crypto_resolution_void_after_sec: int = 86400
+    # EOA -> deposit-wallet auto-funding sweep cadence.
+    crypto_funding_poll_sec: float = 90.0
+
 
 settings = Settings()  # type: ignore[call-arg]

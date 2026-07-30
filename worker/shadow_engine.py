@@ -132,6 +132,7 @@ class ShadowEngine:
         self.db_retry_after = 0.0
         self.last_spot_rx_monotonic = time.monotonic()
         self._signal_tasks: set[asyncio.Task] = set()
+        self._redis = None  # lazy redis.asyncio client for BP33 signal publishing
 
     async def _broadcast_signal(self, text: str) -> None:
         for chat_id in settings.shadow_signal_telegram_ids:
@@ -145,6 +146,29 @@ class ShadowEngine:
         if not settings.shadow_signal_telegram_ids:
             return
         task = asyncio.create_task(self._broadcast_signal(text))
+        self._signal_tasks.add(task)
+        task.add_done_callback(self._signal_tasks.discard)
+
+    # ── BP33: real-money executor feed ────────────────────────────────────────
+
+    async def _publish_execution_signal(self, payload: dict[str, Any]) -> None:
+        """Fire-and-forget pub/sub: no subscribers means the message vanishes,
+        which is exactly what we want (no stale-signal queue to drain)."""
+        try:
+            if self._redis is None:
+                import redis.asyncio as aioredis
+
+                self._redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+            await self._redis.publish(
+                settings.crypto_signals_channel,
+                json.dumps(payload, separators=(",", ":")),
+            )
+        except Exception as exc:
+            log.warning("crypto_signal_publish_failed", error=str(exc)[:200])
+            self._redis = None
+
+    def _spawn_publish(self, payload: dict[str, Any]) -> None:
+        task = asyncio.create_task(self._publish_execution_signal(payload))
         self._signal_tasks.add(task)
         task.add_done_callback(self._signal_tasks.discard)
 
@@ -721,6 +745,24 @@ class ShadowEngine:
             observation.entered = True
             observation.entered_variants.add(variant_name)
             if variant_name == "full" and is_signal:
+                # BP33: hand the filter-passing signal to the real-money executor.
+                self._spawn_publish(
+                    {
+                        "asset": asset,
+                        "condition_id": market.condition_id,
+                        "token_id": token_id,
+                        "side": side,
+                        "price": fill.effective_price,
+                        "best_ask": fill.best_ask,
+                        "tick_size": market.tick_size,
+                        "fee_rate": market.fee_rate,
+                        "fee_exponent": market.fee_exponent,
+                        "window_end": market.window_end,
+                        "model_p": model_p,
+                        "edge": edge,
+                        "published_at": time.time(),
+                    }
+                )
                 side_label = "Up ⬆️" if side == "up" else "Down ⬇️"
                 window_end_utc = datetime.fromtimestamp(
                     market.window_end,

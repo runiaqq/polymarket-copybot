@@ -5909,7 +5909,8 @@ unchanged (resolved markets emit no new BUY signals).
 
 ## Blueprint 33: BTC-bot real-money pilot — standalone product (PLAN, 2026-07-30)
 
-Status: architecture plan only. No code yet. Gate that unlocked this plan: 302
+Status: **Phase A implemented 2026-07-30** — see «33.9 Implementation» at the
+end of this blueprint. Gate that unlocked this plan: 302
 filter-passing trades since BP30.4 deploy, WR 87.7%, net +3.9% ROI (+$178),
 survived one bad day (28.07 −5.4% vs unfiltered −8.3%); all three Europe day
 segments positive; maker permanently rejected (−2.8% under filter vs +3.9%
@@ -6049,3 +6050,76 @@ cached, no per-order Supabase round-trip) and dispatches users concurrently
    exactly what Phase B measures; do not promise shadow ROI to partners.
 6. Filter thresholds (`0.07` / `3 bp`) are config, not code — retuning must be
    a config change with a CURSOR.md note, not a silent edit.
+
+### 33.9 Implementation (Phase A, 2026-07-30)
+
+Shipped as a new top-level package `cryptobot/` plus one compose service.
+Copytrade code paths untouched; the only shared-file edits are the config
+block, the Redis publish hook in the shadow engine, and compose.
+
+**Data (migration `025_crypto_bot.sql`).** `crypto_users` (telegram_id, BP27
+wallet fields: EOA + key enc + deposit wallet + CLOB creds, `trading_on`,
+`stake_usdc`, `eoa_stable_baseline` for deposit detection) and `crypto_trades`
+(signal context + exact fill facts from the order response + lifecycle
+open→win/loss/void, `skipped` rows for attempted-but-failed orders). Unique
+index `(user_id, condition_id)` = one position per user per market, the
+executor's idempotency backstop.
+
+**Signal path.** `worker/shadow_engine.py` now publishes every filter-passing
+`full` entry to Redis pub/sub channel `crypto_signals` (fire-and-forget; no
+subscribers → message vanishes, no stale queue). Payload: condition/token ids,
+side, sim fill price, best ask, tick size, fee rate/exponent, window_end,
+model_p, edge, published_at.
+
+**Service (`cryptobot/main.py`, compose `cryptobot`).** One process runs both
+the PTB bot (manual `initialize/start_polling/start`, so the loop stays free)
+and `CryptoExecutor` with three loops:
+
+- `signal_loop` — subscribes to the channel; guards: `crypto_trading_enabled`
+  kill switch, signal age ≤4 s, ≥8 s left in window, ask ≤0.95. Loads
+  whitelisted active traders, shuffles (fair book access), places FAK BUYs in
+  parallel threads. Per user: daily-loss gate (−3× stake realized today, UTC),
+  stake = preset capped by free pUSD − 3% fee headroom (skip below $5 exchange
+  min, throttled Telegram warning), then `core.clob.place_order` (1.5%
+  slippage band) and `extract_buy_fill` for exact cost/shares/fee; fee falls
+  back to the BP30 formula when the response omits it. No-fill and order
+  errors are recorded as `skipped` rows.
+- `resolution_loop` — every 20 s settles finished windows via
+  `is_condition_resolved` / `detect_outcome_index` / `get_payout_numerator`;
+  winners redeemed with `redeem_winnings` (relayer, idempotent — row stays
+  open and retries if redemption fails); void after 24 h. PnL = shares − cost
+  − fee. Entry/settlement notifications match the shadow-signal format.
+- `funding_loop` — every 90 s replicates the copytrade deposit monitor for
+  `crypto_users`: detects EOA USDC arrivals against `eoa_stable_baseline`,
+  auto-sweeps to pUSD via `fund_deposit_wallet` when POL gas is present
+  (otherwise tells the user to send ~0.1 POL), self-heals stranded USDC.e on
+  the deposit wallet.
+
+**Bot UX (`cryptobot/bot.py`).** `/start` → closed-pilot gate (whitelist) →
+BP27-style explicit wallet creation (staged messages, honest error + retry
+resumes from where it stopped, double-tap guard) → main menu card: deposit
+address, pUSD balance, trading on/off, stake, today's PnL. Buttons: toggle
+trading (refuses to enable below $5 balance), Пополнить (address +
+CopyTextButton + Polygonscan + custody explainer + POL note), Ставка (presets
+from `crypto_stake_presets`), Статистика (today/all-time), Как торгует бот
+(honest strategy explainer), Вывод (manual-by-support in the pilot — the
+copytrade auto-withdraw path needs EOA gas orchestration, deferred).
+
+**Config (all env-overridable).** `crypto_bot_enabled` (default False — the
+service idles until enabled), `crypto_bot_token`, `crypto_signals_channel`,
+`crypto_whitelist_telegram_ids` (empty = closed), `crypto_trading_enabled`
+kill switch, `crypto_stake_presets` [5,10,15], `crypto_max_entry_price` 0.95,
+`crypto_entry_slippage_pct` 0.015, `crypto_signal_max_age_sec` 4,
+`crypto_daily_loss_mult` 3, `crypto_fee_headroom_pct` 0.03, resolution/funding
+poll cadences.
+
+**Tests.** `tests/test_cryptobot_logic.py` covers the pure gates
+(`pilot_stake`, `signal_is_fresh`, `entry_price_ok`, `daily_loss_exceeded`).
+DB/бот/executor I/O paths are thin wrappers over battle-tested `core/*` calls.
+
+**Deploy.** Apply migration 025 in Supabase; add to `.env`:
+`CRYPTO_BOT_ENABLED=true`, `CRYPTO_BOT_TOKEN=<new BotFather token>`,
+`CRYPTO_WHITELIST_TELEGRAM_IDS=[504677064,879714159]`; then
+`docker compose up -d --build cryptobot shadow` (shadow rebuild picks up the
+publisher). Kill switch without redeploy: `CRYPTO_TRADING_ENABLED=false` +
+`docker compose up -d cryptobot`.
