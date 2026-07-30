@@ -5906,3 +5906,146 @@ now counts only economically live positions (`shares>0` AND not `redeemable` AND
 `current_value >= $0.01`). Redeemable winners are also excluded — their capital is
 freed by the redemption task within minutes. The `already_in_market` guard is
 unchanged (resolved markets emit no new BUY signals).
+
+## Blueprint 33: BTC-bot real-money pilot — standalone product (PLAN, 2026-07-30)
+
+Status: architecture plan only. No code yet. Gate that unlocked this plan: 302
+filter-passing trades since BP30.4 deploy, WR 87.7%, net +3.9% ROI (+$178),
+survived one bad day (28.07 −5.4% vs unfiltered −8.3%); all three Europe day
+segments positive; maker permanently rejected (−2.8% under filter vs +3.9%
+taker).
+
+### 33.1 Product shape
+
+A **separate Telegram bot** (own `TELEGRAM_BOT_TOKEN`, own product name) that
+auto-trades our own BP30 signal engine (BTC 5-min up/down, BP30.4 filter,
+taker-only) with real user money. It is NOT another mode inside the copytrade
+bot: different audience, different risk story, different lifecycle (positions
+live 20–120 s, resolution within minutes). Sharing one bot UI would force every
+menu into mode-branches and double regression surface.
+
+What IS shared: the repo, `core/*` (wallets, CLOB client, order-fill
+accounting, relayer redemption, shadow model), Supabase instance, deploy
+pipeline. The new bot is one more compose service reading the same signal
+stream.
+
+### 33.2 Wallet decision: per-user wallets (BP27 flow), NOT one house account
+
+Considered two options:
+
+**(A) Per-user custodial wallet — CHOSEN.** Exactly the BP27 pipeline: generate
+EOA → deploy deposit proxy → register on Polymarket → persist CLOB creds. Users
+deposit to their own address; every fill, fee and redemption lands on their own
+ledger; withdrawals are per-user; a partner can verify their wallet on
+Polygonscan. All of this code exists and is battle-tested (BP25/27/29 fixes).
+
+**(B) One "house" Polymarket account trading pooled funds — REJECTED.** One
+fast order instead of N is tempting (thin books), but: (1) commingled funds —
+internal shares ledger becomes the source of truth for user money, any bug is
+a direct liability; (2) deposits/withdrawals need attribution and queuing
+against open positions; (3) one banned/limited account halts every user; (4)
+per-user PnL must be synthesized pro-rata, which breaks the moment stakes
+change mid-window; (5) our sniper history shows partial fills — splitting a
+partial fill fairly across a pool is exactly the accounting swamp BP29 drained.
+Pooling buys ~1 s of latency and costs custody integrity. No.
+
+Consequence of (A): execution fans out N CLOB orders per signal. Mitigations in
+33.5 (parallel dispatch, depth cap, user cap for the pilot).
+
+### 33.3 Data model (new tables, no reuse of copytrade rows)
+
+- `crypto_users` — telegram_id, username, wallet columns mirroring `users`
+  (EOA, enc key, deposit wallet, CLOB creds, `wallet_registered`), plus
+  `stake_usdc` (default 5), `trading_on` (default false), `daily_loss_limit_usdc`
+  (default = 3 × stake), `created_at`. Deliberately NOT the copytrade `users`
+  table: same telegram_id may exist in both products with different wallets and
+  settings; mixing them recreates the BP24 mirror-drift class of bugs.
+- `crypto_trades` — one row per user per market: condition_id, token_id, side,
+  signal price/edge/model_p, requested/filled USDC, shares, fill price, fee
+  (from order response — BP29 `extract_buy_fill` is mandatory from day one),
+  status (`open/win/loss/void/skipped`), skip_reason, resolved_at, pnl_usdc.
+  Unique index `(user_id, condition_id)` = idempotency guard.
+- Shadow tables stay untouched — the shadow engine keeps running unfiltered as
+  the control group (33.7).
+
+### 33.4 Signal path
+
+Shadow engine stays the single brain. On a **full-variant entry that passes
+`passes_signal_filter`** it publishes an execution signal (Redis pub/sub or a
+`crypto_signals` row + NOTIFY; decide at build time — Redis already in
+compose). Payload: condition_id, token_id, side, signal price, book snapshot
+timestamp, window_end. The executor consumes; the shadow row itself remains a
+pure simulation so live results never contaminate research data.
+
+Hard constraint: signal fires 20–120 s before window close; orders must land
+within ~2–3 s. Executor therefore holds a warm CLOB client per user (creds
+cached, no per-order Supabase round-trip) and dispatches users concurrently
+(`asyncio.gather`), not sequentially.
+
+### 33.5 Execution rules (pilot)
+
+- Taker FAK buy at ask, per-user stake = `min(stake_usdc, free_pusd × 0.97)`
+  (3% fee headroom — BP29 lesson).
+- Price guard: skip if executable price > signal price + 1.5% or > 0.95
+  absolute. Never chase; a skipped trade is logged with skip_reason (the BP28
+  audit proved dip-buying below signal price is adverse selection — same rule
+  here: band, not discount-hunting).
+- Depth cap: spend at most 25% of visible band depth per user; dispatch users
+  in random order per signal so nobody is systematically last.
+- One position per market per user (unique index), no averaging, no exits
+  before resolution — strategy holds to resolution by design; stop-losses in
+  5-min binaries were already analyzed and rejected (whipsaw + double costs).
+- Settlement: reuse the relayer resolution detector + redeem path; PnL from
+  true on-chain payout against the order-response ledger. Void after 24 h like
+  shadow.
+- Risk rails (all pilot-simple): `trading_on` toggle per user; global
+  `crypto_kill_switch` env/admin command checked before every dispatch;
+  per-user daily loss limit (skip new entries after breach, message the user);
+  max 1 concurrent open position (windows are 5 min — overlap is minimal
+  anyway); min recommended balance $50, hard floor $10.
+
+### 33.6 Bot UX (deliberately minimal, but complete)
+
+- `/start` → BP27-style staged wallet creation (reuse the exact flow partners
+  already reviewed, including `/onboarding` replay) → wallet card.
+- Main menu (single screen, buttons): `💰 Баланс` (pUSD + deposit address),
+  `▶️/⏸ Торговля вкл/выкл`, `⚙️ Ставка` (presets $5/$10/$15 — no free input in
+  the pilot), `📊 Сегодня` (n, WR, net PnL today + since start), `💸 Вывод`
+  (reuse copytrade withdraw path), `❓ Как это работает`.
+- Notifications: entry (`🎯 BTC Up, вход 0.84, ставка $10`), settlement
+  (`✅ +$1.90 (+22%)` — same math users already sanity-checked), daily digest
+  21:00 UTC, skip notices only for balance/limit reasons (not for price-guard
+  skips — too noisy).
+- Copy in plain language: this bot trades OUR strategy, not a copied whale;
+  expected profile "many small wins, occasional −100% losses on a trade";
+  показываем net после комиссий.
+
+### 33.7 Pilot protocol and gates
+
+- Phase A (build): bot skeleton + wallet flow + executor behind whitelist.
+  Whitelist = the two internal users (504677064, 879714159), stake $5.
+- Phase B (1 week live): compare EVERY live fill against its shadow row —
+  live_fill_price − sim_fill_price is the honest slippage measure; shadow
+  stays the control. Daily report section: live vs shadow ROI, fill rate,
+  skip reasons.
+- Gate to Phase C (partners, stake ≤$15, ~10 users): live ROI within 2 pp of
+  shadow over ≥100 live trades AND median entry latency ≤3 s AND zero ledger
+  mismatches (order-response totals vs on-chain redemption).
+- Capacity ceiling from BP28 book study still applies: tens of dollars of
+  depth near close. 10 users × $15 = $150 per signal is already at the edge —
+  scaling beyond the pilot needs the depth-cap telemetry from Phase B before
+  any promises to partners.
+
+### 33.8 Known pitfalls (carried from earlier blueprints, must not regress)
+
+1. Fees: clamp stake by fee headroom or CLOB rejects at full balance (BP29).
+2. Ledger truth only from order responses, never Data-API `current_value`
+   (BP29).
+3. Data-API resolved leftovers are immortal — never count them as open
+   positions (BP31).
+4. Relayer neg-risk path irrelevant here (standalone binaries) but redemption
+   retry/backoff from BP25 applies.
+5. Live slippage will be worse than `walk_order_book` on a snapshot — that is
+   exactly what Phase B measures; do not promise shadow ROI to partners.
+6. Filter thresholds (`0.07` / `3 bp`) are config, not code — retuning must be
+   a config change with a CURSOR.md note, not a silent edit.
