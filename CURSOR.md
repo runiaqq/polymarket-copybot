@@ -6123,3 +6123,74 @@ DB/бот/executor I/O paths are thin wrappers over battle-tested `core/*` calls
 `docker compose up -d --build cryptobot shadow` (shadow rebuild picks up the
 publisher). Kill switch without redeploy: `CRYPTO_TRADING_ENABLED=false` +
 `docker compose up -d cryptobot`.
+
+## Blueprint 34: onboarding polish + executor FAK re-quote (PLAN, 2026-07-31)
+
+Context: first live night of BP33 (2026-07-30 18:37 → 07-31 09:23 UTC) plus a
+partner walking the copytrade onboarding.
+
+### 34.1 First-night executor audit (facts, no code change needed for these)
+
+Signal delivery is airtight: 33 filter-passing full signals in shadow_trades,
+33 matching crypto_trades rows — zero lost between Redis publish and executor.
+27 filled (25 win / 2 loss, net +$46 on $15 stakes, WR 92.6%), 6 skipped.
+
+### 34.2 Executor: one re-quote retry on FAK kill — THE code change
+
+All 6 skips share one failure: CLOB 400 `no orders found to match with FAK
+order`. Between the shadow book snapshot and our order (~1 s) the ask moved
+above our worst-price band (signal ask × 1.015), so the FAK found nothing and
+was killed. Shadow counted those 6 as simulated trades (5 would-be wins, 1
+loss) — that is exactly why the copytrade bot "has more trades" than the
+crypto bot. 18% signal loss is worth fixing; expected-value of the missed six
+was positive.
+
+Worse: `_place_trade` records the failure as a `skipped` row in crypto_trades,
+and the `(user_id, condition_id)` unique index then blocks any retry — one
+unlucky FAK permanently forfeits the signal.
+
+Fix (in `cryptobot/executor.py::_place_trade`):
+1. Catch specifically the FAK no-match failure (match "no orders found to
+   match" in the exception text); all other order errors keep the current
+   record-skip-and-stop path.
+2. On no-match: re-fetch the live top of book (`core.polymarket.get_order_book`
+   on the signal's token_id), take fresh best_ask, and re-check the same entry
+   guards: best_ask ≤ `crypto_max_entry_price`, window_end − now ≥ 8 s
+   (MIN_TIME_LEFT_SEC), and best_ask not worse than signal ask by more than a
+   re-quote ceiling — new setting `crypto_requote_max_worse_pct` (default
+   0.03: re-quote may pay up to 3% above the signal price, beyond that the
+   edge thesis is broken).
+3. Re-place the same FAK once with price = fresh best_ask (same slippage band).
+   ONE retry only — no loops; 5-min books move too fast for more.
+4. Only after the retry fails (or guards reject it) insert the `skipped` row
+   with reason `no_fill_after_requote` / original error.
+Add `requoted` boolean column? NO — keep schema; encode via skip_reason and a
+log line (`crypto_requote_placed`) — pilot telemetry lives in logs.
+
+Tests: pure guard for the re-quote decision goes into `cryptobot/logic.py`
+(e.g. `requote_price_ok(signal_ask, fresh_ask, max_worse_pct, max_entry)`) +
+unit tests in tests/test_cryptobot_logic.py.
+
+### 34.3 Copytrade bot: /onboarding lands wrong + «Это безопасно?» removal
+
+Facts: BP32 code in the repo is CORRECT — `/onboarding` renders Screen A
+(`_onb_create_text` + create button), is NOT in MAIN_COMMANDS (hidden, known
+only to those told about it), and the create callback replays staged messages
+idempotently for registered wallets. The partner's `/onboarding` landed on the
+OLD autotrade-gate screen because the api container on the VPS is 3 days old —
+BP32/BP27 fixes were committed later and `docker compose up -d --build` was
+run only for `cryptobot shadow`. Deploy, not code: rebuild `api`.
+
+Code change that IS needed: remove the «🛡 Это безопасно?» button from the L0
+welcome keyboard (`_onboarding_kb` in api/routers/telegram.py). Keep the
+`onb_trust` callback handler (old messages keep working buttons), just stop
+offering it. Nothing else on that keyboard changes.
+
+### 34.4 Deploy
+
+```
+cd /home/ubuntu/app && git pull
+docker compose up -d --build api cryptobot
+```
+
+(shadow untouched by this blueprint; api rebuild also finally ships BP27/32.)
