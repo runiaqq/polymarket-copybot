@@ -110,10 +110,9 @@ def _onboarding_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎬 Смотреть сигналы (без риска)", callback_data="onb_signals")],
         [InlineKeyboardButton("🚀 Перейти к автоторговле",       callback_data="onb_autotrade")],
-        [
-            InlineKeyboardButton("❓ Как это работает", callback_data="help"),
-            InlineKeyboardButton("🛡 Это безопасно?",  callback_data="onb_trust"),
-        ],
+        # BP34: «🛡 Это безопасно?» removed from the offer; the onb_trust
+        # callback handler stays alive so old messages keep working.
+        [InlineKeyboardButton("❓ Как это работает", callback_data="help")],
     ])
 
 

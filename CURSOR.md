@@ -6124,7 +6124,7 @@ DB/бот/executor I/O paths are thin wrappers over battle-tested `core/*` calls
 publisher). Kill switch without redeploy: `CRYPTO_TRADING_ENABLED=false` +
 `docker compose up -d cryptobot`.
 
-## Blueprint 34: onboarding polish + executor FAK re-quote (PLAN, 2026-07-31)
+## Blueprint 34: onboarding polish + executor FAK re-quote (implemented, 2026-07-31)
 
 Context: first live night of BP33 (2026-07-30 18:37 → 07-31 09:23 UTC) plus a
 partner walking the copytrade onboarding.
@@ -6194,3 +6194,26 @@ docker compose up -d --build api cryptobot
 ```
 
 (shadow untouched by this blueprint; api rebuild also finally ships BP27/32.)
+
+### 34.5 What was actually implemented
+
+* `core/config.py`: new `crypto_requote_max_worse_pct: float = 0.03` in the BP33 block.
+* `cryptobot/logic.py`: pure guard `requote_price_ok(signal_ask, fresh_ask,
+  max_worse_pct, max_entry_price)` — fresh ask must be valid (>0), ≤ the hard
+  entry ceiling, and ≤ signal_ask × (1 + max_worse_pct); parameterized tests in
+  tests/test_cryptobot_logic.py cover the exact-3% boundary, the price ceiling,
+  and None/0 asks on both sides.
+* `cryptobot/executor.py::_place_trade`: when place_order raises with
+  "no orders found to match" (case-insensitive) it calls `_requote_once`,
+  which re-checks window_end − now ≥ MIN_TIME_LEFT_SEC, fetches the live book
+  via `core.polymarket.get_order_book`, runs `requote_price_ok`, and re-places
+  the same FAK once at the fresh best ask (same slippage band). Success logs
+  `crypto_requote_placed` (user_id, cond, old_ask, new_ask). The skipped row is
+  inserted only after the retry fails or a guard rejects; skip_reason is one of
+  `requote_window_closing` / `requote_no_book` / `requote_price_ceiling` /
+  `requote_price_too_worse` / `no_fill_after_requote` /
+  `order_error_after_requote: …`. All other order errors keep the old
+  skip-immediately path. No schema change, no `requoted` column.
+* `api/routers/telegram.py::_onboarding_kb`: «🛡 Это безопасно?» button removed
+  from the L0 welcome keyboard; the `onb_trust` callback handler stays so old
+  messages keep working. `/onboarding` verified absent from MAIN_COMMANDS.

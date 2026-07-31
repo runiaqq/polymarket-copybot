@@ -32,6 +32,22 @@ def entry_price_ok(best_ask: float | None, max_entry_price: float) -> bool:
     return best_ask is not None and 0 < best_ask <= max_entry_price
 
 
+def requote_price_ok(
+    signal_ask: float | None,
+    fresh_ask: float | None,
+    max_worse_pct: float,
+    max_entry_price: float,
+) -> bool:
+    """BP34 re-quote guard after a FAK kill: the fresh ask must be a valid
+    price below the hard entry ceiling and not worse than the signal ask by
+    more than max_worse_pct (paying above that breaks the edge thesis)."""
+    if not signal_ask or signal_ask <= 0 or not fresh_ask or fresh_ask <= 0:
+        return False
+    if fresh_ask > max_entry_price:
+        return False
+    return fresh_ask <= signal_ask * (1.0 + max_worse_pct)
+
+
 def daily_loss_exceeded(realized_today_usdc: float, stake_usdc: float, mult: float) -> bool:
     """Stop trading for the day once realized losses reach mult × stake."""
     if mult <= 0 or stake_usdc <= 0:
