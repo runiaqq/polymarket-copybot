@@ -7,6 +7,7 @@ from cryptobot.logic import (
     entry_price_ok,
     pilot_stake,
     requote_price_ok,
+    should_flag_stuck,
     signal_is_fresh,
 )
 
@@ -78,6 +79,30 @@ class TestRequotePriceOk:
     )
     def test_guard(self, signal_ask, fresh_ask, expected):
         assert requote_price_ok(signal_ask, fresh_ask, 0.03, 0.95) is expected
+
+
+class TestShouldFlagStuck:
+    """BP35 watchdog threshold (threshold_sec=900, i.e. 15 minutes)."""
+
+    @pytest.mark.parametrize(
+        ("window_end_ts", "now_ts", "expected"),
+        [
+            # Window just ended — nothing wrong yet.
+            (1000.0, 1000.0, False),
+            # Under the threshold.
+            (1000.0, 1899.0, False),
+            # Exactly at the threshold: not yet "older than" 15 minutes.
+            (1000.0, 1900.0, False),
+            # One second past — stuck.
+            (1000.0, 1901.0, True),
+            # Way past (the incident case: 25+ minutes).
+            (1000.0, 2600.0, True),
+            # Window still in the future (clock skew) — never stuck.
+            (2000.0, 1000.0, False),
+        ],
+    )
+    def test_threshold(self, window_end_ts, now_ts, expected):
+        assert should_flag_stuck(window_end_ts, now_ts, 900.0) is expected
 
 
 class TestDailyLossExceeded:

@@ -29,6 +29,7 @@ from cryptobot.logic import (
     entry_price_ok,
     pilot_stake,
     requote_price_ok,
+    should_flag_stuck,
     signal_is_fresh,
 )
 
@@ -39,6 +40,9 @@ log = structlog.get_logger(__name__)
 MIN_TIME_LEFT_SEC = 8.0
 LOW_BALANCE_THROTTLE_SEC = 6 * 3600
 DAILY_LIMIT_THROTTLE_SEC = 12 * 3600
+# BP35: an open row whose window ended this long ago is flagged as stuck.
+STUCK_THRESHOLD_SEC = 15 * 60
+STUCK_THROTTLE_SEC = 3600
 
 
 async def notify(chat_id: int, text: str) -> None:
@@ -333,6 +337,7 @@ class CryptoExecutor:
                 now = datetime.now(timezone.utc)  # noqa: UP017
                 for row in rows:
                     await self._resolve_trade(row, now)
+                await self._redeem_sweep()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -351,7 +356,6 @@ class CryptoExecutor:
             detect_outcome_index,
             get_payout_numerator,
             is_condition_resolved,
-            redeem_winnings,
         )
 
         resolved = await asyncio.to_thread(is_condition_resolved, condition_id)
@@ -365,11 +369,14 @@ class CryptoExecutor:
                         "⚠️ Рынок не резолвился за 24 часа — сделка аннулирована. "
                         "Средства вернутся после ручного разбора.",
                     )
+                return
+            await self._flag_stuck(row, chat_id, window_end, now)
             return
 
         outcome_index = await asyncio.to_thread(detect_outcome_index, condition_id, token_id)
         if outcome_index is None:
             log.warning("crypto_resolution_index_unknown", cond=condition_id[:14])
+            await self._flag_stuck(row, chat_id, window_end, now)
             return
         held_payout = await asyncio.to_thread(get_payout_numerator, condition_id, outcome_index)
         other_payout = await asyncio.to_thread(
@@ -377,6 +384,7 @@ class CryptoExecutor:
         )
         if held_payout <= 0 and other_payout <= 0:
             log.warning("crypto_resolution_payout_unavailable", cond=condition_id[:14])
+            await self._flag_stuck(row, chat_id, window_end, now)
             return
 
         won = held_payout > 0
@@ -384,32 +392,11 @@ class CryptoExecutor:
         fee = float(row.get("fee_usdc") or 0)
         shares = float(row.get("shares") or 0)
 
-        redeem_tx = None
-        if won:
-            try:
-                redeem = await asyncio.to_thread(
-                    redeem_winnings,
-                    owner["wallet_private_key_enc"],
-                    condition_id,
-                    False,
-                    outcome_index,
-                    token_id,
-                )
-                redeem_tx = redeem.get("tx")
-                if redeem.get("skipped"):
-                    log.warning(
-                        "crypto_redeem_skipped",
-                        cond=condition_id[:14],
-                        reason=redeem.get("reason"),
-                    )
-            except Exception as exc:
-                # Leave the row open: redemption is idempotent, the next cycle retries.
-                log.error("crypto_redeem_failed", cond=condition_id[:14], error=str(exc)[:200])
-                return
-
+        # BP35 settle-first: the outcome is known — settle and tell the user NOW.
+        # The money move (redemption) happens after and never blocks the result.
         pnl = shares - cost - fee if won else -cost - fee
         await asyncio.to_thread(
-            db.settle_trade, int(row["id"]), "win" if won else "loss", pnl, redeem_tx
+            db.settle_trade, int(row["id"]), "win" if won else "loss", pnl, None
         )
         log.info(
             "crypto_trade_settled",
@@ -427,6 +414,85 @@ class CryptoExecutor:
                 f"Вход: {float(row.get('fill_price') or 0):.3f} | "
                 f"Ставка: ${cost:.2f}\n"
                 f"PnL: <b>${pnl:+.2f}</b> ({roi:+.1%})",
+            )
+
+        if won:
+            redeem_tx = await self._try_redeem(row, outcome_index)
+            if redeem_tx:
+                await asyncio.to_thread(db.set_redeem_tx, int(row["id"]), redeem_tx)
+
+    async def _try_redeem(self, row: dict[str, Any], outcome_index: int) -> str | None:
+        """One redemption attempt for a settled win. Returns the redeem_tx value
+        to persist ('recovered_externally' when the tokens are already burned)
+        or None — the sweep retries later (redeem_winnings is idempotent)."""
+        from core.relayer import redeem_winnings
+
+        owner = row.get("crypto_users") or {}
+        condition_id = str(row["condition_id"])
+        try:
+            redeem = await asyncio.to_thread(
+                redeem_winnings,
+                owner["wallet_private_key_enc"],
+                condition_id,
+                False,
+                outcome_index,
+                str(row["token_id"]),
+            )
+        except Exception as exc:
+            log.error("crypto_redeem_failed", cond=condition_id[:14], error=str(exc)[:200])
+            return None
+        if redeem.get("skipped"):
+            log.warning(
+                "crypto_redeem_skipped",
+                cond=condition_id[:14],
+                reason=redeem.get("reason"),
+            )
+            if redeem.get("reason") == "no_token_balance":
+                return "recovered_externally"
+            return None
+        return redeem.get("tx")
+
+    async def _redeem_sweep(self) -> None:
+        """BP35: retry redemption for wins settled without a money move.
+        Silent for the user — they already got the result."""
+        from core.relayer import detect_outcome_index
+
+        rows = await asyncio.to_thread(db.unredeemed_wins)
+        for row in rows:
+            outcome_index = await asyncio.to_thread(
+                detect_outcome_index, str(row["condition_id"]), str(row["token_id"])
+            )
+            if outcome_index is None:
+                continue
+            redeem_tx = await self._try_redeem(row, outcome_index)
+            if redeem_tx:
+                await asyncio.to_thread(db.set_redeem_tx, int(row["id"]), redeem_tx)
+                log.info("crypto_redeem_recovered", trade_id=row["id"], tx=redeem_tx)
+
+    async def _flag_stuck(
+        self,
+        row: dict[str, Any],
+        chat_id: int | None,
+        window_end: datetime,
+        now: datetime,
+    ) -> None:
+        """BP35 watchdog: an open row long past window_end gets a throttled log
+        and a single reassurance to the user (per throttle window)."""
+        if not should_flag_stuck(window_end.timestamp(), now.timestamp(), STUCK_THRESHOLD_SEC):
+            return
+        if not notify_once(f"crypto-stuck:{row['id']}", ttl=STUCK_THROTTLE_SEC):
+            return
+        log.warning(
+            "crypto_resolution_stuck",
+            trade_id=row["id"],
+            cond=str(row["condition_id"])[:14],
+            age_sec=int((now - window_end).total_seconds()),
+        )
+        if chat_id:
+            await notify(
+                chat_id,
+                "⏳ Рынок ещё не рассчитан — результат придёт автоматически, "
+                "средства в безопасности.",
             )
 
     # ── funding path ──────────────────────────────────────────────────────────

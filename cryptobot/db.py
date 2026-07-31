@@ -6,7 +6,7 @@ threads via asyncio.to_thread.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import structlog
@@ -132,6 +132,32 @@ def settle_trade(
             "resolved_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017
         }
     ).eq("id", trade_id).eq("status", "open").execute()
+
+
+def unredeemed_wins() -> list[dict]:
+    """BP35: settled wins whose redemption failed (bounded to the last 7 days),
+    joined with the owner's signing context — the retry sweep's working set."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)  # noqa: UP017
+    res = (
+        get_supabase()
+        .table("crypto_trades")
+        .select(
+            "*, crypto_users(telegram_id, wallet_private_key_enc, deposit_wallet_address)"
+        )
+        .eq("status", "win")
+        .is_("redeem_tx", "null")
+        .gte("resolved_at", cutoff.isoformat())
+        .order("resolved_at")
+        .execute()
+    )
+    return res.data or []
+
+
+def set_redeem_tx(trade_id: int, redeem_tx: str) -> None:
+    """BP35: record the money move separately from settlement."""
+    get_supabase().table("crypto_trades").update({"redeem_tx": redeem_tx}).eq(
+        "id", trade_id
+    ).execute()
 
 
 def realized_pnl_today(user_id: int) -> float:

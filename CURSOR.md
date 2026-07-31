@@ -6195,7 +6195,7 @@ docker compose up -d --build api cryptobot
 
 (shadow untouched by this blueprint; api rebuild also finally ships BP27/32.)
 
-## Blueprint 35: decouple settlement from redemption in the crypto executor (PLAN, 2026-08-01)
+## Blueprint 35: decouple settlement from redemption in the crypto executor (implemented, 2026-08-01)
 
 ### 35.1 Incident
 
@@ -6273,3 +6273,28 @@ by reading the code path (I/O-thin).
 * `api/routers/telegram.py::_onboarding_kb`: «🛡 Это безопасно?» button removed
   from the L0 welcome keyboard; the `onb_trust` callback handler stays so old
   messages keep working. `/onboarding` verified absent from MAIN_COMMANDS.
+
+### 35.4 What was actually implemented
+
+* `cryptobot/executor.py::_resolve_trade`: settle-first — once payouts are
+  known the row is settled (`db.settle_trade` with `redeem_tx=None`) and the
+  user notified immediately; for wins `_try_redeem` runs AFTER and on success
+  writes the tx via `db.set_redeem_tx`. Redemption failure only logs
+  `crypto_redeem_failed` — it no longer blocks settlement or the notification.
+  A `no_token_balance` skip stores `redeem_tx='recovered_externally'`.
+* `cryptobot/executor.py::_redeem_sweep` (called each resolution cycle):
+  scans `db.unredeemed_wins()` (`status='win' AND redeem_tx IS NULL`,
+  resolved_at within 7 days), re-detects the outcome index and retries
+  `redeem_winnings` (idempotent). Success logs `crypto_redeem_recovered` and
+  fills `redeem_tx`; no user notification.
+* Watchdog: `_flag_stuck` fires on every open-row exit path that leaves the
+  row unsettled (unresolved, index unknown, payouts unavailable) when
+  `should_flag_stuck` (pure, `cryptobot/logic.py`, threshold 15 min) holds;
+  throttled via `notify_once` (key `crypto-stuck:{trade_id}`, TTL 1 h). Logs
+  `crypto_resolution_stuck` + sends the user «⏳ Рынок ещё не рассчитан…».
+  The 24 h void path is unchanged.
+* `cryptobot/db.py`: new `unredeemed_wins()` and `set_redeem_tx(trade_id, tx)`.
+  No schema change. `core/relayer.py` untouched (copytrade keeps the
+  swallow-to-False semantics).
+* Tests: `TestShouldFlagStuck` (parameterized boundary cases incl. the exact
+  15-minute edge and clock skew) in tests/test_cryptobot_logic.py.

@@ -48,6 +48,12 @@ def requote_price_ok(
     return fresh_ask <= signal_ask * (1.0 + max_worse_pct)
 
 
+def should_flag_stuck(window_end_ts: float, now_ts: float, threshold_sec: float) -> bool:
+    """BP35 watchdog: an open trade whose window ended more than threshold_sec
+    ago is stuck — the outcome is overdue and the user deserves a heartbeat."""
+    return now_ts - window_end_ts > threshold_sec
+
+
 def daily_loss_exceeded(realized_today_usdc: float, stake_usdc: float, mult: float) -> bool:
     """Stop trading for the day once realized losses reach mult × stake."""
     if mult <= 0 or stake_usdc <= 0:
