@@ -6195,6 +6195,62 @@ docker compose up -d --build api cryptobot
 
 (shadow untouched by this blueprint; api rebuild also finally ships BP27/32.)
 
+## Blueprint 35: decouple settlement from redemption in the crypto executor (PLAN, 2026-08-01)
+
+### 35.1 Incident
+
+Trade crypto_trades#61 (BTC Up, window end 2026-07-31 23:20 UTC, $15 @ 0.87)
+stayed `open` for 25+ minutes while the condition was verifiably resolved
+on-chain with our outcome winning (payoutNumerators[0]=1 — confirmed from a
+second machine with the same code). The user saw the entry notification and
+then silence.
+
+Root cause class (exact trigger visible only in server logs —
+`is_condition_resolved_failed` vs `crypto_redeem_failed`): the settlement path
+in `cryptobot/executor.py::_resolve_trade` is ALL-OR-NOTHING. The row is
+settled and the user notified only after `redeem_winnings` succeeds; any
+persistent failure earlier in the chain (RPC errors swallowed to
+False/0/None by `is_condition_resolved` / `detect_outcome_index` /
+`get_payout_numerator`, or relayer redeem flakes) silently re-loops every
+20 s with zero user-facing signal. The outcome was KNOWN; only the money move
+was stuck — yet the user-visible result was held hostage to it.
+
+### 35.2 First 30 hours of live trading — audit (no defects found)
+
+- 61 filter-passing shadow signals → 61 crypto_trades rows. Zero lost.
+- 52 filled: 44 win / 7 loss / 1 stuck-open; WR 86.3%; net +$25.19 on $780
+  turnover (3.2% ROI). Same-period shadow: WR 85.2%, ROI 1.0% — live BEATS
+  the simulation.
+- Slippage (fill − signal price): mean −0.93 c, median 0.00 — execution at or
+  better than the shadow snapshot; the BP34 re-quote sometimes catches a
+  cheaper ask (one fill 0.76 vs signal 0.89).
+- Skips: 9. All 7 raw FAK kills predate the BP34 deploy; after it only 2
+  `requote_price_too_worse` (correct refusals — the +3% chase ceiling held).
+  Shadow's PnL on the 9 skipped conditions: −$9.72, i.e. the skips saved money.
+
+### 35.3 Fix plan (executor only, no schema change)
+
+1. `_resolve_trade`: once payouts are known, IMMEDIATELY settle the row
+   (`win`/`loss`, pnl, resolved_at) and send the user notification. For wins,
+   attempt redemption AFTER settling; on success update `redeem_tx`.
+   PnL math unchanged (shares − cost − fee; redemption does not change it).
+2. Redemption retry sweep: the resolution loop additionally scans
+   `status='win' AND redeem_tx IS NULL` rows (bounded: resolved_at within
+   the last 7 days) and retries `redeem_winnings` (idempotent). Successful
+   retry logs `crypto_redeem_recovered` and fills `redeem_tx`. No user
+   notification for the money move — they already got the result.
+3. Stuck-resolution watchdog: an `open` row whose window_end is > 15 min old
+   logs `crypto_resolution_stuck` (throttled via notify_once, 1 h TTL) and
+   sends the user a single reassurance: «Рынок ещё не рассчитан — результат
+   придёт автоматически, средства в безопасности». The 24 h void path stays.
+4. Keep the swallow-to-False semantics of the core relayer helpers (copytrade
+   depends on them); the executor gains visibility purely through the
+   watchdog + settle-first ordering.
+
+Tests: pure decision `should_flag_stuck(window_end, now, threshold_min)` in
+cryptobot/logic.py + unit tests; the settle-before-redeem reorder is covered
+by reading the code path (I/O-thin).
+
 ### 34.5 What was actually implemented
 
 * `core/config.py`: new `crypto_requote_max_worse_pct: float = 0.03` in the BP33 block.
