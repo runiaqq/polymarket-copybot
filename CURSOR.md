@@ -6298,3 +6298,16 @@ by reading the code path (I/O-thin).
   swallow-to-False semantics).
 * Tests: `TestShouldFlagStuck` (parameterized boundary cases incl. the exact
   15-minute edge and clock skew) in tests/test_cryptobot_logic.py.
+
+### 35.5 Incident #61 postmortem (confirmed after deploy, 2026-07-31 23:59 UTC)
+
+The exact trigger of the 40-minute hang: **relayer API quota** —
+`RelayerApiException[status_code=429, 'quota exceeded: 0 units remaining,
+resets in 20 seconds']` on `redeem_winnings`. The relayer quota is shared
+with the copytrade worker, whose auto-claim burst around midnight UTC (daily
+markets resolving en masse) exhausted it. Under the old coupled path this
+starved settlement indefinitely; under BP35 the deploy settled #61 within one
+cycle (user notified, pnl +$2.10) and `_redeem_sweep` recovered the money a
+few cycles later once quota freed (`redeem_tx 0x9ff77c…`). Working exactly as
+designed; no further change needed. If 429 bursts ever become chronic, the
+lever is a small backoff/jitter in `_redeem_sweep` — not a priority now.
