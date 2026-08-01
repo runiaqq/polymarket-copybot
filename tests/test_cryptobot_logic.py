@@ -2,6 +2,7 @@
 
 import pytest
 
+from core.shadow_model import ask_depth_usdc
 from cryptobot.logic import (
     daily_loss_exceeded,
     entry_price_ok,
@@ -103,6 +104,31 @@ class TestShouldFlagStuck:
     )
     def test_threshold(self, window_end_ts, now_ts, expected):
         assert should_flag_stuck(window_end_ts, now_ts, 900.0) is expected
+
+
+class TestAskDepthUsdc:
+    BOOK = [
+        {"price": "0.85", "size": "10"},   # $8.50
+        {"price": "0.86", "size": "20"},   # $17.20
+        {"price": "0.90", "size": "50"},   # $45.00
+        {"price": "bad", "size": "1"},     # malformed — ignored
+        {"price": "0.87"},                 # missing size — ignored
+    ]
+
+    def test_best_level_only(self):
+        assert ask_depth_usdc(self.BOOK, 0.85) == 8.5
+
+    def test_band_includes_deeper_levels(self):
+        assert ask_depth_usdc(self.BOOK, 0.86) == 25.7
+
+    def test_wide_band(self):
+        assert ask_depth_usdc(self.BOOK, 0.95) == 70.7
+
+    def test_zero_ceiling(self):
+        assert ask_depth_usdc(self.BOOK, 0.0) == 0.0
+
+    def test_empty_book(self):
+        assert ask_depth_usdc([], 0.9) == 0.0
 
 
 class TestDailyLossExceeded:

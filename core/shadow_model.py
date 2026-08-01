@@ -227,6 +227,25 @@ def fee_usdc(
     return float(rounded)
 
 
+def ask_depth_usdc(asks: Iterable[Mapping[str, object]], up_to_price: float) -> float:
+    """BP36: dollars purchasable from ask levels priced <= up_to_price.
+
+    Capacity telemetry for multi-account scaling: how much stake the book can
+    absorb inside a given price band at signal time."""
+    if up_to_price <= 0:
+        return 0.0
+    total = 0.0
+    for level in asks:
+        try:
+            price = float(level["price"])
+            size = float(level["size"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0 < price < 1 and size > 0 and price <= up_to_price:
+            total += price * size
+    return round(total, 4)
+
+
 def walk_order_book(
     asks: Iterable[Mapping[str, object]],
     stake_usdc: float,

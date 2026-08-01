@@ -6311,3 +6311,42 @@ cycle (user notified, pnl +$2.10) and `_redeem_sweep` recovered the money a
 few cycles later once quota freed (`redeem_tx 0x9ff77c…`). Working exactly as
 designed; no further change needed. If 429 bursts ever become chronic, the
 lever is a small backoff/jitter in `_redeem_sweep` — not a priority now.
+
+## Blueprint 36: capacity telemetry for multi-account scaling (2026-08-01)
+
+Purpose: collect, during normal pilot trading, the data needed to design the
+100-user architecture (native signal sharding, NOT data-api copytrading —
+rationale in the 2026-08-01 deep analysis: entries happen up to 2 min before
+resolution, so per-signal book depth is the binding constraint; within one
+asset windows never overlap).
+
+What we now record on EVERY crypto_trades row (filled AND skipped):
+
+- `depth_best_usdc` / `depth_150bp_usdc` / `depth_300bp_usdc` — dollars
+  purchasable from the signal-side asks at the best-ask level, within +1.5%
+  (our FAK slippage band) and +3% (the BP34 re-quote ceiling). Computed in the
+  shadow engine from the SAME book snapshot the signal was generated from
+  (pure `ask_depth_usdc` in core/shadow_model.py) and carried in the Redis
+  payload — the executor just persists it.
+- `latency_ms` — signal publish → order outcome (fill or error), measured in
+  the executor.
+- `requoted` — whether the fill came from the BP34 re-quote path (previously
+  visible only in logs).
+
+Migration `026_crypto_depth_telemetry.sql` (idempotent ALTERs, no data loss).
+
+What this unlocks after ~1-2 weeks of collection:
+1. Depth distribution per band × time-of-day → hard number for "how many
+   $15 accounts fit one signal" and the rotation quota for N users.
+2. Slippage vs consumed-depth curve (our own $15 already pays >0.1% extra on
+   33% of fills) → per-signal stake budget formula.
+3. Latency distribution → whether laddered/staggered entries are feasible
+   inside the 2-minute pre-resolution window.
+4. Requote win/loss quality vs first-attempt fills → keep or tighten the +3%
+   chase ceiling.
+
+Existing data already covering other scaling questions: skip_reason taxonomy,
+signal_price vs fill_price slippage, created_at time-of-day, relayer 429
+events in logs. Remaining known ceilings for 100 users (documented, not yet
+instrumented): shared relayer quota (already saw 429 with 2 users at the
+midnight copytrade claim burst) and per-signal book depth.

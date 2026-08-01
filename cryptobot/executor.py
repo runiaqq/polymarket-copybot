@@ -184,7 +184,12 @@ class CryptoExecutor:
             "model_p": signal.get("model_p"),
             "edge": signal.get("edge"),
             "intended_usdc": stake,
+            # BP36: capacity telemetry — book depth at signal time (per band).
+            "depth_best_usdc": signal.get("depth_best_usdc"),
+            "depth_150bp_usdc": signal.get("depth_150bp_usdc"),
+            "depth_300bp_usdc": signal.get("depth_300bp_usdc"),
         }
+        published_at = float(signal.get("published_at") or 0)
         requoted = False
         try:
             response = place_order(
@@ -209,14 +214,16 @@ class CryptoExecutor:
                 response, skip_reason = self._requote_once(user, signal, api_creds, stake, tick)
                 requoted = response is not None
             if response is None:
-                db.insert_trade({**base, "status": "skipped", "skip_reason": skip_reason})
+                db.insert_trade({**base, "status": "skipped", "skip_reason": skip_reason,
+                                 "latency_ms": _latency_ms(published_at), "requoted": requoted})
                 log.warning("crypto_order_error", user_id=user_id, error=error_text[:200])
                 return {}
 
         fill = extract_buy_fill(response, stake)
         if fill is None or fill.status == "none":
             skip_reason = "no_fill_after_requote" if requoted else "no_fill"
-            db.insert_trade({**base, "status": "skipped", "skip_reason": skip_reason})
+            db.insert_trade({**base, "status": "skipped", "skip_reason": skip_reason,
+                             "latency_ms": _latency_ms(published_at), "requoted": requoted})
             log.info("crypto_no_fill", user_id=user_id, cond=condition_id[:14])
             return {}
 
@@ -236,6 +243,8 @@ class CryptoExecutor:
                 "shares": round(fill.shares, 6),
                 "fill_price": fill.fill_price,
                 "fee_usdc": round(fee, 6),
+                "latency_ms": _latency_ms(published_at),
+                "requoted": requoted,
             }
         )
         if not inserted:
@@ -595,3 +604,10 @@ class CryptoExecutor:
 
 def _iso(timestamp_sec: float) -> str:
     return datetime.fromtimestamp(timestamp_sec, tz=timezone.utc).isoformat()  # noqa: UP017
+
+
+def _latency_ms(published_at: float) -> int | None:
+    """BP36: signal publish -> order outcome latency (scaling telemetry)."""
+    if published_at <= 0:
+        return None
+    return int(max(0.0, (time.time() - published_at) * 1000))

@@ -20,6 +20,7 @@ from core.shadow_model import (
     EntryVariant,
     EwmaVolatility,
     active_entry_variants,
+    ask_depth_usdc,
     build_entry_variants,
     calibrated_probability,
     divergence_exceeds_ceiling,
@@ -746,6 +747,9 @@ class ShadowEngine:
             observation.entered_variants.add(variant_name)
             if variant_name == "full" and is_signal:
                 # BP33: hand the filter-passing signal to the real-money executor.
+                # BP36: attach book-depth bands (capacity telemetry for scaling).
+                asks = book.get("asks") or []
+                best = fill.best_ask or 0.0
                 self._spawn_publish(
                     {
                         "asset": asset,
@@ -760,6 +764,9 @@ class ShadowEngine:
                         "window_end": market.window_end,
                         "model_p": model_p,
                         "edge": edge,
+                        "depth_best_usdc": ask_depth_usdc(asks, best),
+                        "depth_150bp_usdc": ask_depth_usdc(asks, best * 1.015),
+                        "depth_300bp_usdc": ask_depth_usdc(asks, best * 1.03),
                         "published_at": time.time(),
                     }
                 )
