@@ -6350,3 +6350,31 @@ signal_price vs fill_price slippage, created_at time-of-day, relayer 429
 events in logs. Remaining known ceilings for 100 users (documented, not yet
 instrumented): shared relayer quota (already saw 429 with 2 users at the
 midnight copytrade claim burst) and per-signal book depth.
+
+## Blueprint 37: entry-price ceiling 0.95 -> 0.89 (2026-08-03)
+
+Data-driven tuning from the 5-day live review (2026-07-30..08-03, 142 settled
+trades). Findings that motivated it:
+
+- Execution is NOT the problem: on matched condition_ids the live bot made
+  +$30.40 vs shadow's +$2.23; mean fill was ~1 cent BETTER than the sim
+  (FAK top-of-book + BP34 re-quotes catch dips). Trade-count gap vs shadow is
+  fully explained by justified skips (mostly `requote_price_too_worse`), and
+  shadow LOST $15.15 on the skipped conditions — the chase guard adds value.
+- The one systematically losing segment is entries filled at 0.90+: breakeven
+  win rate there is ~93%, actual was 88% → -$16.17 all-time and -$29.38 over
+  just 08-02..08-03. Every other price bucket is at/above breakeven; the
+  profit core is 0.85-0.90 (+$33.70).
+- The 08-03 red day itself was model variance, not decay: shadow logged
+  -$34.38 on the same signals vs the bot's -$31.08.
+
+Change: `crypto_max_entry_price` 0.95 -> 0.89 in core/config.py (one setting,
+enforced at both signal intake `entry_price_ok` and the BP34 re-quote guard).
+0.89 not 0.90 because the check is `ask <= ceiling` and 0.90-exactly fills sit
+in the losing bucket. Shadow filters unchanged — shadow keeps recording the
+0.90+ segment so we can revisit with a bigger sample.
+
+First BP36 telemetry read (83 rows): depth@1.5% median $185 / p25 $87 /
+min $2 (median signal fits ~12 x $15 accounts, a quarter only ~5);
+latency median 1.37s, max 4.2s — max already brushes the 4s freshness cap;
+6 re-quoted fills.
