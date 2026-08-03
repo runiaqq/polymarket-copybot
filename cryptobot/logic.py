@@ -32,6 +32,22 @@ def entry_price_ok(best_ask: float | None, max_entry_price: float) -> bool:
     return best_ask is not None and 0 < best_ask <= max_entry_price
 
 
+def price_collapsed(
+    signal_ask: float | None,
+    fresh_ask: float | None,
+    max_drop_pct: float,
+) -> bool:
+    """BP38 collapse guard: a fresh ask far BELOW the signal ask means the
+    market violently repriced after the signal snapshot (trade #176: signal
+    0.81 -> fill 0.49) — the model probability is stale and the edge thesis
+    is dead. Moderate dips (<= max_drop_pct) are liquidity noise and remain
+    tradable. Fails open on a missing/invalid fresh ask: the guard targets a
+    rare tail event and must not halt trading on book-fetch hiccups."""
+    if not signal_ask or signal_ask <= 0 or not fresh_ask or fresh_ask <= 0:
+        return False
+    return fresh_ask < signal_ask * (1.0 - max_drop_pct)
+
+
 def requote_price_ok(
     signal_ask: float | None,
     fresh_ask: float | None,

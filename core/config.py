@@ -510,6 +510,12 @@ class Settings(BaseSettings):
     # fresh best ask — but only if it's not worse than the signal ask by more
     # than this fraction; beyond that the edge thesis behind the signal is broken.
     crypto_requote_max_worse_pct: float = 0.03
+    # BP38 collapse guard: skip the signal when the fresh best ask has dropped
+    # more than this fraction below the signal ask — the market repriced after
+    # the snapshot and the model probability is stale (trade #176 filled at
+    # 0.49 on a 0.81 signal and lost). Dips up to this bound are liquidity
+    # noise and historically profitable to buy.
+    crypto_max_price_drop_pct: float = 0.25
     # Discard signals older than this (Redis lag / executor restart).
     crypto_signal_max_age_sec: float = 4.0
     # Stop trading for the day when realized PnL <= -(mult × stake).

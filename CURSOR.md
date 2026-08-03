@@ -6378,3 +6378,33 @@ First BP36 telemetry read (83 rows): depth@1.5% median $185 / p25 $87 /
 min $2 (median signal fits ~12 x $15 accounts, a quarter only ~5);
 latency median 1.37s, max 4.2s — max already brushes the 4s freshness cap;
 6 re-quoted fills.
+
+## Blueprint 38: price-collapse guard (2026-08-03)
+
+Incident: trade #176 — signal ask 0.81 (model 92%, edge +10.2%), FAK filled
+1.35s later at 0.49 and lost -$15.54. BTC spot spiked toward the strike in
+that second; makers repriced Down from 0.81 to ~0.49. A FAK's limit only
+bounds the WORSE side (0.81 x 1.015), so any "better" price fills silently —
+but the model probability was computed on the pre-jump spot, i.e. the bot
+bought a coin-flip priced as one with the edge thesis already dead.
+
+History scan (154 fills): 17 filled >5% below signal. Moderate dips
+(-5..-20%) are liquidity noise and mostly WON (12/15) — do not block them.
+Extreme collapses: -28% (won, lucky) and -40% (#176, lost). The guard cuts
+only the tail.
+
+Implementation:
+- `price_collapsed(signal_ask, fresh_ask, max_drop_pct)` in cryptobot/logic.py
+  (pure, tested). Fails open on missing/invalid fresh ask — it protects
+  against a rare tail, not against book-fetch downtime.
+- `crypto_max_price_drop_pct: float = 0.25` in core/config.py.
+- `_handle_signal`: ONE fresh-book fetch per signal (shared by all users,
+  scales to N accounts), skip reason `price_collapsed` when the fresh ask is
+  >25% below the signal ask. Costs ~200-300ms against a 4s freshness budget
+  and 1.37s median latency.
+- BP34 re-quote path gets the same lower bound (`requote_price_collapsed`) —
+  it already fetches the fresh book, the check is free.
+
+Residual risk: a collapse inside the ~200ms between the guard's book fetch
+and the FAK hitting the exchange is still unguarded; accepted (window shrinks
+from ~1.4s to ~0.2s, event base rate is ~1/154 fills).

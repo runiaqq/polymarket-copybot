@@ -7,6 +7,7 @@ from cryptobot.logic import (
     daily_loss_exceeded,
     entry_price_ok,
     pilot_stake,
+    price_collapsed,
     requote_price_ok,
     should_flag_stuck,
     signal_is_fresh,
@@ -52,6 +53,36 @@ class TestEntryPriceOk:
     )
     def test_ceiling(self, ask, expected):
         assert entry_price_ok(ask, 0.95) is expected
+
+
+class TestPriceCollapsed:
+    """BP38: skip when the fresh ask fell >max_drop_pct below the signal ask
+    (violent repricing = stale model). max_drop_pct=0.25 throughout."""
+
+    @pytest.mark.parametrize(
+        ("signal_ask", "fresh_ask", "expected"),
+        [
+            # Trade #176: signal 0.81 -> book at 0.49 (-40%) — must skip.
+            (0.81, 0.49, True),
+            # Moderate liquidity dips stay tradable.
+            (0.81, 0.75, False),
+            (0.90, 0.68, False),  # -24.4%, just inside the bound
+            (0.90, 0.67, True),  # -25.6%, just past the bound
+            (0.80, 0.605, False),  # just inside the bound
+            # Unchanged or better-for-us (higher) ask never collapses.
+            (0.81, 0.81, False),
+            (0.81, 0.85, False),
+        ],
+    )
+    def test_drop_bound(self, signal_ask, fresh_ask, expected):
+        assert price_collapsed(signal_ask, fresh_ask, 0.25) is expected
+
+    @pytest.mark.parametrize(
+        ("signal_ask", "fresh_ask"),
+        [(None, 0.5), (0.81, None), (0.0, 0.5), (0.81, 0.0)],
+    )
+    def test_fails_open_on_missing_prices(self, signal_ask, fresh_ask):
+        assert price_collapsed(signal_ask, fresh_ask, 0.25) is False
 
 
 class TestRequotePriceOk:

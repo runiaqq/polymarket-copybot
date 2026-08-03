@@ -28,6 +28,7 @@ from cryptobot.logic import (
     daily_loss_exceeded,
     entry_price_ok,
     pilot_stake,
+    price_collapsed,
     requote_price_ok,
     should_flag_stuck,
     signal_is_fresh,
@@ -107,6 +108,23 @@ class CryptoExecutor:
             log.info("crypto_signal_skipped", reason="price_ceiling", cond=condition_id[:14])
             return
 
+        # BP38 collapse guard: one fresh-book fetch per signal (shared by all
+        # users). A FAK is only bounded on the WORSE side, so without this a
+        # violent repricing between the shadow snapshot and our order fills
+        # "great" prices on a stale model (trade #176: signal 0.81, fill 0.49).
+        fresh_ask = await asyncio.to_thread(self._fresh_best_ask, str(signal["token_id"]))
+        if price_collapsed(
+            signal.get("best_ask"), fresh_ask, settings.crypto_max_price_drop_pct
+        ):
+            log.warning(
+                "crypto_signal_skipped",
+                reason="price_collapsed",
+                cond=condition_id[:14],
+                signal_ask=signal.get("best_ask"),
+                fresh_ask=fresh_ask,
+            )
+            return
+
         users = await asyncio.to_thread(db.active_traders)
         whitelist = set(settings.crypto_whitelist_telegram_ids)
         users = [u for u in users if u["telegram_id"] in whitelist]
@@ -115,6 +133,19 @@ class CryptoExecutor:
         # Fair-order dispatch: nobody consistently eats the book first.
         random.shuffle(users)
         await asyncio.gather(*(self._trade_for_user(user, signal) for user in users))
+
+    @staticmethod
+    def _fresh_best_ask(token_id: str) -> float | None:
+        """BP38: best ask right now, or None on any fetch problem (the guard
+        fails open — it protects against a rare tail, not against downtime)."""
+        from core.polymarket import get_order_book
+
+        try:
+            ask = (get_order_book(token_id) or {}).get("best_ask")
+            return float(ask) if ask else None
+        except Exception as exc:
+            log.warning("crypto_fresh_book_failed", error=str(exc)[:120])
+            return None
 
     async def _trade_for_user(self, user: dict, signal: dict[str, Any]) -> None:
         try:
@@ -298,6 +329,10 @@ class CryptoExecutor:
         book = get_order_book(str(signal["token_id"]))
         fresh_ask = (book or {}).get("best_ask")
         signal_ask = signal.get("best_ask")
+        # BP38: the collapse guard also bounds the re-quote from below — a FAK
+        # at the fresh ask would still sweep even cheaper (staler) levels.
+        if price_collapsed(signal_ask, fresh_ask, settings.crypto_max_price_drop_pct):
+            return None, "requote_price_collapsed"
         if not requote_price_ok(
             signal_ask,
             fresh_ask,
