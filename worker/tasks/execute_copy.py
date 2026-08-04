@@ -277,10 +277,15 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         score = None
         log.debug("sizing_fixed", cap=round(size_usdc, 2), user_id=user_id)
 
-    # ── BP8: unified per-trade risk cap (applies in BOTH fixed and kelly modes) ─
-    # Worst-case loss of a binary trade = full stake. Cap it so a single loss
-    # cannot exceed max_risk_per_trade × equity regardless of sizing mode.
-    if not is_sniper and settings.enforce_risk_per_trade_cap and equity > 0:
+    # ── BP8 / BP39: unified per-trade risk cap — KELLY MODE ONLY ──────────────
+    # Worst-case loss of a binary trade = full stake; in kelly mode cap it at
+    # max_risk_per_trade × equity. BP39: fixed mode is exempt — the user chose
+    # an explicit dollar size and the cap silently overrode it (a $15 fixed
+    # stake on a $45 account was cut to 5% ≈ $2.3, then floored back up to the
+    # $5 exchange minimum, so every trade entered at $5). Fixed means fixed;
+    # the tail-risk gates below (exposure/event/drawdown/daily-loss) still apply.
+    if (not is_sniper and effective_mode == "kelly"
+            and settings.enforce_risk_per_trade_cap and equity > 0):
         hard_cap = settings.max_risk_per_trade * equity
         if size_usdc > hard_cap:
             log.info("unified_risk_cap_applied", user_id=user_id,
@@ -290,7 +295,9 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
 
     # BP8: profit-protection trailing cap — don't give back >max_trade_loss_vs_profit_pct
     # of accumulated realized profit above the baseline in a single trade.
-    if not is_sniper and settings.max_trade_loss_vs_profit_pct > 0 and equity > 0:
+    # BP39: kelly-only for the same reason as the unified cap above.
+    if (not is_sniper and effective_mode == "kelly"
+            and settings.max_trade_loss_vs_profit_pct > 0 and equity > 0):
         try:
             from core.db import get_realized_baseline
             baseline = get_realized_baseline(user_id)

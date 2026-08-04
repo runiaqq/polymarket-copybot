@@ -6408,3 +6408,31 @@ Implementation:
 Residual risk: a collapse inside the ~200ms between the guard's book fetch
 and the FAK hitting the exchange is still unguarded; accepted (window shrinks
 from ~1.4s to ~0.2s, event base rate is ~1/154 fills).
+
+## Blueprint 39: fixed sizing means fixed (2026-08-04)
+
+Incident: a copytrade user set fixed sizing with max position $15 and the bot
+entered $5.00. Chain: fixed size $15 → BP8 unified risk cap (5% of ~$45
+equity ≈ $2.30) → floored back up to the $5 exchange minimum. Every trade on
+an account under $300 equity silently entered at $5 regardless of the chosen
+size — the setting was dead weight and looked like a bug to the user.
+
+Decision (product owner call, option "fixed means fixed"): the per-trade caps
+that silently override an EXPLICIT user-chosen dollar size are now
+kelly-only:
+
+- BP8 unified risk cap (`max_risk_per_trade` × equity) — kelly-only.
+- BP8 profit-protection trailing cap (`max_trade_loss_vs_profit_pct`) —
+  kelly-only (same silent-override class; would have re-surfaced as
+  "set 15, entered 8" once a profit cushion accumulated).
+
+Unchanged, still apply in fixed mode:
+
+- Tail-risk gates 1-4 (portfolio exposure 60%, per-event 15%, drawdown
+  breaker, daily loss) — portfolio-level protections, not per-trade sizing.
+  NOTE: gate 2 still clamps a single trade to 15% of equity per event, so a
+  $15 fixed stake on a ~$45 account clamps to ~$6.75. Raising equity to
+  ~$100+ makes the user's $15 effective. If product wants event-cap
+  exemption for fixed mode too, that is a separate deliberate decision.
+- Exchange minimum floor ($5) and balance/fee-headroom cap.
+- Depth cap from the donor signal (can't buy size the book doesn't have).
