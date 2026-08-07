@@ -6436,3 +6436,31 @@ Unchanged, still apply in fixed mode:
   exemption for fixed mode too, that is a separate deliberate decision.
 - Exchange minimum floor ($5) and balance/fee-headroom cap.
 - Depth cap from the donor signal (can't buy size the book doesn't have).
+
+## Blueprint 40: mutually-exclusive text-dialog states (2026-08-07)
+
+Incident: a client could not withdraw — every pasted Polygon address got
+"Только буквы, цифры и пробелы (до 24 символов)". Root cause: he had once
+opened the BP24 create-wallet dialog; `awaiting_wallet_name` was set and
+NEVER cleared on any exit path (its "Отмена" button routes to `wallet_list`,
+which did not reset it). `handle_text_input` checks the wallet-name flag
+BEFORE `withdraw_step`, so the stale flag intercepted all text input forever
+(until an api restart, since user_data is in-memory, no PTB persistence).
+Bonus hazard: any short text would have silently CREATED a wallet named after
+it.
+
+Fix: `_TEXT_FLOW_KEYS` + `_reset_text_flows(context)` in api/routers/
+telegram.py — the full set of text-dialog states (`awaiting_wallet_name`,
+`withdraw_step/_to/_amount`, `awaiting_daily_limit`, `awaiting_max_pos`) is
+wiped at:
+
+- every flow ENTRY: /withdraw, `withdraw_start`, `wallet_new`,
+  `setmax_custom`, `setdaily_custom` — then the flow sets only its own flag;
+- every navigation EXIT reachable from a dialog's cancel/back buttons:
+  `menu`, `settings`, `wallet_list`, `withdraw_cancel`;
+- `withdraw_confirm` (reads to/amount first, then wipes — retry can't
+  re-confirm, unchanged semantics).
+
+Invariant going forward: at most ONE text-dialog flag may be set at any time,
+and any new text flow must enter through `_reset_text_flows`. `pos_cache` is
+navigation state, not a text dialog — deliberately not in the set.

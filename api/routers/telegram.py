@@ -1016,8 +1016,7 @@ async def cmd_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not db_user or not db_user.get("wallet_address"):
         await update.message.reply_text("Сначала отправь /start", parse_mode="HTML")  # type: ignore[union-attr]
         return
-    for k in ("withdraw_step", "withdraw_to", "withdraw_amount"):
-        context.user_data.pop(k, None)
+    _reset_text_flows(context)  # BP40: no stale dialog may intercept the address
     context.user_data["withdraw_step"] = "address"
     await update.message.reply_text(  # type: ignore[union-attr]
         "💸 <b>Вывод USDC</b>\n\n"
@@ -1650,6 +1649,27 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ─── Free-text input handler (custom position size) ──────────────────────────
 
+# BP40: every text-dialog state read by handle_text_input. These are mutually
+# exclusive by design, but a flag left behind by an abandoned flow used to
+# intercept ALL later text input: a stuck awaiting_wallet_name swallowed a
+# client's withdrawal address ("до 24 символов" loop) because the wallet-name
+# check runs first. Every flow ENTRY and every navigation EXIT (menu, settings,
+# wallet_list, withdraw_cancel) must clear the whole set.
+_TEXT_FLOW_KEYS = (
+    "awaiting_wallet_name",
+    "withdraw_step",
+    "withdraw_to",
+    "withdraw_amount",
+    "awaiting_daily_limit",
+    "awaiting_max_pos",
+)
+
+
+def _reset_text_flows(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in _TEXT_FLOW_KEYS:
+        context.user_data.pop(key, None)
+
+
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tg_user = update.effective_user
     if not tg_user:
@@ -1902,6 +1922,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if data == "menu":
+        _reset_text_flows(context)  # BP40: main menu abandons any text dialog
         db_user = get_user_by_telegram_id(tg_user.id)
         if db_user:
             if not settings.auto_copy_enabled:
@@ -1991,6 +2012,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # ── BP24: multi-wallet management ─────────────────────────────────────────
     if data == "wallet_list":
+        # BP40: this is the "Отмена" target of the wallet-name dialog — the
+        # exact stuck flag that swallowed a client's withdrawal address.
+        _reset_text_flows(context)
         db_user = get_user_by_telegram_id(tg_user.id)
         if not db_user or not db_user.get("wallet_address"):
             await query.answer("Сначала отправь /start", show_alert=True)
@@ -2023,6 +2047,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer(
                 f"Максимум {MAX_WALLETS_PER_USER} кошельков.", show_alert=True)
             return
+        _reset_text_flows(context)  # BP40
         context.user_data["awaiting_wallet_name"] = True
         await query.edit_message_text(
             "🔐 <b>Создание кошелька — шаг 1 из 1</b>\n\n"
@@ -2351,9 +2376,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if data == "withdraw_start":
-        # Reset any stale state from a previous abandoned flow
-        for k in ("withdraw_step", "withdraw_to", "withdraw_amount"):
-            context.user_data.pop(k, None)
+        # BP40: reset ALL text-dialog states, not only the withdraw keys — a
+        # stale awaiting_wallet_name otherwise hijacks the address input.
+        _reset_text_flows(context)
         context.user_data["withdraw_step"] = "address"
         await query.edit_message_text(
             "💸 <b>Вывод USDC</b>\n\n"
@@ -2367,9 +2392,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if data == "withdraw_cancel":
-        context.user_data.pop("withdraw_step", None)
-        context.user_data.pop("withdraw_to", None)
-        context.user_data.pop("withdraw_amount", None)
+        _reset_text_flows(context)  # BP40
         await query.edit_message_text(
             "❌ Вывод отменён.",
             parse_mode="HTML",
@@ -2387,9 +2410,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         to_addr = context.user_data.get("withdraw_to", "")
         amount  = float(context.user_data.get("withdraw_amount", 0))
-        # Clear state before dispatching so a retry can't re-confirm
-        for k in ("withdraw_step", "withdraw_to", "withdraw_amount"):
-            context.user_data.pop(k, None)
+        # Clear state before dispatching so a retry can't re-confirm (BP40:
+        # read first, then wipe the whole text-dialog set).
+        _reset_text_flows(context)
 
         try:
             from worker.tasks import withdraw_funds
@@ -2477,6 +2500,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if data == "settings":
+        # BP40: "Назад" from the custom-size/limit prompts lands here — the
+        # pending flag must die with the dialog.
+        _reset_text_flows(context)
         db_user = get_user_by_telegram_id(tg_user.id)
         if not db_user:
             await query.answer("Отправь /start", show_alert=True)
@@ -2500,6 +2526,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         suffix = data[len("setmax_"):]
 
         if suffix == "custom":
+            _reset_text_flows(context)  # BP40
             context.user_data["awaiting_max_pos"] = True
             await query.answer()
             sizing_mode = db_user.get("sizing_mode") or "fixed"
@@ -2562,8 +2589,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         if suffix == "custom":
+            _reset_text_flows(context)  # BP40 (supersedes the manual exclusivity flag)
             context.user_data["awaiting_daily_limit"] = True
-            context.user_data["awaiting_max_pos"] = False  # mutually exclusive
             await query.answer()
             await query.edit_message_text(
                 "✏️ <b>Введи лимит сделок в день</b>\n\n"
