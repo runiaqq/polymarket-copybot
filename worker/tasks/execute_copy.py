@@ -29,8 +29,6 @@ from worker.celery_app import celery_app
 
 log = structlog.get_logger(__name__)
 
-CTF_TOKEN_SCALE = 1_000_000
-
 
 def _confirm_fill(
     wallet_address: str,
@@ -135,9 +133,6 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         _notify_not_registered(user["telegram_id"])
         return {"skipped": True, "reason": "not_registered"}
 
-    # BP26: sniper-mode mirror — bypasses ALL sizing/risk gates except the 30% stop.
-    is_sniper = (signal.get("mode") == "sniper")
-
     # Only copy BUY signals — SELL requires owning the token first
     if signal.get("side", "").upper() in ("SELL", "NO"):
         log.debug("skip_sell_signal", user_id=user_id)
@@ -147,7 +142,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     # fan-out in get_active_subscribers also excludes paused users, but a
     # concurrent pause could arrive between fan-out and task execution).
     from datetime import datetime, timezone
-    paused_until = None if is_sniper else user.get("copy_paused_until")
+    paused_until = user.get("copy_paused_until")
     if paused_until:
         try:
             from dateutil.parser import parse as _parse_dt
@@ -165,7 +160,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     # Checked here — before balance reads, position loads, and order-book RPCs —
     # so a blocked user costs almost nothing.  Fails open on DB errors (never
     # blocks a trade due to a count failure).
-    max_daily = None if is_sniper else user.get("max_daily_trades")
+    max_daily = user.get("max_daily_trades")
     if max_daily is not None:
         try:
             from core.db import get_daily_trade_count
@@ -185,7 +180,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     except Exception:
         log.warning("balance_check_failed", user_id=user_id)
         tradeable = 0.0
-    balance_cap = tradeable * max(0.0, 1.0 - settings.sniper_fee_headroom_pct)
+    balance_cap = tradeable * max(0.0, 1.0 - settings.fee_headroom_pct)
 
     # ── BP13.1 / BP3: sizing mode — User DB setting beats global ENV ─────────
     # Authoritative priority: users.sizing_mode (DB) > settings.sizing_mode (ENV).
@@ -197,46 +192,30 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     depth_cap = float(signal.get("max_copy_usdc") or signal.get("size_usdc") or 0)
 
     # BP8: load cost-basis ledger for both modes (cost-basis equity, no phantom drawdown).
-    # BP26.5: sniper skips BOTH slow lookups (Data-API positions ~0.5-1 s, ledger
-    # equity ~0.3 s) — they only feed the risk gates / already-in-market guard,
-    # which sniper bypasses (the Redis once-key already enforces one entry per
-    # market). Every saved round-trip matters in the last 30 s of a 5-min market.
-    if is_sniper:
+    try:
+        from core.polymarket import get_positions as _gp
+        positions = _gp(deposit_wallet)
+        positions_loaded = True
+    except Exception:
         positions = []
         positions_loaded = False
+    try:
+        from core.db import get_open_trades_cost
+        from core.risk import total_equity
+        ledger_cost = get_open_trades_cost(user_id)
+        equity = total_equity(
+            tradeable,
+            positions,
+            ledger_cost,
+            mode=settings.drawdown_equity_mode,
+        )
+    except Exception:
         ledger_cost = {}
-        equity = tradeable
-    else:
-        try:
-            from core.polymarket import get_positions as _gp
-            positions = _gp(deposit_wallet)
-            positions_loaded = True
-        except Exception:
-            positions = []
-            positions_loaded = False
-        try:
-            from core.db import get_open_trades_cost
-            from core.risk import total_equity
-            ledger_cost = get_open_trades_cost(user_id)
-            equity = total_equity(
-                tradeable,
-                positions,
-                ledger_cost,
-                mode=settings.drawdown_equity_mode,
-            )
-        except Exception:
-            ledger_cost = {}
-            equity = tradeable + sum(
-                float(p.get("current_value") or 0) for p in positions if p.get("shares", 0) > 0
-            )
+        equity = tradeable + sum(
+            float(p.get("current_value") or 0) for p in positions if p.get("shares", 0) > 0
+        )
 
-    if is_sniper:
-        # BP29: final stake is computed from free pUSD and live in-band depth.
-        size_usdc = 0.0
-        score = None
-        log.info("sizing_sniper_bankroll", user_id=user_id,
-                 free_pusd=round(tradeable, 2), stake_frac=settings.sniper_stake_frac)
-    elif effective_mode == "kelly":
+    if effective_mode == "kelly":
         from core.sizing import kelly_stake
         from core.wallet_score import score_wallet
         try:
@@ -284,7 +263,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     # stake on a $45 account was cut to 5% ≈ $2.3, then floored back up to the
     # $5 exchange minimum, so every trade entered at $5). Fixed means fixed;
     # the tail-risk gates below (exposure/event/drawdown/daily-loss) still apply.
-    if (not is_sniper and effective_mode == "kelly"
+    if (effective_mode == "kelly"
             and settings.enforce_risk_per_trade_cap and equity > 0):
         hard_cap = settings.max_risk_per_trade * equity
         if size_usdc > hard_cap:
@@ -296,7 +275,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     # BP8: profit-protection trailing cap — don't give back >max_trade_loss_vs_profit_pct
     # of accumulated realized profit above the baseline in a single trade.
     # BP39: kelly-only for the same reason as the unified cap above.
-    if (not is_sniper and effective_mode == "kelly"
+    if (effective_mode == "kelly"
             and settings.max_trade_loss_vs_profit_pct > 0 and equity > 0):
         try:
             from core.db import get_realized_baseline
@@ -323,7 +302,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     # BP7: the "$100 recommended" warning is shown only in kelly mode — in fixed
     # mode the user chose their own size, so we stay silent about balance.
     exchange_min = settings.exchange_min_order_usdc
-    if not is_sniper and equity < settings.recommended_min_balance_usdc:
+    if equity < settings.recommended_min_balance_usdc:
         if effective_mode == "kelly":
             from core.cache import notify_once as _no
             if _no(f"trading_min:{user_id}", ttl=settings.lowbal_alert_throttle_sec):
@@ -333,23 +312,11 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         log.debug("equity_below_recommended", user_id=user_id,
                   equity=round(equity, 2),
                   recommended=settings.recommended_min_balance_usdc)
-    elif is_sniper and tradeable < settings.sniper_recommended_balance_usdc:
-        from core.cache import notify_once as _no
-        if _no(f"sniper_balance:{user_id}", ttl=86400):
-            _notify_sniper_low_balance(
-                user["telegram_id"],
-                tradeable,
-                settings.sniper_recommended_balance_usdc,
-            )
-        log.info("sniper_balance_below_recommended", user_id=user_id,
-                 balance=round(tradeable, 2),
-                 recommended=settings.sniper_recommended_balance_usdc)
 
-    if not is_sniper:
-        # Floor size up to the exchange minimum so Kelly's tiny fractions still execute.
-        size_usdc = max(size_usdc, exchange_min)
-        # Reserve fee headroom whenever the balance is the binding cap.
-        size_usdc = min(size_usdc, balance_cap)
+    # Floor size up to the exchange minimum so Kelly's tiny fractions still execute.
+    size_usdc = max(size_usdc, exchange_min)
+    # Reserve fee headroom whenever the balance is the binding cap.
+    size_usdc = min(size_usdc, balance_cap)
 
     # ── Fund deposit wallet on demand if short ───────────────────────────────
     if balance_cap < exchange_min:
@@ -370,14 +337,13 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
                 )
                 tradeable = get_balances(deposit_wallet).get("pusd", 0)
                 balance_cap = (
-                    tradeable * max(0.0, 1.0 - settings.sniper_fee_headroom_pct)
+                    tradeable * max(0.0, 1.0 - settings.fee_headroom_pct)
                 )
             except Exception:
                 log.warning("ondemand_fund_failed", user_id=user_id)
 
-    if not is_sniper:
-        # Re-clamp after possible sweep.
-        size_usdc = min(max(size_usdc, exchange_min), balance_cap)
+    # Re-clamp after possible sweep.
+    size_usdc = min(max(size_usdc, exchange_min), balance_cap)
 
     # Only skip if the wallet genuinely cannot afford the platform minimum.
     if balance_cap < exchange_min:
@@ -401,8 +367,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         # BP31: count only economically live positions. Resolved leftovers stay in
         # the Data-API forever with shares>0 (losing tokens are never redeemed,
         # redeemable winners are freed shortly) — they must not consume the
-        # max_open_positions slots, or lost 5-min sniper trades permanently
-        # starve regular whale copying.
+        # max_open_positions slots and starve regular whale copying.
         open_count = sum(
             1
             for p in positions
@@ -410,7 +375,7 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             and not p.get("redeemable")
             and float(p.get("current_value") or 0) >= 0.01
         )
-        if not is_sniper and open_count >= settings.max_open_positions:
+        if open_count >= settings.max_open_positions:
             log.info("skip_max_positions", user_id=user_id, open=open_count)
             return {"skipped": True, "reason": "max_positions"}
     except Exception:
@@ -455,37 +420,6 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         fallback_baseline_cost = fallback_baseline_shares * float(
             baseline_position.get("avg_price") or 0
         )
-    elif is_sniper:
-        try:
-            from core.relayer import ctf_token_balance
-
-            fallback_baseline_shares = (
-                ctf_token_balance(deposit_wallet, token_id) / CTF_TOKEN_SCALE
-            )
-            fallback_baseline_known = fallback_baseline_shares == 0
-            if not fallback_baseline_known:
-                from core.polymarket import get_positions as _get_baseline_positions
-
-                baseline_positions = _get_baseline_positions(deposit_wallet)
-                baseline_position = next(
-                    (
-                        position
-                        for position in baseline_positions
-                        if position.get("token_id") == token_id
-                    ),
-                    {},
-                )
-                api_shares = float(baseline_position.get("shares") or 0)
-                if api_shares > 0:
-                    fallback_baseline_shares = api_shares
-                    fallback_baseline_cost = api_shares * float(
-                        baseline_position.get("avg_price") or 0
-                    )
-                    fallback_baseline_known = True
-        except Exception:
-            fallback_baseline_known = False
-            log.warning("fill_baseline_snapshot_failed", user_id=user_id,
-                        token=token_id[:18])
 
     # ── Fresh order-book re-check ────────────────────────────────────────────
     entry_price = float(signal.get("price") or 0)
@@ -495,34 +429,29 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     try:
         from core.polymarket import get_order_book
 
-        if is_sniper:
-            book = None
-        else:
-            book = get_order_book(token_id)
-            if book and book.get("best_ask"):
-                entry_price = float(book["best_ask"])
-                if entry_price > settings.max_entry_price or entry_price < settings.min_entry_price:
-                    log.info("skip_price_out_of_range", user_id=user_id, price=entry_price)
-                    return {"skipped": True, "reason": "price_out_of_range"}
-                band = entry_price * (1.0 + settings.order_slippage_pct)
-                fillable = sum(
-                    lvl["price"] * lvl["size"] for lvl in book["asks"] if lvl["price"] <= band
-                )
-                cap = fillable * settings.book_safe_frac
-                if cap > 0:
-                    size_usdc = min(size_usdc, cap)
+        book = get_order_book(token_id)
+        if book and book.get("best_ask"):
+            entry_price = float(book["best_ask"])
+            if entry_price > settings.max_entry_price or entry_price < settings.min_entry_price:
+                log.info("skip_price_out_of_range", user_id=user_id, price=entry_price)
+                return {"skipped": True, "reason": "price_out_of_range"}
+            band = entry_price * (1.0 + settings.order_slippage_pct)
+            fillable = sum(
+                lvl["price"] * lvl["size"] for lvl in book["asks"] if lvl["price"] <= band
+            )
+            cap = fillable * settings.book_safe_frac
+            if cap > 0:
+                size_usdc = min(size_usdc, cap)
         if book and book.get("best_bid"):
             entry_bid_at_fill = float(book["best_bid"])
     except Exception:
         log.warning("exec_book_check_failed", user_id=user_id)
 
-    # After the default-path book re-check, ensure the balance/depth caps still
-    # leave enough room for a platform-minimum order. Sniper does this inside
-    # its single book-read/order-attempt loop below.
-    if not is_sniper:
-        size_usdc = max(size_usdc, exchange_min)
-        size_usdc = min(size_usdc, balance_cap)
-    if not is_sniper and (size_usdc < exchange_min or balance_cap < exchange_min):
+    # After the book re-check, ensure the balance/depth caps still
+    # leave enough room for a platform-minimum order.
+    size_usdc = max(size_usdc, exchange_min)
+    size_usdc = min(size_usdc, balance_cap)
+    if size_usdc < exchange_min or balance_cap < exchange_min:
         log.debug("skip_depth_below_min", user_id=user_id,
                   size=round(size_usdc, 4), exchange_min=exchange_min)
         return {"skipped": True, "reason": "depth_below_min_order"}
@@ -545,58 +474,57 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
     # Passing hwm=0 makes check_risk_gates use hwm=max(0, equity)=equity →
     # drawdown=0 for the rest of the UTC day. Gates 1-2 (exposure) still apply.
     concentration_warn: str | None = None
-    if not is_sniper:
+    try:
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        from core.db import get_daily_realized_pnl, get_risk_override_until, get_user_equity_hwm
+        from core.risk import check_risk_gates
+        hwm = get_user_equity_hwm(user_id)
+        daily_pnl = get_daily_realized_pnl(user_id)
         try:
-            from datetime import datetime as _dt
-            from datetime import timezone as _tz
-
-            from core.db import get_daily_realized_pnl, get_risk_override_until, get_user_equity_hwm
-            from core.risk import check_risk_gates
-            hwm = get_user_equity_hwm(user_id)
-            daily_pnl = get_daily_realized_pnl(user_id)
-            try:
-                _override_ts = get_risk_override_until(user_id)
-                if _override_ts:
-                    from dateutil.parser import parse as _pdt
-                    _override_exp = _pdt(_override_ts)
-                    if _override_exp.tzinfo is None:
-                        _override_exp = _override_exp.replace(tzinfo=_tz.utc)
-                    if _dt.now(_tz.utc) < _override_exp:
-                        log.debug("risk_gates34_bypassed_override",
-                                  user_id=user_id, override_until=_override_ts)
-                        daily_pnl = 0.0  # gate 4 sees no loss → does not block
-                        hwm = 0.0        # gate 3 sees no drawdown → does not block
-            except Exception:
-                pass
-            decision = check_risk_gates(
-                signal=signal,
-                stake=size_usdc,
-                open_positions=positions,
-                equity=equity,
-                equity_hwm=hwm,
-                daily_pnl=daily_pnl,
-                cfg=settings,
-                ledger_cost_by_token=ledger_cost,
-            )
-            if not decision.allowed:
-                gate = decision.gate
-                # BP8: no notification here — manage_positions owns the pause alert.
-                log.info("skip_risk_gate", user_id=user_id,
-                         gate=gate, reason=decision.reason[:80])
-                return {"skipped": True, "reason": f"risk_gate:{gate}"}
-
-            # BP7: apply clamped stake when Gates 1/2 reduced it (e.g. partial headroom).
-            if decision.max_stake is not None:
-                clamped = max(min(decision.max_stake, balance_cap), exchange_min)
-                log.info("risk_gate_clamp_applied", user_id=user_id,
-                         original=round(size_usdc, 2), clamped=round(clamped, 2),
-                         gate=decision.gate)
-                size_usdc = clamped
-
-            # Carry the concentration warning forward to the trade notification.
-            concentration_warn = decision.warn
+            _override_ts = get_risk_override_until(user_id)
+            if _override_ts:
+                from dateutil.parser import parse as _pdt
+                _override_exp = _pdt(_override_ts)
+                if _override_exp.tzinfo is None:
+                    _override_exp = _override_exp.replace(tzinfo=_tz.utc)
+                if _dt.now(_tz.utc) < _override_exp:
+                    log.debug("risk_gates34_bypassed_override",
+                              user_id=user_id, override_until=_override_ts)
+                    daily_pnl = 0.0  # gate 4 sees no loss → does not block
+                    hwm = 0.0        # gate 3 sees no drawdown → does not block
         except Exception:
-            log.warning("risk_gate_check_failed", user_id=user_id)
+            pass
+        decision = check_risk_gates(
+            signal=signal,
+            stake=size_usdc,
+            open_positions=positions,
+            equity=equity,
+            equity_hwm=hwm,
+            daily_pnl=daily_pnl,
+            cfg=settings,
+            ledger_cost_by_token=ledger_cost,
+        )
+        if not decision.allowed:
+            gate = decision.gate
+            # BP8: no notification here — manage_positions owns the pause alert.
+            log.info("skip_risk_gate", user_id=user_id,
+                     gate=gate, reason=decision.reason[:80])
+            return {"skipped": True, "reason": f"risk_gate:{gate}"}
+
+        # BP7: apply clamped stake when Gates 1/2 reduced it (e.g. partial headroom).
+        if decision.max_stake is not None:
+            clamped = max(min(decision.max_stake, balance_cap), exchange_min)
+            log.info("risk_gate_clamp_applied", user_id=user_id,
+                     original=round(size_usdc, 2), clamped=round(clamped, 2),
+                     gate=decision.gate)
+            size_usdc = clamped
+
+        # Carry the concentration warning forward to the trade notification.
+        concentration_warn = decision.warn
+    except Exception:
+        log.warning("risk_gate_check_failed", user_id=user_id)
 
     # ── Idempotency guard & signal insert ────────────────────────────────────
     signal_id = signal.get("signal_id")
@@ -664,179 +592,21 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         # Blueprint 17 Layer 3: CLOB best_bid at fill time (Layer 3 bid-vs-bid guard).
         # NULL-safe: column may be absent in old DB schema — insert only when present.
         **({"entry_bid": round(entry_bid_at_fill, 6)} if entry_bid_at_fill > 0 else {}),
-        # BP26: NULL-safe for the pre-migration-019 schema — only sniper trades send
-        # the column (they can't exist before migration 019 anyway, since the donor
-        # row needs tracked_wallets.mode); default trades rely on the column default.
-        **({"mode": "sniper"} if is_sniper else {}),
     })
 
     try:
-        if is_sniper:
-            from core.polymarket import get_order_book as _get_sniper_book
-            from core.sniper_entry import (
-                calculate_sniper_stake,
-                entry_bounds,
-                entry_decision,
-            )
-
-            donor_px = float(signal.get("price") or 0)
-            lower_bound, upper_bound = entry_bounds(
-                donor_px,
-                settings.sniper_max_below_pct,
-                settings.sniper_slippage_pct,
-            )
-            deadline = time.time() + settings.sniper_entry_wait_sec
-            attempts = 0
-            last_ask = 0.0
-            last_direction = "no_book"
-            result = None
-            last_fak_error: Exception | None = None
-
-            while time.time() <= deadline:
-                try:
-                    book = _get_sniper_book(token_id)
-                except Exception:
-                    book = None
-                ask = float(book.get("best_ask") or 0) if book else 0.0
-                if ask > 0:
-                    last_ask = ask
-                    if ask < lower_bound:
-                        last_direction = "below"
-                    elif ask > min(upper_bound, settings.sniper_max_entry_price):
-                        last_direction = "above"
-                    else:
-                        last_direction = "inside"
-                if time.time() > deadline:
-                    break
-
-                decision = entry_decision(
-                    donor_px,
-                    ask,
-                    max_below_pct=settings.sniper_max_below_pct,
-                    slippage_pct=settings.sniper_slippage_pct,
-                    max_entry_price=settings.sniper_max_entry_price,
-                )
-                if decision == "enter" and book:
-                    max_price = min(upper_bound, settings.sniper_max_entry_price)
-                    depth_usdc = sum(
-                        float(level["price"]) * float(level["size"])
-                        for level in (book.get("asks") or [])
-                        if float(level["price"]) <= max_price
-                    )
-                    size_usdc = calculate_sniper_stake(
-                        tradeable,
-                        depth_usdc,
-                        stake_frac=settings.sniper_stake_frac,
-                        min_order_usdc=exchange_min,
-                        stake_cap_usdc=settings.sniper_stake_cap_usdc,
-                        fee_headroom_pct=settings.sniper_fee_headroom_pct,
-                    )
-                    if size_usdc < exchange_min:
-                        log.info(
-                            "sniper_skip",
-                            reason="depth_below_min_order",
-                            user_id=user_id,
-                            depth=round(depth_usdc, 4),
-                            stake=round(size_usdc, 4),
-                        )
-                        try:
-                            sb.table("copy_trades").update({
-                                "status": "unfilled",
-                                "error_msg": "sniper depth below minimum",
-                            }).eq("id", trade_row["id"]).execute()
-                        except Exception:
-                            pass
-                        return {"skipped": True, "reason": "depth_below_min_order"}
-
-                    entry_price = ask
-                    entry_bid_at_fill = float(book.get("best_bid") or 0)
-                    try:
-                        payload = {
-                            "size_usdc": round(size_usdc, 2),
-                            "entry_price": round(entry_price, 6),
-                        }
-                        if entry_bid_at_fill > 0:
-                            payload["entry_bid"] = round(entry_bid_at_fill, 6)
-                        sb.table("copy_trades").update(payload).eq(
-                            "id", trade_row["id"]
-                        ).execute()
-                    except Exception:
-                        pass
-
-                    if time.time() > deadline:
-                        break
-                    attempts += 1
-                    order_slippage = max(
-                        0.0,
-                        min(settings.sniper_slippage_pct, max_price / ask - 1.0),
-                    )
-                    try:
-                        result = place_order(
-                            private_key_enc=user["wallet_private_key_enc"],
-                            api_creds=api_creds,
-                            token_id=token_id,
-                            side=signal["side"],
-                            price=entry_price,
-                            size_usdc=size_usdc,
-                            tick_size=str(signal.get("tick_size", "0.01")),
-                            neg_risk=bool(signal.get("neg_risk", False)),
-                            slippage_pct=order_slippage,
-                            deposit_wallet=deposit_wallet,
-                        )
-                        break
-                    except Exception as fak_exc:
-                        if "no orders found to match" not in str(fak_exc).lower():
-                            raise
-                        last_fak_error = fak_exc
-                        log.info(
-                            "sniper_fak_retry",
-                            user_id=user_id,
-                            ask=round(ask, 4),
-                            attempt=attempts,
-                        )
-                        if attempts >= settings.sniper_fak_max_retries:
-                            raise
-
-                remaining_wait = deadline - time.time()
-                if remaining_wait <= 0:
-                    break
-                time.sleep(min(settings.sniper_entry_poll_sec, remaining_wait))
-
-            if result is None:
-                if last_fak_error and attempts >= settings.sniper_fak_max_retries:
-                    raise last_fak_error
-                log.info(
-                    "sniper_skip",
-                    reason="price_out_of_band",
-                    direction=last_direction,
-                    user_id=user_id,
-                    donor=round(donor_px, 4),
-                    lower=round(lower_bound, 4),
-                    upper=round(min(upper_bound, settings.sniper_max_entry_price), 4),
-                    last_ask=round(last_ask, 4),
-                    waited=settings.sniper_entry_wait_sec,
-                )
-                try:
-                    sb.table("copy_trades").update({
-                        "status": "unfilled",
-                        "error_msg": f"sniper price out of band: {last_direction}",
-                    }).eq("id", trade_row["id"]).execute()
-                except Exception:
-                    pass
-                return {"skipped": True, "reason": "price_out_of_band"}
-        else:
-            result = place_order(
-                private_key_enc=user["wallet_private_key_enc"],
-                api_creds=api_creds,
-                token_id=token_id,
-                side=signal["side"],
-                price=entry_price,
-                size_usdc=size_usdc,
-                tick_size=str(signal.get("tick_size", "0.01")),
-                neg_risk=bool(signal.get("neg_risk", False)),
-                slippage_pct=settings.order_slippage_pct,
-                deposit_wallet=deposit_wallet,
-            )
+        result = place_order(
+            private_key_enc=user["wallet_private_key_enc"],
+            api_creds=api_creds,
+            token_id=token_id,
+            side=signal["side"],
+            price=entry_price,
+            size_usdc=size_usdc,
+            tick_size=str(signal.get("tick_size", "0.01")),
+            neg_risk=bool(signal.get("neg_risk", False)),
+            slippage_pct=settings.order_slippage_pct,
+            deposit_wallet=deposit_wallet,
+        )
 
         order_id = result.get("orderID") or result.get("order_id") or ""
 
@@ -891,14 +661,14 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         filled = fill.filled_usdc
         fill_status = fill.status
         shares_filled = round(fill.shares, 6)
-        fee_estimate = round(size_usdc * settings.sniper_fee_headroom_pct, 6)
+        fee_estimate = round(size_usdc * settings.fee_headroom_pct, 6)
         if fill.fee_usdc is None:
             log.info(
                 "order_fee_estimate",
                 user_id=user_id,
                 order_id=order_id,
                 estimate_usdc=fee_estimate,
-                headroom_pct=settings.sniper_fee_headroom_pct,
+                headroom_pct=settings.fee_headroom_pct,
             )
 
         try:
@@ -908,12 +678,11 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
             remaining = 0.0
 
         score_val, signal_type_val, thesis_val, caution_val = None, None, None, None
-        if not is_sniper:
-            try:
-                from worker.tasks.ai_filter import _call_gpt
-                score_val, signal_type_val, thesis_val, caution_val = _call_gpt(signal)
-            except Exception:
-                log.warning("ai_inline_failed", user_id=user_id)
+        try:
+            from worker.tasks.ai_filter import _call_gpt
+            score_val, signal_type_val, thesis_val, caution_val = _call_gpt(signal)
+        except Exception:
+            log.warning("ai_inline_failed", user_id=user_id)
 
         final_status = "confirmed" if fill_status != "none" else "unfilled"
         update_payload: dict = {
@@ -996,10 +765,6 @@ def execute_copy_trade(self: ExecuteCopyTask, user_id: int, signal: dict) -> dic
         except Exception:
             pass
         log.exception("copy_trade_failed", user_id=user_id)
-        if is_sniper:
-            # BP26: NO retry — a retry 5s later fires into an already-resolved market.
-            log.warning("sniper_trade_failed_no_retry", user_id=user_id)
-            return {"skipped": True, "reason": "sniper_failed"}
         raise self.retry(exc=exc)
 
 
@@ -1282,23 +1047,6 @@ def _notify_trading_at_minimum(telegram_id: int, balance: float, recommended: fl
         )
     except Exception:
         log.exception("notify_trading_at_minimum_failed", telegram_id=telegram_id)
-
-
-def _notify_sniper_low_balance(telegram_id: int, balance: float, recommended: float) -> None:
-    """Daily soft warning for a small sniper bankroll; trading continues."""
-    try:
-        _tg_send(
-            telegram_id,
-            (
-                "⚠️ <b>Для снайпер-режима маловато запаса</b>\n\n"
-                f"Сейчас свободно: <b>${balance:.2f} pUSD</b>. "
-                f"Лучше держать хотя бы <b>${recommended:.0f}</b>: "
-                "в плохой день стратегия может просесть примерно на $100.\n\n"
-                "Сделку не блокируем, просто предупреждаем о риске."
-            ),
-        )
-    except Exception:
-        log.exception("notify_sniper_low_balance_failed", telegram_id=telegram_id)
 
 
 def _notify_risk_pause(telegram_id: int, reason: str) -> None:

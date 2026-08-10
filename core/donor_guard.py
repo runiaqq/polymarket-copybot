@@ -3,7 +3,7 @@ Blueprint 42 — per-donor loss-streak circuit breaker.
 
 Pure decision logic + small shared helpers. A donor whose last N unique copied
 markets ALL resolved at a loss gets `tracked_wallets.paused_until` set; the
-pollers (poll_tracked_wallets / poll_sniper_wallets) skip paused donors. The
+poller (poll_tracked_wallets) skips paused donors. The
 evaluation loop lives in worker/tasks/donor_refresh.py (called from
 sync_positions every 2 min).
 """

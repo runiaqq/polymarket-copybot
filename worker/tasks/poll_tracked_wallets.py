@@ -151,9 +151,10 @@ def poll_tracked_wallets() -> dict:
         addr = (w.get("address") or "").lower()
         if not addr:
             continue
-        # BP26: sniper wallets are handled EXCLUSIVELY by poll_sniper_wallets —
-        # without this skip the donor would be double-copied through both paths.
-        if (w.get("mode") or "default") == "sniper":
+        # BP44: sniper mode is removed from the codebase. Legacy rows with
+        # mode='sniper' (5-min BTC markets) must never be copied by this
+        # slow path — their markets resolve before the copy even lands.
+        if (w.get("mode") or "default") != "default":
             continue
         # BP42: loss-streak circuit breaker — donor is on a cooldown.
         if donor_is_paused(w.get("paused_until"), now):

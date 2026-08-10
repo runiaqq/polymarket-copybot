@@ -253,55 +253,13 @@ class Settings(BaseSettings):
     # costs one extra trade per day instead of bleeding all day.
     donor_pause_hours: float = 24.0
 
-    # ── Blueprint 26: sniper-mode donor mirroring (5-min BTC markets) ──────────
-    # Fast poll cadence for mode='sniper' tracked wallets (seconds).
-    sniper_poll_sec: float = 3.0
-    # Ignore donor fills older than this (market lives ~5 min; donor enters at T-30s).
-    sniper_max_trade_age_sec: int = 25
-    # Data-API activity fetch limit per sniper wallet per poll.
-    sniper_fetch_limit: int = 10
-    # Max slippage vs the donor's fill price (skip entry on drift beyond this).
-    sniper_slippage_pct: float = 0.02
-    # Never enter after the ask falls more than this below the donor fill.
-    sniper_max_below_pct: float = 0.04
-    # Absolute entry-price ceiling for sniper entries.
-    sniper_max_entry_price: float = 0.97
-    # BP26.6 "patient entry": the donor's own order sweeps the thin book, so the
-    # ask right after his fill is cents higher — but MMs requote within seconds.
-    # Instead of an instant drift-skip, re-read the book for up to this long and
-    # enter the moment the ask returns inside the slippage band.
-    sniper_entry_wait_sec: float = 10.0
-    sniper_entry_poll_sec: float = 0.7
-    # BP26.8: how many times to re-place a sniper FAK order after the CLOB
-    # rejects it with "no orders found to match" (ask vanished between the
-    # book read and the order hitting the engine).
-    sniper_fak_max_retries: int = 4
+    # BP44 removed sniper-mode donor mirroring (BP26/26.5) entirely. Two
+    # settings from that era stay because the regular copy path uses them:
     # Reserve balance for CLOB taker-fee validation when a stake hits free pUSD.
-    # Applies to every entry path, not only sniper markets.
-    sniper_fee_headroom_pct: float = 0.03
+    fee_headroom_pct: float = 0.03
     # Retry only the post-fill ledger write; never re-place a matched order.
     trade_ledger_update_attempts: int = 3
     trade_ledger_update_retry_sec: float = 0.2
-    # Sniper stake is a fraction of free pUSD, bounded by this dollar cap.
-    sniper_stake_frac: float = 0.10
-    sniper_stake_cap_usdc: float = 50.0
-    # Soft warning only; low balance never blocks a sniper entry.
-    sniper_recommended_balance_usdc: float = 200.0
-    # Redis once-key TTL for per-market dedup (one entry per market instance).
-    sniper_dedup_ttl_sec: int = 900
-
-    # ── Blueprint 26.5: real-time sniper feed (RTDS WebSocket) ──────────────────
-    # Platform-wide activity stream (~1 s after match) — the primary low-latency
-    # path; the 3-second Data-API poller above stays as a fallback.
-    sniper_ws_enabled: bool = True
-    sniper_ws_url: str = "wss://ws-live-data.polymarket.com"
-    # Re-read the sniper donor list from tracked_wallets this often (seconds).
-    sniper_ws_refresh_donors_sec: int = 60
-    # Force a reconnect after this many seconds without ANY frame from the
-    # server (the unfiltered orders_matched stream is never quiet for long;
-    # RTDS connections are known to die silently). BP26.6: 25 s — prod showed
-    # hourly silent drops; a 60 s window + 30 s backoff cost a real donor fill.
-    sniper_ws_silence_reconnect_sec: int = 25
 
     # ── Blueprint 30: own signal engine in isolated shadow mode ───────────────
     shadow_enabled: bool = True

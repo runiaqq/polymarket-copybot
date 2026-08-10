@@ -6543,6 +6543,47 @@ Caveat: the `requoted` flag exists only since migration 026 (08-01), so the
 first ~75 trades may hide unflagged re-quotes — the true historical damage
 is likely somewhat larger than −$65.86.
 
+## Blueprint 44: remove sniper-mode donor mirroring (BP26/26.5-29) (2026-08-10)
+
+Incident: three weeks after sniper copying of the 5-min BTC bot was
+abandoned, the copytrade bot re-sent a loss notification for a July-20
+sniper trade ("Bitcoin Up or Down - July 20, 9:40AM-9:45AM ET", −$19.77,
+resolved 07-20 13:46 UTC, re-notified 08-10 13:49 UTC). Root cause chain:
+(1) the sniper donor row was still active=true in tracked_wallets; (2) the
+`settle:{uid}:{cond}` Redis dedup key expires after 7 days; (3) a
+redemption/backfill sweep touched the ancient position and the Data API
+re-surfaced it with a FRESH close timestamp, defeating the
+settlement_lookback_sec "too old" filter in sync_positions.
+
+Removed (code):
+- `worker/tasks/poll_sniper_wallets.py` (fast poller + fire_sniper_signal),
+  `worker/sniper_ws.py` (RTDS listener), `core/sniper_entry.py` (patient
+  entry helpers) + their tests and `scripts/repair_sniper_ledger.py`.
+- All `is_sniper` branches in `worker/tasks/execute_copy.py` — the patient
+  entry loop, bankroll sizing, gate bypasses, no-retry branch, low-balance
+  warning. Every entry now goes through the full default risk pipeline.
+- Sniper delta-drop specializations in manage_positions (zero min-hold,
+  1-tick confirm).
+- Beat: sniper WS daemon thread; celery: poll-sniper-wallets schedule/route.
+- Config: whole BP26/26.5 settings block. Two settings survived under new
+  names because the DEFAULT path uses them: `sniper_fee_headroom_pct` ->
+  `fee_headroom_pct` (0.03), plus `trade_ledger_update_*` kept as-is.
+
+Kept: `tracked_wallets.mode` and `copy_trades.mode` DB columns (historical
+data); poll_tracked_wallets skips any row with mode != 'default' so a legacy
+sniper row can never be copied by the slow path. `core/order_fill.py`
+(extract_buy_fill) stays — the cryptobot executor uses it.
+
+DB state change (already applied in prod): the sniper donor row
+(tracked_wallets id=21, 'BTC 5-min sniper') set active=false,
+allowed_telegram_ids=null.
+
+Re-notification fix (sync_positions, closed-positions loop): before emitting
+a win/loss notice, look up the trade's `resolved_at` in copy_trades — if the
+market was resolved for this user longer than settlement_lookback_sec ago,
+skip regardless of the Data-API timestamp. The DB ledger is terminal truth;
+the 7-day Redis key is now only a fast-path cache in front of it.
+
 ### Backlog (agreed 2026-08-10, not yet implemented)
 
 1. **Crypto drought gate.** When the shadow filter passed <15 signals in the

@@ -211,7 +211,7 @@ def sync_positions() -> dict:
             # the in-process _first_seen dict only when the DB row is unavailable.
             fkey = f"{uid}:{token_id}"
             age_sec: float = settings.delta_drop_min_hold_sec  # default: eligible
-            db_trade = None  # BP26: initialized before try so it's in scope for sniper checks
+            db_trade = None  # initialized before try so it's in scope below
             try:
                 from core.db import get_open_trade_by_token as _got
                 db_trade = _got(uid, token_id)
@@ -228,8 +228,7 @@ def sync_positions() -> dict:
                 seen_at = _first_seen.setdefault(fkey, now)
                 age_sec = now - seen_at
 
-            # BP26: sniper trades live ~30s — hold-time guard must be zero for them.
-            _min_hold = 0 if (db_trade or {}).get("mode") == "sniper" else settings.delta_drop_min_hold_sec
+            _min_hold = settings.delta_drop_min_hold_sec
             if age_sec < _min_hold:
                 log.debug("exit_skipped_too_new",
                           user_id=uid, token=token_id[:14],
@@ -456,7 +455,7 @@ def sync_positions() -> dict:
                     # ── Layer 4: persistence / debounce ────────────────────
                     _drop_ticks[fkey] = _drop_ticks.get(fkey, 0) + 1
                     ticks = _drop_ticks[fkey]
-                    _req_ticks = 1 if (db_trade or {}).get("mode") == "sniper" else settings.delta_drop_confirm_ticks
+                    _req_ticks = settings.delta_drop_confirm_ticks
                     if ticks < _req_ticks:
                         log.info("delta_drop_confirming",
                                  user_id=uid, token=token_id[:14],
@@ -508,6 +507,31 @@ def sync_positions() -> dict:
             if not (resolved_win or resolved_loss):
                 continue  # mid-market sell (TP/SL/manual) — already notified at close
             cond_id = c["condition_id"]
+
+            # BP44: durable dedup on top of the 7-day Redis settle-key. Our own
+            # redemption/backfill sweeps can touch an ancient position and
+            # re-surface it in the Data API with a FRESH close timestamp (seen
+            # live 2026-08-10: a July-20 sniper loss re-notified 3 weeks later
+            # after its Redis key expired). The DB ledger is the terminal truth:
+            # a market already resolved for this user longer than the lookback
+            # ago must never notify again.
+            try:
+                from core.db import get_supabase as _gsb2
+                from core.donor_guard import parse_ts as _pts
+                _res = (
+                    _gsb2().table("copy_trades")
+                    .select("resolved_at").eq("user_id", uid)
+                    .eq("condition_id", cond_id)
+                    .not_.is_("resolved_at", "null")
+                    .order("resolved_at", desc=True).limit(1).execute()
+                )
+                _ra_ts = _pts(((_res.data or [{}])[0] or {}).get("resolved_at"))
+                if _ra_ts and now - _ra_ts > settings.settlement_lookback_sec:
+                    log.debug("settle_notice_deduped_by_ledger",
+                              user_id=uid, cond=cond_id[:14])
+                    continue
+            except Exception:
+                pass
 
             if resolved_win and settings.auto_redeem_enabled:
                 # BP9 Layer 3: this branch caused the prod bug (sent "выиграно"
