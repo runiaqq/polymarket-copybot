@@ -109,6 +109,21 @@ def fire_sniper_signal(addr: str, allowed: list[int], cond: str, token: str,
                        ttl=settings.sniper_dedup_ttl_sec):
         return False
 
+    # BP42: loss-streak circuit breaker. Checked HERE (not in the poller loop)
+    # so the RTDS WS path is covered too — both sources converge on this exit.
+    try:
+        from core.db import get_supabase
+        from core.donor_guard import donor_is_paused
+        row = (
+            get_supabase().table("tracked_wallets").select("paused_until")
+            .eq("address", addr.lower()).limit(1).execute().data or [{}]
+        )[0]
+        if donor_is_paused(row.get("paused_until"), time.time()):
+            log.info("sniper_skip", reason="donor_paused", wallet=addr[:10])
+            return False
+    except Exception:
+        log.warning("sniper_pause_check_failed", wallet=addr[:10])
+
     meta = get_clob_market(cond)
     if not meta:
         log.info("sniper_skip", reason="no_market_meta", market=cond[:14])

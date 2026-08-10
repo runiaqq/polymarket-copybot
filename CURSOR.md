@@ -6479,3 +6479,37 @@ Fix (core/polygon.py): after sending the approve, `_ensure_allowance` polls
 the allowance up to 6 times / 2s apart (logs `allowance_read_lag` per miss)
 before raising. Affects every wrap/unwrap path (deposits, withdrawals,
 cryptobot funding sweep) — all shared this race.
+
+## Blueprint 42: per-donor loss-streak circuit breaker (2026-08-10)
+
+Incident: donor `donthackme` went cold 2026-08-07..09 and bled −$41 across
+all copiers (the week's +100% was given back in two days) before the admin
+manually removed the wallet. The old `deactivate_underperforming_donors`
+task targets the legacy Model-A `donor_wallets` table and never sees
+Model-B `tracked_wallets` — there was NO automatic brake on a cold donor.
+
+Mechanism:
+- Migration 027: `tracked_wallets.paused_until timestamptz` (NULL = live).
+- `core/donor_guard.py`: pure `pause_decision()` + `donor_is_paused()` +
+  `notify_admins()` (admin-bot token, falls back to the main bot; recipients
+  = super-admin + `admins` table).
+- `worker/tasks/donor_refresh.py::check_donor_streaks()` — called at the end
+  of `sync_positions` (every 2 min, right after resolutions land). Joins the
+  last 7 days of resolved `copy_trades` to donors via `trade_signals
+  .source_wallet` and pauses a donor whose last `donor_pause_loss_streak`
+  (default 5) most recent UNIQUE markets (dedup by condition_id — 3 users
+  copying one losing market = ONE loss) all have `realized_pnl < 0`.
+- Enforcement: `poll_tracked_wallets` skips paused wallets in the fan-out
+  loop; the sniper path is gated inside `fire_sniper_signal` so BOTH sources
+  (RTDS WS listener + Data-API poller) are covered.
+- Admin notification (Russian, HTML) fires once per pause with the label,
+  address and auto-resume time.
+
+Sizing of the knobs (config): streak 5 → P(false positive) ≈ 0.4^5 ≈ 1% per
+window for a healthy 60%-WR donor; pause 24 h ≈ 3-10 skipped trades for an
+active donor, enough for a losing market regime to pass. Auto-resume with a
+re-arm guard: re-pausing requires at least one NEW loss resolved after the
+previous pause ended (the old streak alone can't re-trigger), so a donor
+that is still cold costs at most ~1 extra trade per day instead of bleeding
+all day. Open positions of a paused donor keep being managed normally
+(stop-loss/redeem run in sync_positions regardless of the pause).

@@ -239,6 +239,20 @@ class Settings(BaseSettings):
     # (one entry per burst, not one per fill / per poll cycle).
     tracked_reentry_hours: int = 12
 
+    # ── Blueprint 42: per-donor loss-streak circuit breaker ────────────────────
+    # Pause a donor after this many CONSECUTIVE unique losing markets (counted
+    # across all copiers by condition_id, so 3 users copying the same losing
+    # market = ONE loss, not three). P(5 straight losses) for a healthy 60%-WR
+    # donor is ~1% per window — cheap false-positive rate vs. cutting a donor
+    # who has gone cold (donthackme 2026-08: −$41 over a multi-day cold streak).
+    donor_pause_loss_streak: int = 5
+    # Pause length. 24 h skips ~3-10 trades of an active donor (bounded cost if
+    # the pause was a false positive) while letting a losing market regime pass.
+    # Auto-resume; if the donor is still cold, ONE new post-resume loss (with the
+    # streak still intact behind it) re-arms the pause — worst case a cold donor
+    # costs one extra trade per day instead of bleeding all day.
+    donor_pause_hours: float = 24.0
+
     # ── Blueprint 26: sniper-mode donor mirroring (5-min BTC markets) ──────────
     # Fast poll cadence for mode='sniper' tracked wallets (seconds).
     sniper_poll_sec: float = 3.0

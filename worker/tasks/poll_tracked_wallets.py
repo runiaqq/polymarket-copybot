@@ -17,6 +17,7 @@ import structlog
 
 from core.cache import accum_add, accum_get, accum_mark_fired, notify_once
 from core.config import settings
+from core.donor_guard import donor_is_paused
 from worker.celery_app import celery_app
 
 log = structlog.get_logger(__name__)
@@ -153,6 +154,11 @@ def poll_tracked_wallets() -> dict:
         # BP26: sniper wallets are handled EXCLUSIVELY by poll_sniper_wallets —
         # without this skip the donor would be double-copied through both paths.
         if (w.get("mode") or "default") == "sniper":
+            continue
+        # BP42: loss-streak circuit breaker — donor is on a cooldown.
+        if donor_is_paused(w.get("paused_until"), now):
+            log.debug("tracked_wallet_paused", wallet=addr[:10],
+                      until=w.get("paused_until"))
             continue
         threshold = _threshold(w)
 

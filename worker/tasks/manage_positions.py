@@ -592,6 +592,13 @@ def sync_positions() -> dict:
         except Exception:
             log.warning("hwm_update_failed", user_id=uid)
 
+    # BP42: after resolutions landed, pause donors on a loss streak.
+    try:
+        from worker.tasks.donor_refresh import check_donor_streaks
+        check_donor_streaks()
+    except Exception:
+        log.warning("donor_streak_check_failed")
+
     log.info("sync_positions_done", users=len(subscribers), actions=actions)
     return {"users": len(subscribers), "actions": actions}
 
