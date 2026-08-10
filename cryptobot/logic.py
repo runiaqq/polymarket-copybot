@@ -48,22 +48,6 @@ def price_collapsed(
     return fresh_ask < signal_ask * (1.0 - max_drop_pct)
 
 
-def requote_price_ok(
-    signal_ask: float | None,
-    fresh_ask: float | None,
-    max_worse_pct: float,
-    max_entry_price: float,
-) -> bool:
-    """BP34 re-quote guard after a FAK kill: the fresh ask must be a valid
-    price below the hard entry ceiling and not worse than the signal ask by
-    more than max_worse_pct (paying above that breaks the edge thesis)."""
-    if not signal_ask or signal_ask <= 0 or not fresh_ask or fresh_ask <= 0:
-        return False
-    if fresh_ask > max_entry_price:
-        return False
-    return fresh_ask <= signal_ask * (1.0 + max_worse_pct)
-
-
 def should_flag_stuck(window_end_ts: float, now_ts: float, threshold_sec: float) -> bool:
     """BP35 watchdog: an open trade whose window ended more than threshold_sec
     ago is stuck — the outcome is overdue and the user deserves a heartbeat."""

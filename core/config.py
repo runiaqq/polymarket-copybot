@@ -520,10 +520,8 @@ class Settings(BaseSettings):
     # The check is `ask <= ceiling`, so 0.89 admits 0.89 and rejects 0.90.
     crypto_max_entry_price: float = 0.89
     crypto_entry_slippage_pct: float = 0.015
-    # BP34: after a FAK kill ("no orders found to match") re-quote once at the
-    # fresh best ask — but only if it's not worse than the signal ask by more
-    # than this fraction; beyond that the edge thesis behind the signal is broken.
-    crypto_requote_max_worse_pct: float = 0.03
+    # BP43 removed the BP34 re-quote path entirely: a FAK kill means informed
+    # flow ate the ask; chasing measured WR 62% / −$65.86 over 16 trades.
     # BP38 collapse guard: skip the signal when the fresh best ask has dropped
     # more than this fraction below the signal ask — the market repriced after
     # the snapshot and the model probability is stale (trade #176 filled at

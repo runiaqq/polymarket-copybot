@@ -6513,3 +6513,46 @@ previous pause ended (the old streak alone can't re-trigger), so a donor
 that is still cold costs at most ~1 extra trade per day instead of bleeding
 all day. Open positions of a paused donor keep being managed normally
 (stop-loss/redeem run in sync_positions regardless of the pause).
+
+## Blueprint 43: kill the FAK re-quote path (2026-08-10)
+
+Full-history audit of the crypto bot (275 resolved real-money trades,
+2026-07-30..08-10, cum −$0.35 after giving back the +$82 peak) decomposed
+the PnL and found the BP34 re-quote path is systematically toxic:
+
+- requoted=True: 16 trades, WR 62%, **−$65.86**;
+- requoted=False: 259 trades, WR 85%, **+$65.51** (peak cum +$117).
+
+Mechanism (adverse selection): a FAK killed with "no orders found to match"
+means the book moved between the shadow snapshot and our order — informed
+flow ate the ask. The re-quote then chased the price +2..+4% ABOVE the
+signal ask, so wins shrank to avg +$2.6 while losses stayed full −$15.
+Mirror confirmation: plain entries whose fill came ≥3% CHEAPER than the
+signal ran WR 88% / +$106.75 (n=48) — the bot's whole profit lives where
+the market gives a better price than the model priced, never a worse one.
+
+Change: `_requote_once` deleted from cryptobot/executor.py; a FAK kill now
+inserts a skipped row with `skip_reason='fak_killed'` and moves on.
+`requote_price_ok` removed from cryptobot/logic.py (+ its tests);
+`crypto_requote_max_worse_pct` removed from config. The
+`crypto_trades.requoted` column stays for historical data; new rows default
+to false. BP38's collapse guard is untouched (it protects the primary
+entry, which remains).
+
+Caveat: the `requoted` flag exists only since migration 026 (08-01), so the
+first ~75 trades may hide unflagged re-quotes — the true historical damage
+is likely somewhat larger than −$65.86.
+
+### Backlog (agreed 2026-08-10, not yet implemented)
+
+1. **Crypto drought gate.** When the shadow filter passed <15 signals in the
+   trailing 24 h, the few that do pass are toxic: shadow full-history
+   drought trades ran WR 74% / −$46 (positive-flow trades: WR 85% / +$249,
+   still positive after 08-04); on real money drought trades are −$11.86
+   (n=11). Plan: shadow engine adds its rolling 24h pass-count to the signal
+   payload; executor skips entries when the count is below a
+   `crypto_drought_min_signals_24h` threshold (default 15).
+2. **Tighten the crypto daily loss stop 3× → 2× stake.** On 08-09 the bot
+   lost $40.53 in 4 trades and the 3× ($45) limit never fired; 2× ($30)
+   would have cut the day one losing trade earlier. Config:
+   `crypto_daily_loss_mult`.

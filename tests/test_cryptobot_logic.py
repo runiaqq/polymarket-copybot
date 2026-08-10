@@ -8,7 +8,6 @@ from cryptobot.logic import (
     entry_price_ok,
     pilot_stake,
     price_collapsed,
-    requote_price_ok,
     should_flag_stuck,
     signal_is_fresh,
 )
@@ -83,34 +82,6 @@ class TestPriceCollapsed:
     )
     def test_fails_open_on_missing_prices(self, signal_ask, fresh_ask):
         assert price_collapsed(signal_ask, fresh_ask, 0.25) is False
-
-
-class TestRequotePriceOk:
-    """BP34: guard for the one-shot FAK re-quote (max_worse_pct=0.03, ceiling=0.95)."""
-
-    @pytest.mark.parametrize(
-        ("signal_ask", "fresh_ask", "expected"),
-        [
-            # Fresh ask equal to or better than the signal ask is always fine.
-            (0.80, 0.80, True),
-            (0.80, 0.78, True),
-            # Exactly 3% worse is still allowed (inclusive ceiling)...
-            (0.80, 0.824, True),
-            # ...one tick beyond is not.
-            (0.80, 0.83, False),
-            # Hard entry ceiling wins even when within the 3% band.
-            (0.94, 0.95, True),
-            (0.94, 0.951, False),
-            # Invalid fresh ask: empty book or degenerate price.
-            (0.80, None, False),
-            (0.80, 0.0, False),
-            # Invalid signal ask: worseness can't be evaluated.
-            (None, 0.80, False),
-            (0.0, 0.80, False),
-        ],
-    )
-    def test_guard(self, signal_ask, fresh_ask, expected):
-        assert requote_price_ok(signal_ask, fresh_ask, 0.03, 0.95) is expected
 
 
 class TestShouldFlagStuck:

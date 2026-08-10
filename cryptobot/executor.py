@@ -29,7 +29,6 @@ from cryptobot.logic import (
     entry_price_ok,
     pilot_stake,
     price_collapsed,
-    requote_price_ok,
     should_flag_stuck,
     signal_is_fresh,
 )
@@ -221,7 +220,6 @@ class CryptoExecutor:
             "depth_300bp_usdc": signal.get("depth_300bp_usdc"),
         }
         published_at = float(signal.get("published_at") or 0)
-        requoted = False
         try:
             response = place_order(
                 private_key_enc=user["wallet_private_key_enc"],
@@ -237,24 +235,27 @@ class CryptoExecutor:
             )
         except Exception as exc:
             error_text = str(exc)
-            response = None
-            skip_reason = f"order_error: {error_text[:180]}"
-            # BP34: a FAK killed by the exchange (book moved between the shadow
-            # snapshot and our order) gets exactly ONE re-quote at the fresh ask.
+            # BP43 (replaces BP34): a FAK killed by the exchange means the book
+            # moved between the shadow snapshot and our order — informed flow ate
+            # the ask. Chasing it with a re-quote was measured at WR 62% / −$65.86
+            # over 16 trades (wins avg +$2.6, losses full −$15) vs +$65.51 for
+            # plain entries. Skip, never chase.
             if "no orders found to match" in error_text.lower():
-                response, skip_reason = self._requote_once(user, signal, api_creds, stake, tick)
-                requoted = response is not None
-            if response is None:
-                db.insert_trade({**base, "status": "skipped", "skip_reason": skip_reason,
-                                 "latency_ms": _latency_ms(published_at), "requoted": requoted})
-                log.warning("crypto_order_error", user_id=user_id, error=error_text[:200])
-                return {}
+                skip_reason = "fak_killed"
+                log.info("crypto_fak_killed_skip", user_id=user_id,
+                         cond=condition_id[:14])
+            else:
+                skip_reason = f"order_error: {error_text[:180]}"
+                log.warning("crypto_order_error", user_id=user_id,
+                            error=error_text[:200])
+            db.insert_trade({**base, "status": "skipped", "skip_reason": skip_reason,
+                             "latency_ms": _latency_ms(published_at)})
+            return {}
 
         fill = extract_buy_fill(response, stake)
         if fill is None or fill.status == "none":
-            skip_reason = "no_fill_after_requote" if requoted else "no_fill"
-            db.insert_trade({**base, "status": "skipped", "skip_reason": skip_reason,
-                             "latency_ms": _latency_ms(published_at), "requoted": requoted})
+            db.insert_trade({**base, "status": "skipped", "skip_reason": "no_fill",
+                             "latency_ms": _latency_ms(published_at)})
             log.info("crypto_no_fill", user_id=user_id, cond=condition_id[:14])
             return {}
 
@@ -275,7 +276,6 @@ class CryptoExecutor:
                 "fill_price": fill.fill_price,
                 "fee_usdc": round(fee, 6),
                 "latency_ms": _latency_ms(published_at),
-                "requoted": requoted,
             }
         )
         if not inserted:
@@ -305,72 +305,6 @@ class CryptoExecutor:
                 f"Окно закроется в {window_end_utc:%H:%M:%S} UTC"
             )
         }
-
-    def _requote_once(
-        self,
-        user: dict,
-        signal: dict[str, Any],
-        api_creds: dict,
-        stake: float,
-        tick: Any,
-    ) -> tuple[Any | None, str]:
-        """BP34: one re-quote after a FAK kill. Re-fetches the live book and,
-        if the entry guards still hold, re-places the same FAK at the fresh
-        best ask. Returns (response, "") on success or (None, skip_reason)."""
-        from core.clob import place_order
-        from core.polymarket import get_order_book
-
-        user_id = int(user["id"])
-        condition_id = str(signal["condition_id"])
-
-        if float(signal.get("window_end") or 0) - time.time() < MIN_TIME_LEFT_SEC:
-            return None, "requote_window_closing"
-
-        book = get_order_book(str(signal["token_id"]))
-        fresh_ask = (book or {}).get("best_ask")
-        signal_ask = signal.get("best_ask")
-        # BP38: the collapse guard also bounds the re-quote from below — a FAK
-        # at the fresh ask would still sweep even cheaper (staler) levels.
-        if price_collapsed(signal_ask, fresh_ask, settings.crypto_max_price_drop_pct):
-            return None, "requote_price_collapsed"
-        if not requote_price_ok(
-            signal_ask,
-            fresh_ask,
-            settings.crypto_requote_max_worse_pct,
-            settings.crypto_max_entry_price,
-        ):
-            if not fresh_ask:
-                return None, "requote_no_book"
-            if float(fresh_ask) > settings.crypto_max_entry_price:
-                return None, "requote_price_ceiling"
-            return None, "requote_price_too_worse"
-
-        try:
-            response = place_order(
-                private_key_enc=user["wallet_private_key_enc"],
-                api_creds=api_creds,
-                token_id=str(signal["token_id"]),
-                side="BUY",
-                price=float(fresh_ask),
-                size_usdc=stake,
-                tick_size=f"{float(tick):g}",
-                neg_risk=False,
-                slippage_pct=settings.crypto_entry_slippage_pct,
-                deposit_wallet=user["deposit_wallet_address"],
-            )
-        except Exception as exc:
-            if "no orders found to match" in str(exc).lower():
-                return None, "no_fill_after_requote"
-            return None, f"order_error_after_requote: {str(exc)[:150]}"
-
-        log.info(
-            "crypto_requote_placed",
-            user_id=user_id,
-            cond=condition_id[:14],
-            old_ask=signal_ask,
-            new_ask=fresh_ask,
-        )
-        return response, ""
 
     # ── settlement path ───────────────────────────────────────────────────────
 
