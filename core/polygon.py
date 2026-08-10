@@ -178,12 +178,22 @@ def _exec_tx(w3, private_key, addr, fn, gas: int, label: str) -> str:
 
 
 def _ensure_allowance(w3, token, owner, spender, amount: int, private_key) -> None:
-    """Approve `spender` for at least `amount`, then verify the allowance actually took."""
+    """Approve `spender` for at least `amount`, then verify the allowance actually took.
+
+    The verification read RETRIES with backoff: the RPC endpoint is
+    load-balanced, so right after wait_for_transaction_receipt a lagging node
+    can still serve pre-approve state. Seen live 2026-08-10: a withdrawal
+    aborted with allowance_not_set while the approve was already on-chain
+    (the client's retry then succeeded because the allowance persisted)."""
     if token.functions.allowance(owner, spender).call() >= amount:
         return
     _exec_tx(w3, private_key, owner, token.functions.approve(spender, MAX_UINT), 90_000, "approve")
-    if token.functions.allowance(owner, spender).call() < amount:
-        raise RuntimeError(f"allowance_not_set spender={spender}")
+    for attempt in range(6):
+        if token.functions.allowance(owner, spender).call() >= amount:
+            return
+        log.info("allowance_read_lag", spender=spender[:10], attempt=attempt + 1)
+        time.sleep(2)
+    raise RuntimeError(f"allowance_not_set spender={spender}")
 
 
 def wrap_usdce_to_pusd(

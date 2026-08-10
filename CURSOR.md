@@ -6464,3 +6464,18 @@ wiped at:
 Invariant going forward: at most ONE text-dialog flag may be set at any time,
 and any new text flow must enter through `_reset_text_flows`. `pos_cache` is
 navigation state, not a text dialog — deliberately not in the set.
+
+## Blueprint 41: allowance verification retries (2026-08-10)
+
+Incident: client withdrawal aborted with "конвертация pUSD → USDC.e не
+удалась: allowance_not_set spender=<offramp>". On-chain check showed the
+approve WAS mined (allowance at MAX_UINT); `_ensure_allowance` read the
+allowance immediately after `wait_for_transaction_receipt`, hit a lagging
+node of the load-balanced RPC and saw pre-approve state — a false negative
+that aborted the whole withdrawal. The client's manual retry succeeded
+because the allowance persisted from the "failed" attempt.
+
+Fix (core/polygon.py): after sending the approve, `_ensure_allowance` polls
+the allowance up to 6 times / 2s apart (logs `allowance_read_lag` per miss)
+before raising. Affects every wrap/unwrap path (deposits, withdrawals,
+cryptobot funding sweep) — all shared this race.
