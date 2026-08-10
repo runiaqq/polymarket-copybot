@@ -31,6 +31,7 @@ from cryptobot.logic import (
     price_collapsed,
     should_flag_stuck,
     signal_is_fresh,
+    wr_gate_blocks,
 )
 
 log = structlog.get_logger(__name__)
@@ -105,6 +106,24 @@ class CryptoExecutor:
             return
         if not entry_price_ok(signal.get("best_ask"), settings.crypto_max_entry_price):
             log.info("crypto_signal_skipped", reason="price_ceiling", cond=condition_id[:14])
+            return
+
+        # BP45 regime gate: sit out while the model is on a cold streak. The
+        # window is built from SHADOW resolutions, so it keeps sliding during
+        # the pause and trading resumes on its own once the model warms up.
+        outcomes = await asyncio.to_thread(
+            db.recent_shadow_outcomes, settings.crypto_wr_gate_lookback
+        )
+        if wr_gate_blocks(
+            outcomes, settings.crypto_wr_gate_lookback, settings.crypto_wr_gate_min_wr
+        ):
+            log.warning(
+                "crypto_signal_skipped",
+                reason="wr_gate",
+                cond=condition_id[:14],
+                trailing_wr=round(sum(outcomes) / len(outcomes), 3),
+                lookback=settings.crypto_wr_gate_lookback,
+            )
             return
 
         # BP38 collapse guard: one fresh-book fetch per signal (shared by all

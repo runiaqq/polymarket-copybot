@@ -6601,7 +6601,7 @@ loops. In the open-positions branch an old settled market burns the Redis
 key (short-circuits next cycles' DB read) and skips the notice; old WINS
 suppress only the message — the redeem dispatch still runs.
 
-### Backlog (agreed 2026-08-10, not yet implemented)
+### Backlog (agreed 2026-08-10)
 
 1. **Crypto drought gate.** When the shadow filter passed <15 signals in the
    trailing 24 h, the few that do pass are toxic: shadow full-history
@@ -6609,8 +6609,58 @@ suppress only the message — the redeem dispatch still runs.
    still positive after 08-04); on real money drought trades are −$11.86
    (n=11). Plan: shadow engine adds its rolling 24h pass-count to the signal
    payload; executor skips entries when the count is below a
-   `crypto_drought_min_signals_24h` threshold (default 15).
-2. **Tighten the crypto daily loss stop 3× → 2× stake.** On 08-09 the bot
-   lost $40.53 in 4 trades and the 3× ($45) limit never fired; 2× ($30)
-   would have cut the day one losing trade earlier. Config:
-   `crypto_daily_loss_mult`.
+   `crypto_drought_min_signals_24h` threshold (default 15). Note: 08-10 was
+   a HIGH-flow losing day, so this gate alone is not sufficient — see BP45.
+2. ~~Tighten the crypto daily loss stop 3× → 2× stake.~~ Done in BP45.
+
+## Blueprint 45: crypto regime gate + daily stop 2× (2026-08-10)
+
+### Diagnosis that led here
+
+08-10 closed at −$37 (15W/6L) and pushed all-time real PnL negative (−$11
+from a +$83 peak on 08-06). Deploy-lag forensics first: BP43 (kill re-quote)
+went live only at 13:53 UTC that day — the DB shows `requote_*` skip reasons
+until 12:58 and a requoted losing trade at 13:23, with the first
+`fak_killed` skip at 13:53. So 4 of the day's 6 losses happened on PRE-fix
+code. Post-fix trades (5W/2L, −$11) were then cleared individually: the
+scary 15:53 entry (fill 0.710 vs signal 0.880) is NOT a bug — historical
+scan shows fills 10–25% below signal run 11W/2L, +$36.6 (a cheap fill is a
+discount, not adverse selection), so BP38's 25% bound stays as is.
+
+The real driver is a regime break on 08-07: real-money WR fell 86% → 70%
+across ALL price buckets simultaneously. Control experiment: replaying the
+executor's exact filter (btc, full variant, edge ≥ shadow_filter_min_edge,
+strike ≥ 3 bp, price ≤ 0.89) over shadow_trades reproduces the break
+exactly — shadow WR 86% before 08-07, 73% after. Shadow has no execution
+path, so the degradation is model-vs-market, not anything we shipped. At
+0.83–0.88 entries (win ≈ +$2.5, loss −$15) breakeven needs ~85% WR; a 73%
+regime bleeds every single day until it ends. Bad days cluster
+(08-07..08-10 consecutive), which is what makes a trailing-window gate
+work.
+
+### Mechanism
+
+1. **Regime gate** (`wr_gate_blocks` in cryptobot/logic.py, global check in
+   `_handle_signal` after the price ceiling): skip all entries while the
+   win rate of the last `crypto_wr_gate_lookback` (15) RESOLVED shadow
+   trades matching the executor-filter proxy (`recent_shadow_outcomes` in
+   cryptobot/db.py) is below `crypto_wr_gate_min_wr` (0.80). The window is
+   built from the SHADOW stream, which keeps trading while the real bot
+   sits out — the window keeps sliding and the bot auto-resumes when the
+   model warms up (no frozen-window deadlock, no persisted pause state,
+   fully stateless recompute per signal ≈ 2/hour). Fails open until a full
+   window exists.
+2. **Daily loss stop tightened**: `crypto_daily_loss_mult` 3.0 → 2.0. The
+   3× stop ($45 at $15 stakes) never fired even on the worst days (08-03
+   −$42, 08-09 −$41, 08-10 trough −$41); three losses already erase a full
+   day of wins, so damage past 2× is rarely recovered same-day.
+
+### Sizing (backtest over all 282 real-money trades)
+
+Grid N ∈ {15,20,30} × min_wr ∈ {0.75,0.80,0.85}: N=15/0.80 skips 64 trades
+(23%) including 14 of 39 losses, turning all-time −$11 into +$35 while
+keeping volume; N=30/0.85 saves slightly more (+$52) but halves trade count
+— rejected, the goal is to keep trading in good regimes. At deploy time the
+gate is correctly ON (trailing shadow WR 67%).
+
+Log marker: `crypto_signal_skipped reason=wr_gate trailing_wr=…`.

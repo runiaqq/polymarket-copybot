@@ -489,7 +489,21 @@ class Settings(BaseSettings):
     # Discard signals older than this (Redis lag / executor restart).
     crypto_signal_max_age_sec: float = 4.0
     # Stop trading for the day when realized PnL <= -(mult × stake).
-    crypto_daily_loss_mult: float = 3.0
+    # BP45: 3.0 -> 2.0 — the 3× stop ($45 at $15 stakes) never fired even on
+    # the worst days (08-03: -$42, 08-10 intraday trough: -$41); at these
+    # payoffs (win ≈ +$2.5, loss = -$15) three losses already erase a full
+    # day of wins, so damage past 2× is rarely recovered same-day.
+    crypto_daily_loss_mult: float = 2.0
+    # BP45 regime gate: skip entries while the trailing win rate of the last
+    # `lookback` RESOLVED shadow trades (executor-filter proxy: btc, full
+    # variant, edge/strike filters, entry ceiling) sits below `min_wr`.
+    # Shadow keeps trading during the pause, so the window keeps sliding and
+    # the bot auto-resumes when the model starts hitting again. Backtest over
+    # all real-money history (282 trades): skips 64 trades incl. 14 of 39
+    # losses, all-time PnL -$11 -> +$35. Gate is inactive until `lookback`
+    # resolved shadow trades exist (fail-open).
+    crypto_wr_gate_lookback: int = 15
+    crypto_wr_gate_min_wr: float = 0.80
     crypto_resolution_poll_sec: float = 20.0
     crypto_resolution_void_after_sec: int = 86400
     # EOA -> deposit-wallet auto-funding sweep cadence.

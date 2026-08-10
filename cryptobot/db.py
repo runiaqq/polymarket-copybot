@@ -177,6 +177,46 @@ def realized_pnl_today(user_id: int) -> float:
     return sum(float(row.get("pnl_usdc") or 0) for row in (res.data or []))
 
 
+def recent_shadow_outcomes(lookback: int) -> list[bool]:
+    """BP45: win/loss outcomes of the latest resolved shadow trades that match
+    the executor's own tradable set (the regime gate's input), newest first.
+
+    Filter mirrors what the real bot would have traded — btc / full variant /
+    min-edge / strike-distance / entry ceiling. Verified proxy: over
+    30.07–10.08 it reproduces the real bot's WR (86% before 07.08, 73% after
+    vs 70% real). Over-fetches raw rows because the strike filter needs
+    spot/open_price math that PostgREST can't express."""
+    from core.config import settings
+
+    res = (
+        get_supabase()
+        .table("shadow_trades")
+        .select("status, edge, sim_fill_price, variant, asset, spot, open_price")
+        .in_("status", ["win", "loss"])
+        .eq("asset", "btc")
+        .eq("variant", "full")
+        .not_.is_("resolved_at", "null")
+        .order("resolved_at", desc=True)
+        .limit(max(lookback * 8, 120))
+        .execute()
+    )
+    outcomes: list[bool] = []
+    for r in res.data or []:
+        if (r.get("edge") or 0) < settings.shadow_filter_min_edge:
+            continue
+        spot, op = r.get("spot") or 0, r.get("open_price") or 0
+        if not spot or not op:
+            continue
+        if abs(spot - op) / op * 10000 < settings.shadow_filter_min_strike_bp:
+            continue
+        if (r.get("sim_fill_price") or 0) > settings.crypto_max_entry_price:
+            continue
+        outcomes.append(r["status"] == "win")
+        if len(outcomes) >= lookback:
+            break
+    return outcomes
+
+
 def user_stats(user_id: int) -> dict:
     """Aggregates for the «Статистика» screen: today and all-time."""
     rows = (

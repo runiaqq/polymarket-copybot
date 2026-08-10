@@ -59,3 +59,21 @@ def daily_loss_exceeded(realized_today_usdc: float, stake_usdc: float, mult: flo
     if mult <= 0 or stake_usdc <= 0:
         return False
     return realized_today_usdc <= -(mult * stake_usdc)
+
+
+def wr_gate_blocks(outcomes: list[bool], lookback: int, min_wr: float) -> bool:
+    """BP45 regime gate: block entries while the model is cold.
+
+    `outcomes` — win/loss results of the most recent RESOLVED shadow trades
+    that match the executor's own filter, newest first. Bad days cluster
+    (07-10.08: shadow WR fell 86% -> 73% and every one of those days closed
+    red), so a trailing window over the SHADOW stream — which keeps trading
+    while the real bot sits out — both detects the cold streak and slides
+    past it for auto-resume.
+
+    Fails open until a full window exists: no data must never halt trading.
+    """
+    if lookback <= 0 or len(outcomes) < lookback:
+        return False
+    window = outcomes[:lookback]
+    return sum(window) / lookback < min_wr

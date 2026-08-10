@@ -10,6 +10,7 @@ from cryptobot.logic import (
     price_collapsed,
     should_flag_stuck,
     signal_is_fresh,
+    wr_gate_blocks,
 )
 
 
@@ -131,6 +132,32 @@ class TestAskDepthUsdc:
 
     def test_empty_book(self):
         assert ask_depth_usdc([], 0.9) == 0.0
+
+
+class TestWrGateBlocks:
+    """BP45: block entries while trailing shadow WR (newest first) < min_wr."""
+
+    def test_cold_streak_blocks(self):
+        # 11 wins / 4 losses in 15 = 73.3% < 80%.
+        outcomes = [True] * 11 + [False] * 4
+        assert wr_gate_blocks(outcomes, 15, 0.80)
+
+    def test_exactly_at_threshold_passes(self):
+        # 12/15 = 80% is NOT below the threshold.
+        outcomes = [True] * 12 + [False] * 3
+        assert not wr_gate_blocks(outcomes, 15, 0.80)
+
+    def test_fails_open_below_full_window(self):
+        assert not wr_gate_blocks([False] * 14, 15, 0.80)
+        assert not wr_gate_blocks([], 15, 0.80)
+
+    def test_only_newest_lookback_counts(self):
+        # Newest 15 are all wins; ancient losses beyond the window are ignored.
+        outcomes = [True] * 15 + [False] * 10
+        assert not wr_gate_blocks(outcomes, 15, 0.80)
+
+    def test_disabled_when_lookback_zero(self):
+        assert not wr_gate_blocks([False] * 50, 0, 0.80)
 
 
 class TestDailyLossExceeded:
