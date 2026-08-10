@@ -6650,10 +6650,16 @@ work.
    model warms up (no frozen-window deadlock, no persisted pause state,
    fully stateless recompute per signal ≈ 2/hour). Fails open until a full
    window exists.
-2. **Daily loss stop tightened**: `crypto_daily_loss_mult` 3.0 → 2.0. The
-   3× stop ($45 at $15 stakes) never fired even on the worst days (08-03
-   −$42, 08-09 −$41, 08-10 trough −$41); three losses already erase a full
-   day of wins, so damage past 2× is rarely recovered same-day.
+2. **Daily loss stop: tried 2×, REVERTED to 3× the same day.** The month
+   simulation's guard decomposition (replay on the real 283-trade sequence)
+   falsified the backlog reasoning: with wins ≈ +$2.5 and losses = −$15, a
+   NORMAL profitable day routinely troughs at ~−$30 (two losses) before the
+   small wins grind it back — 08-05 trough −$30.38 → close +$24.82, 08-04
+   trough −$28.34 → close +$18.28, 08-06 trough −$26.64 → close +$20.64.
+   Stop 2× alone replays to −$56.65 vs −$26.66 actual (it locks in the
+   trough); gate + 3× replays to +$34.86 and the 3× stop adds no drag on
+   top of the gate. Lesson recorded: the original "damage past 2× is rarely
+   recovered" claim came from eyeballing LOSING days only — survivor bias.
 
 ### Sizing (backtest over all 282 real-money trades)
 
@@ -6664,3 +6670,15 @@ keeping volume; N=30/0.85 saves slightly more (+$52) but halves trade count
 gate is correctly ON (trailing shadow WR 67%).
 
 Log marker: `crypto_signal_skipped reason=wr_gate trailing_wr=…`.
+
+### Month-ahead expectation (simulated 2026-08-10)
+
+Method: replay BP45 guards on the real trade sequence → guarded day PnLs →
+circular 3-day-block bootstrap into 30-day months (20k paths, $15 stakes).
+Mixed regime (good:cold ≈ 2:1 as observed): median +$91/mo, mean +$87,
+IQR +$12..+$169, p5 −$112, p95 +$272, P(losing month) 22%, typical
+intramonth drawdown −$81 (bad case −$195). Bounds: full good-regime month
+median +$148; full cold-regime month median −$34 (the gate caps regime
+bleed at roughly one stake/month of gate-lag leakage). Caveats: 12 days of
+history, exactly one regime break observed; block bootstrap can't imagine
+regimes worse than seen; assumes signal flow ~25/day and one $15 account.

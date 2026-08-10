@@ -489,11 +489,13 @@ class Settings(BaseSettings):
     # Discard signals older than this (Redis lag / executor restart).
     crypto_signal_max_age_sec: float = 4.0
     # Stop trading for the day when realized PnL <= -(mult × stake).
-    # BP45: 3.0 -> 2.0 — the 3× stop ($45 at $15 stakes) never fired even on
-    # the worst days (08-03: -$42, 08-10 intraday trough: -$41); at these
-    # payoffs (win ≈ +$2.5, loss = -$15) three losses already erase a full
-    # day of wins, so damage past 2× is rarely recovered same-day.
-    crypto_daily_loss_mult: float = 2.0
+    # BP45 tried 2.0 and REVERTED to 3.0 the same day: full-sequence replay
+    # showed a normal day routinely troughs at ~-$30 (two $15 losses) and
+    # recovers, because wins are small (+$2.5) and losses big (-$15) — e.g.
+    # 08-05 trough -$30.38, close +$24.82. A 2× stop locks in the trough
+    # (replay: -$56.65 vs -$26.66 actual); with the WR gate active 3× adds
+    # no drag (gate+3x replay: +$34.86).
+    crypto_daily_loss_mult: float = 3.0
     # BP45 regime gate: skip entries while the trailing win rate of the last
     # `lookback` RESOLVED shadow trades (executor-filter proxy: btc, full
     # variant, edge/strike filters, entry ceiling) sits below `min_wr`.
