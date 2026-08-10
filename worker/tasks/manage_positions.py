@@ -41,6 +41,33 @@ def _notify_once(key: str) -> bool:
     return notify_once(key)
 
 
+def _settled_long_ago(user_id: int, condition_id: str) -> bool:
+    """BP44.1: durable settlement dedup on top of the 7-day Redis settle-key.
+
+    The Data-API keeps re-surfacing ancient positions (worthless losing tokens
+    stay 'redeemable' in the wallet forever; sweeps refresh closed-position
+    timestamps), so once the Redis key expires the notification paths would
+    re-announce a weeks-old result. The copy_trades ledger is the terminal
+    truth: resolved longer than settlement_lookback_sec ago = never notify.
+    Fails open (False) so a DB hiccup can't suppress a legitimate notice."""
+    import time as _time
+
+    try:
+        from core.db import get_supabase
+        from core.donor_guard import parse_ts
+        res = (
+            get_supabase().table("copy_trades")
+            .select("resolved_at").eq("user_id", user_id)
+            .eq("condition_id", condition_id)
+            .not_.is_("resolved_at", "null")
+            .order("resolved_at", desc=True).limit(1).execute()
+        )
+        ts = parse_ts(((res.data or [{}])[0] or {}).get("resolved_at"))
+        return bool(ts and _time.time() - ts > settings.settlement_lookback_sec)
+    except Exception:
+        return False
+
+
 def _claim_settled(user_id: int, condition_id: str) -> None:
     claim(f"settle:{user_id}:{condition_id}")
 
@@ -116,6 +143,21 @@ def sync_positions() -> dict:
                 pnl = p.get("cash_pnl", 0)
                 won = cur >= 0.5
 
+                # BP44.1: DB-ledger dedup. Worthless losing tokens are never
+                # redeemed, so they sit in the wallet as 'redeemable' FOREVER —
+                # and once the 7-day Redis settle-key expired, this branch
+                # re-notified ancient losses on every key expiry (seen live:
+                # July-20 losses re-notified 08-10, weeks after resolution).
+                # The ledger is terminal truth: if this market settled longer
+                # than the lookback ago, burn the Redis key and stay silent.
+                # For old WINS only the message is suppressed — the redeem
+                # dispatch below still runs (money over notifications).
+                settled_old = _settled_long_ago(uid, condition_id)
+                if settled_old:
+                    _notify_once(f"settle:{uid}:{condition_id}")
+                    if not won:
+                        continue
+
                 # BP20 Fix A2: look up the DB trade once so we can pass trade_id
                 # + entry_cost into redeem_position (never dispatch blind).
                 _rp_trade_id: int | None = None
@@ -160,7 +202,7 @@ def sync_positions() -> dict:
                         f"redeem:{uid}:{condition_id}",
                         ttl=settings.redeem_lease_sec,
                     )
-                    if _notify_once(f"settle:{uid}:{condition_id}"):
+                    if not settled_old and _notify_once(f"settle:{uid}:{condition_id}"):
                         if redeem_claimed:
                             # We own the redeem — send the pending message.
                             # Final "✅ Выигрыш зачислен" comes from redeem_position.
@@ -183,7 +225,7 @@ def sync_positions() -> dict:
                 elif won:
                     # auto_redeem disabled: send the terminal win notification
                     # with a manual-claim instruction (no on-chain tx expected).
-                    if _notify_once(f"settle:{uid}:{condition_id}"):
+                    if not settled_old and _notify_once(f"settle:{uid}:{condition_id}"):
                         _emit_win(tg, p.get("title"), _resolved_outcome, pnl,
                                   claimable=True, event_slug=p.get("event_slug"))
                         actions += 1
@@ -508,30 +550,12 @@ def sync_positions() -> dict:
                 continue  # mid-market sell (TP/SL/manual) — already notified at close
             cond_id = c["condition_id"]
 
-            # BP44: durable dedup on top of the 7-day Redis settle-key. Our own
-            # redemption/backfill sweeps can touch an ancient position and
-            # re-surface it in the Data API with a FRESH close timestamp (seen
-            # live 2026-08-10: a July-20 sniper loss re-notified 3 weeks later
-            # after its Redis key expired). The DB ledger is the terminal truth:
-            # a market already resolved for this user longer than the lookback
-            # ago must never notify again.
-            try:
-                from core.db import get_supabase as _gsb2
-                from core.donor_guard import parse_ts as _pts
-                _res = (
-                    _gsb2().table("copy_trades")
-                    .select("resolved_at").eq("user_id", uid)
-                    .eq("condition_id", cond_id)
-                    .not_.is_("resolved_at", "null")
-                    .order("resolved_at", desc=True).limit(1).execute()
-                )
-                _ra_ts = _pts(((_res.data or [{}])[0] or {}).get("resolved_at"))
-                if _ra_ts and now - _ra_ts > settings.settlement_lookback_sec:
-                    log.debug("settle_notice_deduped_by_ledger",
-                              user_id=uid, cond=cond_id[:14])
-                    continue
-            except Exception:
-                pass
+            # BP44: durable dedup — see _settled_long_ago.
+            if _settled_long_ago(uid, cond_id):
+                _notify_once(f"settle:{uid}:{cond_id}")
+                log.debug("settle_notice_deduped_by_ledger",
+                          user_id=uid, cond=cond_id[:14])
+                continue
 
             if resolved_win and settings.auto_redeem_enabled:
                 # BP9 Layer 3: this branch caused the prod bug (sent "выиграно"

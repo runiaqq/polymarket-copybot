@@ -6584,6 +6584,23 @@ market was resolved for this user longer than settlement_lookback_sec ago,
 skip regardless of the Data-API timestamp. The DB ledger is terminal truth;
 the 7-day Redis key is now only a fast-path cache in front of it.
 
+### BP44.1 follow-up (same day): the OPEN-positions loop was the real emitter
+
+A second stale notice arrived after BP44 shipped. The closed-positions fix
+was necessary but NOT the firing path: worthless losing tokens are never
+redeemed, so they sit in `get_positions` as `redeemable=true` FOREVER, and
+the open-positions branch of sync_positions re-notified each old loss every
+time its 7-day Redis settle-key expired (staggered per market — hence one
+ghost notice at a time for weeks). reconcile_settlements was exonerated:
+`mark_trade_settled` sets `redeemed_at`, so settled losses drop out of
+`get_outstanding_copy_trades` (checked live: 0 outstanding-but-resolved).
+
+Fix: shared helper `_settled_long_ago(uid, condition_id)` (ledger
+`resolved_at` older than settlement_lookback_sec; fails open) used in BOTH
+loops. In the open-positions branch an old settled market burns the Redis
+key (short-circuits next cycles' DB read) and skips the notice; old WINS
+suppress only the message — the redeem dispatch still runs.
+
 ### Backlog (agreed 2026-08-10, not yet implemented)
 
 1. **Crypto drought gate.** When the shadow filter passed <15 signals in the
