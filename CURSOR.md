@@ -6671,6 +6671,14 @@ gate is correctly ON (trailing shadow WR 67%).
 
 Log marker: `crypto_signal_skipped reason=wr_gate trailing_wr=…`.
 
+Hotfix 08-11: the gate's shadow fetch (120 raw rows) under-spanned the
+window in low-flow periods — live it yielded 9/15 outcomes overnight and
+the gate failed open exactly when low flow made it most needed (the 03:28
+−$15.34 entry would likely have been blocked by a full window). Now the
+min-edge cut is pushed into the PostgREST query and the fetch is 1000 rows
+(~ weeks of coverage). Fail-open below a full window remains the intended
+behavior for a genuinely young table.
+
 ### Month-ahead expectation (simulated 2026-08-10)
 
 Method: replay BP45 guards on the real trade sequence → guarded day PnLs →

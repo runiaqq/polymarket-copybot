@@ -184,8 +184,12 @@ def recent_shadow_outcomes(lookback: int) -> list[bool]:
     Filter mirrors what the real bot would have traded — btc / full variant /
     min-edge / strike-distance / entry ceiling. Verified proxy: over
     30.07–10.08 it reproduces the real bot's WR (86% before 07.08, 73% after
-    vs 70% real). Over-fetches raw rows because the strike filter needs
-    spot/open_price math that PostgREST can't express."""
+    vs 70% real). The min-edge cut is pushed into the query; strike/price
+    need spot/open_price math PostgREST can't express, so they filter
+    client-side over a deep fetch. The fetch must comfortably out-span the
+    window: seen live 08-11, a 120-row fetch yielded only 9/15 outcomes in a
+    low-flow night and the gate FAILED OPEN exactly when the flow-toxicity
+    made it most needed."""
     from core.config import settings
 
     res = (
@@ -195,15 +199,14 @@ def recent_shadow_outcomes(lookback: int) -> list[bool]:
         .in_("status", ["win", "loss"])
         .eq("asset", "btc")
         .eq("variant", "full")
+        .gte("edge", settings.shadow_filter_min_edge)
         .not_.is_("resolved_at", "null")
         .order("resolved_at", desc=True)
-        .limit(max(lookback * 8, 120))
+        .limit(1000)
         .execute()
     )
     outcomes: list[bool] = []
     for r in res.data or []:
-        if (r.get("edge") or 0) < settings.shadow_filter_min_edge:
-            continue
         spot, op = r.get("spot") or 0, r.get("open_price") or 0
         if not spot or not op:
             continue
