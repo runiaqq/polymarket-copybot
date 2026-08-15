@@ -1102,11 +1102,30 @@ def _notify(
     link_line = f"\n🔗 <a href=\"{url}\">Смотреть позицию</a>" if url else ""
 
     if fill_status == "none":
+        # BP47: thin books (esports above all) zero-fill ~70% of copy attempts —
+        # correct behavior (never chase price), but ~10 identical pushes/day
+        # read as "the bot is broken". Throttle to one push per 4h per user;
+        # suppressed notices accumulate into a digest line on the next push.
+        # DB still records every unfilled row — only the push is muted.
+        from core.cache import incr_counter, notify_once as _once, pop_counter
+
+        if not _once(f"unfilled-note:{telegram_id}", ttl=4 * 3600):
+            n = incr_counter(f"unfilled:{telegram_id}")
+            log.info("unfilled_notice_suppressed",
+                     telegram_id=telegram_id, suppressed_in_window=n)
+            return
+        suppressed = pop_counter(f"unfilled:{telegram_id}")
+        digest = (
+            f"\n\nЗа последние часы ещё {suppressed} сделок не прошли по той же "
+            f"причине — это тонкие рынки, бот не гонится за ценой."
+            if suppressed else ""
+        )
         msg = (
             f"⚠️ <b>Сделка не прошла</b>\n\n"
             f"📌 {title_html}\n"
             f"🎯 Исход: <b>{outcome}</b>\n\n"
-            f"Стакан слишком тонкий — ордер не наполнился, позиция не открыта.{link_line}"
+            f"Стакан слишком тонкий — ордер не наполнился, позиция не открыта."
+            f"{digest}{link_line}"
         )
     else:
         head = "✅ <b>Бот открыл позицию</b>"

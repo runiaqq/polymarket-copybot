@@ -236,6 +236,16 @@ def sync_positions() -> dict:
                         actions += 1
                 continue
 
+            # ── BP46: stop engine kill-switch ────────────────────────────────
+            # Everything below (hold guard, book fetch, entry resolver, phantom
+            # guard, hard-stop floor, spread veto, delta-drop) is pre-resolution
+            # EXIT logic. The 223-exit autopsy showed it net-destroys $276 vs
+            # holding to resolution, so it is off by default. Settlement paths
+            # (redeemable branch above, closed-positions loop below) are NOT
+            # affected. Bonus: saves one CLOB book call per position per cycle.
+            if not settings.stop_engine_enabled:
+                continue
+
             # ── Blueprint 10 + 17: Delta-Drop stop-loss (hardened) ───────────
             # Primary strategy: hold to resolution (binary pays $1 win / $0 loss).
             # Exception 1 — Delta-Drop: exit when the fair-value mid has fallen

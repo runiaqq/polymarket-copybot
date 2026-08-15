@@ -6735,7 +6735,7 @@ Rejected: weekday scheduling for the crypto bot ("trade Wed–Fri") — only
 dates (08-03, 08-10), and the BP45 WR gate already does regime selection
 adaptively without a calendar.
 
-## Blueprint 46: copytrade stop engine off — hold to resolution (planned)
+## Blueprint 46: copytrade stop engine off — hold to resolution (2026-08-15)
 
 ### Decision
 
@@ -6764,12 +6764,15 @@ every stop threshold sells recoveries more often than it saves stakes.
 
 ### Tests
 
-- Engine off (default): a position 50% below entry across many polls
-  dispatches NO close_position.
-- Engine on: existing delta-drop/hard-stop behavior preserved (current
-  tests re-run with the flag forced on).
+Implementation note: the gate is a 2-line config check inside the
+monolithic sync_positions task; a dedicated dispatch test would require
+mocking the full Data-API/CLOB/DB surface, which this repo intentionally
+avoids (tests cover pure decision helpers). Verified instead by code path
+review: the gate sits AFTER the redeemable branch and BEFORE any stop
+logic, so settlement/notification behavior is provably unchanged and no
+close_position dispatch is reachable while the flag is False.
 
-## Blueprint 47: throttle zero-fill "Сделка не прошла" notices (planned)
+## Blueprint 47: throttle zero-fill "Сделка не прошла" notices (2026-08-15)
 
 Esports books are so thin that the donor's own order empties the ask side;
 ~70% of esports copy attempts end status='unfilled' (106 of ~150 since
@@ -6778,12 +6781,13 @@ Esports books are so thin that the donor's own order empties the ask side;
 esports copies run 15W/2L +$47.88; we must keep trying at fair prices and
 never chase — BP43 lesson), only the noise is wrong.
 
-Design: in execute_copy `_notify`, fill_status=='none' branch becomes
-throttled-digest:
+Implemented in execute_copy `_notify`, fill_status=='none' branch:
 - Redis `notify_once(f"unfilled-note:{telegram_id}", ttl=4h)` gates the
-  push; a suppressed notice INCRs `unfilled-cnt:{telegram_id}` (24h expiry).
-- When the gate is open, the message includes the suppressed count since
-  the last push: "…за последние часы ещё N сделок не прошли по той же
-  причине" and the counter resets.
+  push; a suppressed notice INCRs the `unfilled:{telegram_id}` counter
+  (new `incr_counter`/`pop_counter` helpers in core/cache.py, 24h expiry,
+  fail-open to 0 on Redis outage — worst case is pre-BP47 behavior).
+- When the gate is open, the message appends the suppressed count since
+  the last push ("За последние часы ещё N сделок не прошли по той же
+  причине…") and the counter resets.
 - DB rows (status='unfilled') unchanged — stats and audits keep full data.
 - No throttle for partial fills (real positions, must stay loud).

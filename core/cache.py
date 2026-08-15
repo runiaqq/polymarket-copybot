@@ -63,6 +63,28 @@ def claim(key: str, ttl: int = 7 * 86400) -> None:
         pass
 
 
+def incr_counter(key: str, ttl: int = 86400) -> int:
+    """BP47: bump a rolling counter (suppressed-notice tally). Fail-open to 0."""
+    try:
+        pipe = _client().pipeline()
+        pipe.incr(f"cnt:{key}")
+        pipe.expire(f"cnt:{key}", ttl)
+        return int(pipe.execute()[0])
+    except Exception:
+        return 0
+
+
+def pop_counter(key: str) -> int:
+    """BP47: read-and-reset a counter; 0 when absent or Redis is down."""
+    try:
+        pipe = _client().pipeline()
+        pipe.get(f"cnt:{key}")
+        pipe.delete(f"cnt:{key}")
+        return int(pipe.execute()[0] or 0)
+    except Exception:
+        return 0
+
+
 # ── Blueprint 2: cross-process slice-accumulation buckets ────────────────────
 # Each bucket is a Redis hash keyed by "accum:<wallet>:<cond>:<token>".
 # Fields: first_ts, last_ts, acc_usdc, acc_notional, fills, fired

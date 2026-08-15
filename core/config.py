@@ -120,6 +120,17 @@ class Settings(BaseSettings):
     # outcome at near-zero (< hard_stop_abs_price), meaning it has effectively
     # been ruled out. Recycles capital instead of waiting for a $0 resolution.
     #
+    # ── BP46 (2026-08-15): stop engine OFF — hold to resolution ──────────────
+    # Autopsy of ALL 223 stop exits (on-chain payout checked per stopped
+    # market): 54% were premature — the market recovered and WON. Net effect
+    # of the stop stack vs plain hold-to-resolution: −$275.93, negative in
+    # every market category and every entry-price bucket, including deep
+    # hard-stop-like exits (net −$45: seven positions priced ≤0.2 recovered
+    # to full wins, costing more than all deep salvage combined). Binary
+    # whipsaw defeats price stops at every threshold tried. The full stack
+    # below (delta-drop layers, hard-stop floor, spread veto, phantom guard)
+    # stays code-complete for reversibility but is dead while this is False.
+    stop_engine_enabled: bool = False
     # Percentage TP/SL are disabled (set to unreachable values).
     take_profit_pct: float = 99.0  # disabled — hold to resolution
     stop_loss_pct: float = 99.0  # disabled — use delta_drop_stop_pct instead
