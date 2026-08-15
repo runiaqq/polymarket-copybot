@@ -6690,3 +6690,100 @@ median +$148; full cold-regime month median −$34 (the gate caps regime
 bleed at roughly one stake/month of gate-lag leakage). Caveats: 12 days of
 history, exactly one regime break observed; block bootstrap can't imagine
 regimes worse than seen; assumes signal flow ~25/day and one $15 account.
+
+## Recovery plan (agreed 2026-08-15) — full-book audit findings
+
+Context: user reported both bots "bled the balance". Full audit (all
+copy_trades rows, not just result∈{win,loss}) uncovered that every previous
+"profitable" report was blind to stop-loss exits (status='closed', result
+not set). TRUE all-time copytrade ledger:
+
+| component                     | trades | PnL       |
+|-------------------------------|--------|-----------|
+| resolution wins               | 579    | +$1,056.50|
+| resolution losses             | 65     | −$734.41  |
+| stop exits (closed)           | 223    | −$514.14  |
+| **total**                     |        | **−$192.06** |
+
+Stop autopsy (on-chain payout check per stopped (condition, outcome)):
+119 of 220 resolvable stops (54%) were PREMATURE — the market recovered and
+resolved FOR us. Cost: −$233.20 realized + $538.54 missed win payout.
+Saved stops (101): paid −$271.20 to avoid −$533.81 riding to zero =
++$262.61 salvage. NET effect of the whole stop engine vs hold-to-resolution:
+**−$275.93** — negative in EVERY category (esports −$145, other −$131) and
+EVERY entry-price bucket. Depth split (loss as fraction of stake — proxy
+for which mechanism fired): shallow <0.5 (classic delta-drop) net −$161
+(95 premature / 60 saved); mid 0.5–0.8 net −$67; deep ≥0.8 (hard-stop-like)
+net −$45 (even 7 positions priced ≤0.2 recovered to full wins, costing more
+than all deep salvage). Binary-market whipsaw defeats price stops at every
+threshold we ran.
+
+Priority plan:
+1. **BP46 — copytrade stop engine OFF (hold to resolution).** Biggest
+   single EV change: +$276 vs historical trajectory.
+2. **Crypto bot back ON** — DONE by user 08-15 (trading_on had been off
+   since ~08-13; the bot missed a 24-signal 92%-WR day on 08-14 while the
+   BP45 gate was open). Probation criteria agreed: run untouched 2–3 weeks;
+   success = cumulative PnL back above zero AND gate open ≥~60% of signals;
+   otherwise rework the model economics or close the pilot.
+3. **BP47 — throttle "Сделка не прошла" notifications** (70% of esports
+   copy attempts are zero fills on thin books; ~10 noise messages/day).
+4. Backlog: KAGE leaderboard parsing for donor discovery; crypto drought
+   gate (see BP44 backlog).
+Rejected: weekday scheduling for the crypto bot ("trade Wed–Fri") — only
+2–3 observations per weekday; the "toxic Monday" (−$95) is two regime-break
+dates (08-03, 08-10), and the BP45 WR gate already does regime selection
+adaptively without a calendar.
+
+## Blueprint 46: copytrade stop engine off — hold to resolution (planned)
+
+### Decision
+
+Disable BOTH the Delta-Drop stop (BP10/17/19/21 stack) and the hard-stop
+floor by default. The strategy returns to its original thesis: binary
+positions are held to resolution; capital risk per trade is bounded by the
+stake; donor edge realizes at resolution, and the 223-stop autopsy proves
+every stop threshold sells recoveries more often than it saves stakes.
+
+### Mechanism (one kill-switch, machinery preserved)
+
+- New setting `stop_engine_enabled: bool = False`. In sync_positions, gate
+  the ENTIRE post-redeemable stop section behind it (hold-time guard, book
+  fetch, 5-tier entry resolver, phantom guard, position marks, hard-stop
+  floor, spread veto, delta-drop evaluation). With the engine off the loop
+  goes straight to the next position after the redeemable branch —
+  also saving one CLOB book call per open position per 2-min cycle.
+- NOT deleted: the whole stop stack stays in code for reversibility (it is
+  battle-hardened across 4 blueprints); `close_position` task untouched
+  (manual close paths still use it); settlement/redeemable branch, BP44.1
+  dedup and notifications untouched.
+- `_drop_ticks`/`_first_seen`/`_closing` bookkeeping only runs when the
+  engine is on.
+- Invariant: the flag must not affect settlement detection — only the
+  pre-resolution EXIT logic.
+
+### Tests
+
+- Engine off (default): a position 50% below entry across many polls
+  dispatches NO close_position.
+- Engine on: existing delta-drop/hard-stop behavior preserved (current
+  tests re-run with the flag forced on).
+
+## Blueprint 47: throttle zero-fill "Сделка не прошла" notices (planned)
+
+Esports books are so thin that the donor's own order empties the ask side;
+~70% of esports copy attempts end status='unfilled' (106 of ~150 since
+07-25, all users zero-filled on ALL of them) — each currently emitting a
+"Сделка не прошла" push. The attempts themselves are correct (filled
+esports copies run 15W/2L +$47.88; we must keep trying at fair prices and
+never chase — BP43 lesson), only the noise is wrong.
+
+Design: in execute_copy `_notify`, fill_status=='none' branch becomes
+throttled-digest:
+- Redis `notify_once(f"unfilled-note:{telegram_id}", ttl=4h)` gates the
+  push; a suppressed notice INCRs `unfilled-cnt:{telegram_id}` (24h expiry).
+- When the gate is open, the message includes the suppressed count since
+  the last push: "…за последние часы ещё N сделок не прошли по той же
+  причине" and the counter resets.
+- DB rows (status='unfilled') unchanged — stats and audits keep full data.
+- No throttle for partial fills (real positions, must stay loud).
