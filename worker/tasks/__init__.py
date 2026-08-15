@@ -1,5 +1,10 @@
 from worker.tasks.ai_filter import run_ai_analysis
 from worker.tasks.donor_refresh import deactivate_underperforming_donors, refresh_donor_stats
+from worker.tasks.donor_scout import (
+    donor_scout_digest,
+    harvest_wallet_sightings,
+    score_donor_candidates,
+)
 from worker.tasks.execute_copy import execute_copy_trade
 from worker.tasks.manage_positions import close_position, sync_positions
 from worker.tasks.monitor_deposits import monitor_deposits
@@ -24,4 +29,7 @@ __all__ = [
     "monitor_deposits",
     "refresh_donor_stats",
     "deactivate_underperforming_donors",
+    "harvest_wallet_sightings",
+    "score_donor_candidates",
+    "donor_scout_digest",
 ]

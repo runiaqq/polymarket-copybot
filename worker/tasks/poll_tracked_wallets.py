@@ -32,6 +32,7 @@ def _consensus_count(sb, condition_id: str, token_id: str, this_wallet: str) -> 
             .select("source_wallet")
             .eq("market_id", condition_id)
             .eq("token_id", token_id)
+            .eq("probation", False)  # BP48: shadow candidates don't vote
             .gte("created_at", since)
             .execute()
         )
@@ -154,8 +155,13 @@ def poll_tracked_wallets() -> dict:
         # BP44: sniper mode is removed from the codebase. Legacy rows with
         # mode='sniper' (5-min BTC markets) must never be copied by this
         # slow path — their markets resolve before the copy even lands.
-        if (w.get("mode") or "default") != "default":
+        # BP48: mode='candidate' wallets run the FULL accumulate→fire path in
+        # shadow probation — their signals are recorded (probation=true) but
+        # never dispatched to users.
+        mode = w.get("mode") or "default"
+        if mode not in ("default", "candidate"):
             continue
+        is_candidate = mode == "candidate"
         # BP42: loss-streak circuit breaker — donor is on a cooldown.
         if donor_is_paused(w.get("paused_until"), now):
             log.debug("tracked_wallet_paused", wallet=addr[:10],
@@ -295,6 +301,7 @@ def poll_tracked_wallets() -> dict:
                 "source_tx_hash": signal["source_tx_hash"],
                 "source_wallet":  addr,
                 "consensus":      consensus,
+                "probation":      is_candidate,  # BP48 shadow probation flag
             }
             try:
                 try:
@@ -307,15 +314,29 @@ def poll_tracked_wallets() -> dict:
                     if "23505" in str(ins_exc) or "duplicate key" in str(ins_exc):
                         log.info("signal_duplicate_skip", market=cond[:14])
                         continue
-                    # Fail-safe (§5): if migration 017 (trade_signals.outcome) is
-                    # not applied yet, retry without it — the money path must
-                    # never go down on a display-only column.
+                    # Fail-safe (§5): if migration 017 (trade_signals.outcome) or
+                    # 028 (probation) is not applied yet, retry without the
+                    # display-only columns — the money path must never go down
+                    # on them.
                     sig_payload.pop("outcome", None)
+                    sig_payload.pop("probation", None)
                     log.warning("signal_insert_retry_no_outcome", market=cond[:14])
                     row = insert_trade_signal(sig_payload)
                 signal["signal_id"] = row["id"]
             except Exception:
                 log.exception("tracked_signal_insert_failed", market=cond[:14])
+                continue
+
+            # BP48 invariant: probation signals must never reach users.
+            if is_candidate:
+                log.info(
+                    "probation_signal_recorded",
+                    wallet=addr[:10],
+                    market=cond[:14],
+                    outcome=outcome,
+                    size=round(agg_size, 2),
+                    vwap=round(vwap, 4),
+                )
                 continue
 
             for uid in user_ids:

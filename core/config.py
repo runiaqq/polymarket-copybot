@@ -370,6 +370,27 @@ class Settings(BaseSettings):
     # football score 1:0, 2:1, ...). 3+ outcomes in one event → excluded/removed.
     discovery_max_event_outcomes: int = 3
 
+    # ── Blueprint 48: donor scout (discovery from our own tape) ─────────────────
+    # /refresh auto-prune of tracked wallets is OFF: it removed proven manual
+    # donors that never appear on the global leaderboard (their pnl_map=0 →
+    # activity heuristics decide → false positives swap good donors for MMs).
+    discovery_prune_enabled: bool = False
+    # Min taker BUY size to record a sighting from the global trade feed.
+    # $200 catches conviction entries of mid-size directional traders (our best
+    # donors bet $200-2000) while skipping retail noise; the $5000 whale_min_usdc
+    # legacy threshold would blind the scout to exactly the donors we copy.
+    scout_min_trade_usdc: float = 200.0
+    # Sightings in 14d required before a wallet is worth scoring (one Data-API
+    # pull per candidate per night — keep the pool tight).
+    scout_min_sightings: int = 5
+    # Max concurrent probation seats (mode='candidate' tracked wallets).
+    scout_probation_slots: int = 5
+    # Nominal stake for would-be PnL in probation reports (mirrors the typical
+    # live user stake so the digest reads in real dollars).
+    scout_probation_stake_usdc: float = 15.0
+    # Harvest cadence (Data-API global trades poll).
+    scout_harvest_sec: float = 60.0
+
     # ── AI ───────────────────────────────────────────────────────────────────────
     # Risk score (1-10) at or above which the user gets a HIGH-RISK warning.
     ai_risk_warn_threshold: int = 7

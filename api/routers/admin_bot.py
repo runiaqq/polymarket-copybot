@@ -38,6 +38,8 @@ from core.db import (
     list_active_subscribers_detail,
     list_tracked_wallets,
     remove_tracked_wallet,
+    set_donor_candidate_status,
+    set_tracked_wallet_mode,
     list_admins,
     redeem_admin_code,
     remove_admin,
@@ -718,13 +720,14 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     lines = [
-        "✅ <b>Белый список обновлён</b>\n",
+        "✅ <b>Скан лидерборда завершён</b>\n",
         f"🔎 Проверено кандидатов: <b>{r['scanned']}</b>",
         f"🎯 Прошли фильтр качества: <b>{r['qualified']}</b>",
-        f"➕ Добавлено новых: <b>{len(r['added'])}</b>",
+        f"🧪 Отправлено на обкатку: <b>{len(r['added'])}</b>",
         f"✓ Уже были в списке: <b>{len(r['kept'])}</b>",
-        f"🧹 Убрано маркет-мейкеров: <b>{len(r.get('removed', []))}</b>",
         f"📋 Всего в списке: <b>{r['total']}</b>",
+        "\nBP48: новые кошельки идут в теневую обкатку (сигналы пишутся, "
+        "копий нет). Решение о переводе в бой — в недельном дайджесте скаута.",
     ]
     def _wallet_score_line(p: dict, icon: str) -> str:
         name = f" · {p['name']}" if p.get("name") else ""
@@ -799,6 +802,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             remove_tracked_wallet(addr)
             toast = "🗑 Убран"
             text, kb = _detail_view(addr, origin)
+        elif data.startswith("dc:"):
+            # BP48 scout digest buttons: promote a probation candidate to live
+            # copying or dismiss it for good. Answer-only (the digest message
+            # itself is left intact as the decision record).
+            _, action, addr = data.split(":", 2)
+            if action == "p":
+                set_tracked_wallet_mode(addr, "default")
+                try:
+                    set_donor_candidate_status(addr, "promoted")
+                except Exception:
+                    log.warning("candidate_status_update_failed", addr=addr[:10])
+                await q.answer(f"✅ {_short_addr(addr)} переведён в бой")
+            else:
+                remove_tracked_wallet(addr)
+                try:
+                    set_donor_candidate_status(addr, "dismissed")
+                except Exception:
+                    log.warning("candidate_status_update_failed", addr=addr[:10])
+                await q.answer(f"🗑 {_short_addr(addr)} отклонён")
+            return
         elif data.startswith("uh:"):
             _, tid_s, off_s = data.split(":", 2)
             text, kb = _history_view(int(tid_s), int(off_s))

@@ -259,21 +259,27 @@ def discover_quality(target: int = 20, add: bool = True) -> dict:
             kept.append(p)
             continue
         if add:
+            # BP48: leaderboard survivors enter SHADOW PROBATION, never live
+            # copying — the leaderboard proves wealth, not copyability. The
+            # candidate's signals are recorded (probation=true) and the weekly
+            # scout digest decides promotion on OUR would-be PnL.
             try:
-                add_tracked_wallet(p["wallet"], (p["name"] or "")[:30] or None)
+                add_tracked_wallet(p["wallet"], (p["name"] or "")[:30] or None,
+                                   mode="candidate")
             except Exception:
                 log.warning("seed_add_failed", wallet=p["wallet"])
                 continue
         added.append(p)
 
-    # Hygiene: drop already-tracked wallets that turn out to be market makers /
-    # churners (low profit/volume ratio, e.g. skk1ch / swisstony at ~4%) or
-    # scattershot/hedge bettors (many outcomes in one event). Falls back to the
-    # activity feed when the wallet isn't on the volume board.
+    # Hygiene prune — DISABLED by default (BP48). Proven manual donors never
+    # appear on the global leaderboard (pnl_map=0 → ratio=None → activity-feed
+    # heuristics decide) and were being silently swapped for leaderboard MMs.
+    # Live-donor demotion now belongs to the BP42 loss-streak pause and the
+    # scout digest's human-confirmed retirement hints.
     qualified_addrs = {p["wallet"].lower() for p in qualified}
     max_evt = settings.discovery_max_event_outcomes
     removed: list[dict] = []
-    if add:
+    if add and settings.discovery_prune_enabled:
         for w in list_tracked_wallets():
             a = w["address"].lower()
             if a in qualified_addrs:

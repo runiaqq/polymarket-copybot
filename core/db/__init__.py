@@ -45,6 +45,8 @@ from core.db.queries import (
     redeem_admin_code,
     remove_admin,
     remove_tracked_wallet,
+    set_donor_candidate_status,
+    set_tracked_wallet_mode,
     reset_risk_baseline,
     resume_user_copying,
     set_risk_override_until,
@@ -140,4 +142,6 @@ __all__ = [
     "list_tracked_wallets",
     "add_tracked_wallet",
     "remove_tracked_wallet",
+    "set_tracked_wallet_mode",
+    "set_donor_candidate_status",
 ]

@@ -2,6 +2,7 @@ import ssl
 
 import structlog
 from celery import Celery
+from celery.schedules import crontab
 from celery.signals import task_failure
 
 from core.config import settings
@@ -75,6 +76,7 @@ _includes = [
     "worker.tasks.poll_tracked_wallets",
     "worker.tasks.monitor_deposits",
     "worker.tasks.execute_copy",
+    "worker.tasks.donor_scout",
 ]
 # Model B copies a curated whitelist via polling (poll_tracked_wallets), so the
 # anonymous WS large-buy listener is no longer the entry source and stays off.
@@ -118,6 +120,9 @@ celery_app.conf.update(
         "worker.tasks.poll_donor_trades": {"queue": "periodic"},
         "worker.tasks.refresh_donor_stats": {"queue": "periodic"},
         "worker.tasks.deactivate_underperforming_donors": {"queue": "periodic"},
+        "worker.tasks.harvest_wallet_sightings": {"queue": "periodic"},
+        "worker.tasks.score_donor_candidates": {"queue": "periodic"},
+        "worker.tasks.donor_scout_digest": {"queue": "periodic"},
     },
     # Periodic tasks only run in auto-copy mode (and thus only on a non-geoblocked host).
     beat_schedule=({
@@ -150,6 +155,20 @@ celery_app.conf.update(
         "check-subscription-expiry": {
             "task": "worker.tasks.check_subscription_expiry",
             "schedule": 21600.0,  # every 6 hours
+        },
+        # BP48 donor scout: passive tape harvest / nightly scoring / weekly
+        # promote-dismiss digest.
+        "harvest-wallet-sightings": {
+            "task": "worker.tasks.harvest_wallet_sightings",
+            "schedule": settings.scout_harvest_sec,
+        },
+        "score-donor-candidates": {
+            "task": "worker.tasks.score_donor_candidates",
+            "schedule": crontab(hour=3, minute=30),
+        },
+        "donor-scout-digest": {
+            "task": "worker.tasks.donor_scout_digest",
+            "schedule": crontab(day_of_week="mon", hour=9, minute=0),
         },
     } if _AUTO else {}),
 )

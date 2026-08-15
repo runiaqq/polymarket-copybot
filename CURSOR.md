@@ -6791,3 +6791,86 @@ Implemented in execute_copy `_notify`, fill_status=='none' branch:
   причине…") and the counter resets.
 - DB rows (status='unfilled') unchanged — stats and audits keep full data.
 - No throttle for partial fills (real positions, must stay loud).
+
+## Blueprint 48: donor scout — automated donor discovery from our own tape (2026-08-15)
+
+### Why the old pipeline kept picking market makers
+
+KAGE is dead (site down) and its 4 imported wallets earned +$10/mo. The
+admin `/refresh` (`core/wallet_discovery.discover_quality`) has the same
+structural defect plus one active bug:
+- **Wrong source**: candidates come from the GLOBAL profit leaderboard —
+  populated by long-dated-politics whales (outside our 0.5–72h universe)
+  and industrial MMs. The anti-MM heuristics (profit/volume ratio,
+  directionality, density, MAKER_REBATE) are decent but polish a wrong
+  funnel: the leaderboard tells us who is RICH, not who is COPYABLE.
+- **Wrong criterion**: ranking by leaderboard PnL ≠ "our pipeline can fill
+  this wallet's entries at fair prices in our market window".
+- **Active bug**: the prune step REMOVES tracked wallets that fail the
+  current leaderboard filter. Proven manual donors don't appear on the
+  global boards at all (their pnl_map=0 → ratio=None → activity-feed
+  heuristics decide), so `/refresh` could silently swap good donors for
+  leaderboard MMs. This is the user-reported "заменяет хорошие на плохие".
+
+### Design: harvest → score → shadow probation → human promote
+
+Principle inversion: a quality donor is measured ONLY by our own pipeline.
+1. **Harvest** (`worker/tasks/donor_scout.harvest_wallet_sightings`, beat
+   60s): passive record-only revival of the Model-A whale feed.
+   `fetch_whale_trades` (global taker BUY feed, server-side cash filter at
+   `scout_min_trade_usdc`=$200) ∩ fast-markets universe → insert into
+   `wallet_sightings` (unique tx_hash; tracked wallets excluded). No
+   copies, no notifications — just tape.
+2. **Score** (`score_donor_candidates`, nightly): wallets with
+   ≥`scout_min_sightings` (5) sightings/14d get one Data-API activity pull
+   (reuses `_activity_profile` anti-MM fingerprints: directionality,
+   trades/day, avg size, MAKER_REBATE) + resolution check of their sighted
+   markets via Gamma (`outcomePrices`). Hard filters kill MM profiles;
+   survivors get a Laplace-smoothed WR score `(wins+1)/(resolved+2)` into
+   `donor_candidates`. Top qualifying candidates are auto-enrolled into
+   probation (`tracked_wallets.mode='candidate'`) up to
+   `scout_probation_slots` (5) concurrent seats. Also prunes sightings
+   >30d.
+3. **Shadow probation**: poll_tracked_wallets now lets mode='candidate'
+   wallets through the full accumulate→fire path, inserts their signals
+   into trade_signals with `probation=true`, but NEVER dispatches
+   execute_copy_trade. The signal row stores OUR vwap at OUR signal time —
+   after 2 weeks the would-be PnL at a nominal $15 stake measures exactly
+   "what our users would have earned". `_consensus_count` excludes
+   probation rows.
+4. **Digest** (`donor_scout_digest`, weekly Mon 09:00 UTC): per-candidate
+   probation stats (signals, resolved, WR, would-be PnL) pushed to admins
+   via the admin bot with inline buttons — `dc:p:<addr>` promote to
+   mode='default' (live copying), `dc:x:<addr>` dismiss (active=false +
+   donor_candidates.status='dismissed'). Live donors are NEVER auto-removed:
+   demotion is BP42 pause + a digest retirement hint for stale (no signals
+   14d) or negative-30d donors. Human confirms; the bot never swaps donors
+   silently.
+
+### /refresh repurposed, prune killed
+
+- `discovery_prune_enabled: bool = False` — the auto-prune block in
+  discover_quality is gated off (the "replaces good wallets" bug).
+- discover_quality now adds leaderboard survivors as mode='candidate'
+  (probation), never straight to live copying. The leaderboard remains a
+  SECONDARY candidate source feeding the same probation funnel.
+
+### Schema (migration 028)
+
+- `wallet_sightings`: wallet, tx_hash (unique), condition_id, token_id,
+  outcome, price, size_usdc, title, traded_at; indexed (wallet, created_at)
+  and (created_at).
+- `donor_candidates`: wallet (unique), name, sightings/volume/avg size 14d,
+  resolved_count/wins, directionality, trades_per_day, is_mm, score,
+  status ∈ new|candidate|promoted|dismissed, timestamps.
+- `tracked_wallets.mode` gets value 'candidate' (column exists since BP26).
+- `trade_signals.probation boolean not null default false`.
+
+### Invariants
+
+- Probation signals must never reach execute_copy_trade and never count
+  toward consensus.
+- Harvest inserts are idempotent (unique tx_hash, ignore 23505).
+- Scoring/digest failures must never touch the live donor list.
+- add_tracked_wallet(mode=...) preserves an existing live donor's mode on
+  re-add (a candidate insert cannot demote a live donor).

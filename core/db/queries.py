@@ -33,15 +33,39 @@ def list_tracked_wallets(active_only: bool = True) -> list[dict]:
     return q.execute().data or []
 
 
-def add_tracked_wallet(address: str, label: str | None = None) -> dict:
+def add_tracked_wallet(address: str, label: str | None = None, mode: str = "default") -> dict:
     sb = get_supabase()
     addr = address.strip().lower()
-    existing = sb.table("tracked_wallets").select("id").eq("address", addr).maybe_single().execute()
+    existing = sb.table("tracked_wallets").select("id,mode").eq("address", addr).maybe_single().execute()
     if existing and existing.data:
-        sb.table("tracked_wallets").update({"active": True, "label": label}).eq("address", addr).execute()
+        patch: dict = {"active": True, "label": label}
+        # BP48 invariant: a candidate re-add must never demote a live donor;
+        # promoting to 'default' is always allowed.
+        if mode == "default" or (existing.data.get("mode") or "default") != "default":
+            patch["mode"] = mode
+        sb.table("tracked_wallets").update(patch).eq("address", addr).execute()
         return {"address": addr, "updated": True}
-    sb.table("tracked_wallets").insert({"address": addr, "label": label, "active": True}).execute()
+    sb.table("tracked_wallets").insert(
+        {"address": addr, "label": label, "active": True, "mode": mode}
+    ).execute()
     return {"address": addr, "added": True}
+
+
+def set_tracked_wallet_mode(address: str, mode: str) -> None:
+    """BP48: probation promote/dismiss transitions ('candidate' <-> 'default')."""
+    sb = get_supabase()
+    sb.table("tracked_wallets").update({"mode": mode}).eq(
+        "address", address.strip().lower()
+    ).execute()
+
+
+def set_donor_candidate_status(wallet: str, status: str) -> None:
+    """BP48: scout candidate lifecycle (new -> candidate -> promoted/dismissed).
+    Dismissed wallets are never re-enrolled into probation."""
+    sb = get_supabase()
+    sb.table("donor_candidates").update({"status": status}).eq(
+        "wallet", wallet.strip().lower()
+    ).execute()
 
 
 def remove_tracked_wallet(address: str) -> bool:
