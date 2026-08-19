@@ -6941,3 +6941,37 @@ $200 + flat $15 on ungated t60-90 replay: final $292 (peak $338, maxDD
 weeks are ~flat (+$1.3, -$2.8 ungated; the cross-gate improves cold-week
 skips) — the window change removes the systematic bleed, it does not
 manufacture edge in a cold regime.
+
+## Blueprint 50: alt data-collection mode (2026-08-19)
+
+### Why
+
+Per-asset models for eth/sol/xrp were requested; the data says NOT YET: a
+month of shadow collection produced 18/26/23 resolved rows per alt
+(~0.7/day) vs 21,283 for btc — any grid search on n≈20 is noise mining.
+Root cause: the shadow entry bar (edge >= shadow_min_edge 0.05) almost
+never clears on thin alt books, so nothing gets recorded to learn from.
+
+### Change
+
+- `shadow_alt_min_edge=0.02`: non-BTC assets record virtual entries at a
+  lower bar purely to grow the dataset (BTC keeps 0.05). Expected: tens of
+  alt rows/day -> a model-fit sample in ~2-3 weeks.
+- `crypto_signal_assets=["btc"]`: hard whitelist between shadow and real
+  money, enforced TWICE — at publish (engine) and in the executor
+  (_handle_signal skips `asset_not_whitelisted`). Alts stay
+  data-collection-only until a per-asset model validates on a real sample.
+- `_row_is_signal` re-keyed (also fixes a BP49 gap): settlement win/loss
+  broadcasts now mirror the PUBLISHED set — execution-window variant
+  (t60-90 by default, name derived from the window settings) + whitelisted
+  asset + signal filter. Previously keyed on variant='full', which after
+  BP49 would notify results for entries subscribers never saw (and alt
+  rows would have started notifying once BP50 grew their flow).
+
+### Analysis protocol (when the sample exists, ~2-3 weeks)
+
+Per asset: calibration of model_p vs realized WR, then the BP49-style
+grid (window × edge × ceiling × strike) with split-half time validation
+and n>=200 per surviving config. Only a config that is positive in BOTH
+halves gets a real-money pilot, and only via its own entry in
+crypto_signal_assets.

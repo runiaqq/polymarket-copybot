@@ -688,7 +688,12 @@ class ShadowEngine:
         if fill.effective_price > settings.shadow_max_price:
             observation.reason = "price_above_ceiling"
             return
-        if edge < settings.shadow_min_edge:
+        # BP50: alts record at a lower bar purely to grow the dataset — at the
+        # BTC bar they produced ~0.7 rows/day, unusable for model work.
+        min_edge = (
+            settings.shadow_min_edge if asset == "btc" else settings.shadow_alt_min_edge
+        )
+        if edge < min_edge:
             observation.reason = "edge_below_threshold"
             return
 
@@ -759,7 +764,14 @@ class ShadowEngine:
                 <= time_left
                 <= settings.crypto_signal_time_left_max_sec
             )
-            if is_signal and publish_window and market.condition_id not in self.published_conditions:
+            # BP50: only whitelisted assets reach the real-money executor —
+            # alt entries are data collection, never execution signals.
+            if (
+                is_signal
+                and publish_window
+                and asset in settings.crypto_signal_assets
+                and market.condition_id not in self.published_conditions
+            ):
                 if len(self.published_conditions) > 4000:
                     self.published_conditions.clear()
                 self.published_conditions.add(market.condition_id)
@@ -898,13 +910,26 @@ class ShadowEngine:
 
     @staticmethod
     def _row_is_signal(row: dict[str, Any]) -> bool:
-        """Settlement notifications must mirror the entry-side signal filter."""
-        return row.get("variant") == "full" and passes_signal_filter(
-            float(row.get("edge") or 0),
-            float(row.get("spot") or 0),
-            float(row.get("open_price") or 0),
-            min_edge=settings.shadow_filter_min_edge,
-            min_strike_bp=settings.shadow_filter_min_strike_bp,
+        """Settlement notifications must mirror the entry-side signal set.
+
+        BP49/BP50: entries are published from the execution-window bucket
+        (t60-90 by default) for whitelisted assets only — win/loss notices
+        key on the same variant and asset, or subscribers would get results
+        for trades they never saw open (and vice versa)."""
+        exec_variant = (
+            f"t{settings.crypto_signal_time_left_min_sec:g}"
+            f"-{settings.crypto_signal_time_left_max_sec:g}"
+        )
+        return (
+            row.get("variant") == exec_variant
+            and str(row.get("asset") or "") in settings.crypto_signal_assets
+            and passes_signal_filter(
+                float(row.get("edge") or 0),
+                float(row.get("spot") or 0),
+                float(row.get("open_price") or 0),
+                min_edge=settings.shadow_filter_min_edge,
+                min_strike_bp=settings.shadow_filter_min_strike_bp,
+            )
         )
 
     async def _resolve_trade(self, row: dict[str, Any], now: datetime) -> None:

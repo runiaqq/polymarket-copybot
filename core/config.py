@@ -281,6 +281,12 @@ class Settings(BaseSettings):
         default_factory=lambda: [20.0, 30.0, 60.0, 90.0, 120.0]
     )
     shadow_min_edge: float = 0.05
+    # BP50: alt data-collection mode. Non-BTC assets record virtual entries at
+    # a much lower edge bar: a month of collection at the 0.05 bar produced
+    # 18-26 resolved rows per alt (~0.7/day) — three orders of magnitude short
+    # of model-fitting material. Shadow-only: real-money publishing is gated
+    # to crypto_signal_assets regardless of what the shadow records.
+    shadow_alt_min_edge: float = 0.02
     shadow_max_price: float = 0.95
     shadow_stake_usdc: float = 15.0
     shadow_window_sec: int = 300
@@ -532,6 +538,10 @@ class Settings(BaseSettings):
     # NOT affected — all variants keep recording the wide window.
     crypto_signal_time_left_min_sec: float = 60.0
     crypto_signal_time_left_max_sec: float = 90.0
+    # BP50: assets the shadow engine may hand to the real-money executor.
+    # Alts are data-collection only until a per-asset model is validated on
+    # a real sample (enforced both at publish and in the executor).
+    crypto_signal_assets: list[str] = Field(default_factory=lambda: ["btc"])
     # Stop trading for the day when realized PnL <= -(mult × stake).
     # BP45 tried 2.0 and REVERTED to 3.0 the same day: full-sequence replay
     # showed a normal day routinely troughs at ~-$30 (two $15 losses) and

@@ -96,6 +96,12 @@ class CryptoExecutor:
         if not settings.crypto_trading_enabled:
             log.info("crypto_signal_skipped", reason="kill_switch", cond=condition_id[:14])
             return
+        # BP50 belt-and-suspenders: the publisher already filters assets, but
+        # real money must never depend on a single gate.
+        if str(signal.get("asset") or "") not in settings.crypto_signal_assets:
+            log.warning("crypto_signal_skipped", reason="asset_not_whitelisted",
+                        asset=signal.get("asset"), cond=condition_id[:14])
+            return
         if not signal_is_fresh(
             float(signal.get("published_at") or 0), now, settings.crypto_signal_max_age_sec
         ):
