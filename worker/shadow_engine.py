@@ -130,6 +130,10 @@ class ShadowEngine:
         self.entered_conditions: set[tuple[str, str]] = set()
         self.maker_orders: dict[tuple[str, int], MakerOrder] = {}
         self.maker_attempted_conditions: set[str] = set()
+        # BP49: conditions already handed to the real-money executor (one
+        # publish per condition; in-memory — the executor's DB dedup is the
+        # durable backstop across restarts).
+        self.published_conditions: set[str] = set()
         self.db_retry_after = 0.0
         self.last_spot_rx_monotonic = time.monotonic()
         self._signal_tasks: set[asyncio.Task] = set()
@@ -745,7 +749,20 @@ class ShadowEngine:
             inserted_any = True
             observation.entered = True
             observation.entered_variants.add(variant_name)
-            if variant_name == "full" and is_signal:
+            # BP49: the executor feed fires only inside the profitable entry
+            # window (60-90s to close; every earlier/later bucket is negative
+            # over the whole real-money era — see CURSOR.md BP49). Collection
+            # is untouched: all variants keep recording, so the wide 'full'
+            # stream still feeds the BP45 WR gate and future re-analysis.
+            publish_window = (
+                settings.crypto_signal_time_left_min_sec
+                <= time_left
+                <= settings.crypto_signal_time_left_max_sec
+            )
+            if is_signal and publish_window and market.condition_id not in self.published_conditions:
+                if len(self.published_conditions) > 4000:
+                    self.published_conditions.clear()
+                self.published_conditions.add(market.condition_id)
                 # BP33: hand the filter-passing signal to the real-money executor.
                 # BP36: attach book-depth bands (capacity telemetry for scaling).
                 asks = book.get("asks") or []

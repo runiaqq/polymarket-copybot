@@ -189,7 +189,12 @@ def recent_shadow_outcomes(lookback: int) -> list[bool]:
     client-side over a deep fetch. The fetch must comfortably out-span the
     window: seen live 08-11, a 120-row fetch yielded only 9/15 outcomes in a
     low-flow night and the gate FAILED OPEN exactly when the flow-toxicity
-    made it most needed."""
+    made it most needed.
+
+    BP49: entries moved to the 60-90s window, but this gauge DELIBERATELY
+    stays on the wide 'full' stream — cross-gate replay showed the wide
+    stream detects regime breaks earlier (taken +$114 vs +$48 if the gate
+    gauged t60-90 itself, which skipped 90.5%-WR trades)."""
     from core.config import settings
 
     res = (

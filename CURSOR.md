@@ -6874,3 +6874,70 @@ Principle inversion: a quality donor is measured ONLY by our own pipeline.
 - Scoring/digest failures must never touch the live donor list.
 - add_tracked_wallet(mode=...) preserves an existing live donor's mode on
   re-add (a candidate insert cannot demote a live donor).
+
+## Blueprint 49: crypto entry window 60-90s (2026-08-19)
+
+### The finding (full audit 08-19)
+
+Crypto bot all-time: -$58.68 over 309 resolved trades (WR 82.5%). Split by
+SECONDS TO WINDOW CLOSE at entry, real trades:
+
+| window    | trades | WR    | PnL     | avg    |
+|-----------|--------|-------|---------|--------|
+| 90-120s   | 246    | 80.9% | -$90.38 | -$0.37 |
+| 60-90s    | 45     | 91.1% | +$42.91 | +$0.95 |
+| 30-60s    | 14     | 85.7% | -$2.40  | -$0.17 |
+
+80% of entries happened at 90-120s because signals publish the moment the
+edge first appears — i.e. at window open. Executor-filtered shadow over the
+whole era (07-30..08-19, 14,266 resolved rows) confirms on larger n:
+t60-90 +$92.48 (n=299, WR 85.3%) is the ONLY positive bucket; t90-120
+-$241, t30-60 -$79, t20-30 -$13, full -$216, maker -$383. t60-90 was
+positive/flat in all three weeks including the cold regime (+$94.0 / +$1.3
+/ -$2.8) while full bled every week. Mechanism: at 2 minutes out the model
+prices its least reliable horizon at an already-high ask; at 60-90s the
+same ask buys a markedly sharper forecast.
+
+### Change (publisher-side only)
+
+- `crypto_signal_time_left_min_sec=60` / `crypto_signal_time_left_max_sec=90`.
+- shadow_engine publishes the executor signal (and the Telegram "Сигнал"
+  broadcast) on ANY variant entry whose time_left falls inside the window,
+  once per condition (`published_conditions` in-memory set, capped at 4000,
+  executor DB dedup is the durable backstop). Previously: `variant=='full'`
+  → fired at first edge appearance, usually 90-120s.
+- Shadow COLLECTION unchanged — every variant keeps recording the wide
+  window, so the full stream keeps feeding the BP45 gate and re-analysis.
+- BP45 gate DELIBERATELY unchanged (gauges the wide full stream):
+  cross-gate replay: full-gauged gate over t60-90 entries takes +$114.26
+  (n=219, WR 86.8%), skips -$21.79; re-gauging on t60-90 itself halves the
+  take to +$48 by skipping 90.5%-WR trades. Wide stream = earlier smoke
+  alarm for regime breaks.
+- Executor untouched (freshness, ceiling, collapse guard, daily stop all
+  apply as before).
+
+### Hypotheses tested and REJECTED (replay 07-30..08-19, t60-90 stream)
+
+- Widen to 30-90s: late-edge t30-60 entries (no passing t60-90 sibling)
+  are -$52.36/142 — the window closes at 60s.
+- Lower ceiling to 0.85: +$100.69/140 ungated — more per trade but half
+  the flow and same total as 0.89 (+$92.48/299); with the cross-gate the
+  0.89 ceiling nets more (+$114). Keep 0.89.
+- Price floor 0.70: kills profit (+$92 -> -$16); cheap 0.5-0.6 fills are
+  +$55. No floor.
+- min_edge 0.08/0.10: -$15 / -$53 (vs +$92 at 0.07). Keep 0.07.
+- strike >=5bp / >=10bp: -$36 / -$39. Keep 3bp.
+- eth/sol/xrp at t60-90: ZERO rows pass the executor filter — nothing to
+  trade there, not a config problem.
+- Drought gate: only 1 day with <5 passing signals (-$15) — not enough
+  evidence, stays backlog.
+- Daily 3x stop on the gated stream: never triggers (no change); keep as
+  tail insurance.
+
+### Expectation
+
+$200 + flat $15 on ungated t60-90 replay: final $292 (peak $338, maxDD
+-$85) vs actual-behavior counterfactual $129. Honest caveat: the last two
+weeks are ~flat (+$1.3, -$2.8 ungated; the cross-gate improves cold-week
+skips) — the window change removes the systematic bleed, it does not
+manufacture edge in a cold regime.

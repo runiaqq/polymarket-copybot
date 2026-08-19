@@ -520,6 +520,18 @@ class Settings(BaseSettings):
     crypto_max_price_drop_pct: float = 0.25
     # Discard signals older than this (Redis lag / executor restart).
     crypto_signal_max_age_sec: float = 4.0
+    # BP49: the shadow engine publishes executor signals ONLY when the entry
+    # moment falls inside this window (seconds to window close). Whole
+    # real-money era, executor-filtered shadow (07-30..08-19): t60-90 is the
+    # ONLY profitable bucket (+$92, WR 85.3%, n=299) vs t90-120 -$241,
+    # t30-60 -$79, t20-30 -$13; real trades agree (60-90s: +$42.91/45 vs
+    # 90-120s: -$90.38/246). Mechanism: at 90-120s the model pays a high ask
+    # for its least reliable horizon; at 60-90s the same price buys a
+    # markedly sharper forecast. Late-edge t30-60 entries are ALSO negative
+    # (-$52/142), so the window closes at 60s, not 30s. Shadow collection is
+    # NOT affected — all variants keep recording the wide window.
+    crypto_signal_time_left_min_sec: float = 60.0
+    crypto_signal_time_left_max_sec: float = 90.0
     # Stop trading for the day when realized PnL <= -(mult × stake).
     # BP45 tried 2.0 and REVERTED to 3.0 the same day: full-sequence replay
     # showed a normal day routinely troughs at ~-$30 (two $15 losses) and
@@ -536,6 +548,12 @@ class Settings(BaseSettings):
     # all real-money history (282 trades): skips 64 trades incl. 14 of 39
     # losses, all-time PnL -$11 -> +$35. Gate is inactive until `lookback`
     # resolved shadow trades exist (fail-open).
+    # BP49 note: the gate DELIBERATELY keeps gauging the wide 'full' shadow
+    # stream while entries are restricted to 60-90s. Cross-gate replay
+    # (07-30..08-19): full-gauged gate on the t60-90 stream takes +$114
+    # (n=219, WR 86.8%) and skips -$22; re-gauging the gate on the t60-90
+    # stream itself would halve the take to +$48 (it skips 90.5%-WR trades).
+    # The wide stream degrades earlier in a regime break = better smoke alarm.
     crypto_wr_gate_lookback: int = 15
     crypto_wr_gate_min_wr: float = 0.80
     crypto_resolution_poll_sec: float = 20.0
