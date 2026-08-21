@@ -6989,3 +6989,57 @@ grid (window × edge × ceiling × strike) with split-half time validation
 and n>=200 per surviving config. Only a config that is positive in BOTH
 halves gets a real-money pilot, and only via its own entry in
 crypto_signal_assets.
+
+## Blueprint 51: edge corridor 7-8% (2026-08-21)
+
+### Why
+
+After BP49 the t60-90 stream itself went red in the W33-34 regime
+(weekly: +13/+85/+94/-30/-154 over the five ISO weeks of full shadow
+history, 22,230 resolved btc rows since 07-21). Factor scan for a
+regime-robust confidence signal found ONE: the edge itself, and the
+relationship is inverted at the top. In t60-90 (executor filters
+applied):
+
+- edge 7-7.5%:  +$46.69 / 74  (WR 85.1%)
+- edge 7.5-8%:  +$87.84 / 69  (WR 89.9%)
+- edge 8-9%:    -$10.50 / 155
+- edge 9-10%:    +$2.41 / 125
+- edge 10%+:   -$118.20 / 148
+
+Mechanism: a huge model-market divergence usually means the MARKET
+knows something the model doesn't (informed flow holding the price away
+from the model's fair value) — adverse selection against an
+overconfident model (calibration: stated 90%+ realizes ~85%). A
+moderate divergence is genuine mispricing.
+
+### Robustness (full history)
+
+Corridor (7% floor from BP30.4 filter, <8% cap) on t60-90: +$134.53 /
+143 trades, WR 87.4%, positive in ALL FIVE ISO weeks including toxic
+W34 (+$32.02 while the uncapped stream lost -$154). Both halves of the
+corridor independently positive. Does NOT generalize to other windows
+(t90-120 corridor: -$128; t30-60: -$5) — the alpha is the combination
+"reliable 60-90s horizon × moderate divergence", which also means it is
+not a data-mining artifact that shows up everywhere.
+
+### Change
+
+- `crypto_max_edge=0.08`: publish gate in the shadow engine now requires
+  `edge < crypto_max_edge` (floor stays `shadow_filter_min_edge=0.07`
+  inside passes_signal_filter).
+- `edge_exceeds_cap` (cryptobot/logic.py) + executor belt-and-suspenders
+  skip `edge_above_cap` — real money never depends on a single gate.
+- `_row_is_signal` mirrors the cap so settlement notices track the
+  published set exactly.
+- Collection untouched: all variants/edges keep recording.
+
+### Expectation & monitoring
+
+~3-5 signals/day (was ~15). At $15 stakes: ~+$0.94/trade, ~+$30/week in
+a normal regime, ~breakeven-to-positive in cold ones. Review after ~30
+live trades. Phase 2 candidate (NOT implemented): decelerating-vol
+filter `sigma_fast/sigma < 1.0` on top of the corridor showed +$169.46
+/ 88 (WR 93.2%, all thirds positive) but needs sigmas in the executor
+payload and halves the flow — add only after the corridor validates
+live, one variable at a time.

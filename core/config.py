@@ -542,6 +542,16 @@ class Settings(BaseSettings):
     # Alts are data-collection only until a per-asset model is validated on
     # a real sample (enforced both at publish and in the executor).
     crypto_signal_assets: list[str] = Field(default_factory=lambda: ["btc"])
+    # BP51 edge corridor: signals publish only when edge < this cap (the floor
+    # is shadow_filter_min_edge). Counter-intuitive but robust across the FULL
+    # two-month shadow history: in t60-90, edge 7-8% made +$134.53 / 143 trades
+    # (WR 87.4%) and was positive ALL five ISO weeks incl. the toxic W34
+    # (+$32.02), while 10%+ lost -$134. Mechanism: a huge model-market gap
+    # usually means the MARKET knows something the model doesn't (adverse
+    # selection against an overconfident model), a moderate gap is genuine
+    # mispricing. Both corridor halves are independently positive (7-7.5%:
+    # +$46.69, 7.5-8%: +$87.84), so it is not one lucky sliver.
+    crypto_max_edge: float = 0.08
     # Stop trading for the day when realized PnL <= -(mult × stake).
     # BP45 tried 2.0 and REVERTED to 3.0 the same day: full-sequence replay
     # showed a normal day routinely troughs at ~-$30 (two $15 losses) and

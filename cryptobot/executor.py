@@ -26,6 +26,7 @@ from core.shadow_model import fee_usdc as estimate_fee_usdc
 from cryptobot import db
 from cryptobot.logic import (
     daily_loss_exceeded,
+    edge_exceeds_cap,
     entry_price_ok,
     pilot_stake,
     price_collapsed,
@@ -101,6 +102,13 @@ class CryptoExecutor:
         if str(signal.get("asset") or "") not in settings.crypto_signal_assets:
             log.warning("crypto_signal_skipped", reason="asset_not_whitelisted",
                         asset=signal.get("asset"), cond=condition_id[:14])
+            return
+        # BP51 belt-and-suspenders: the publisher already enforces the edge
+        # corridor; re-check here so a stale shadow build can't leak oversized
+        # edges to real money.
+        if edge_exceeds_cap(signal.get("edge"), settings.crypto_max_edge):
+            log.warning("crypto_signal_skipped", reason="edge_above_cap",
+                        edge=signal.get("edge"), cond=condition_id[:14])
             return
         if not signal_is_fresh(
             float(signal.get("published_at") or 0), now, settings.crypto_signal_max_age_sec

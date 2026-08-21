@@ -766,9 +766,13 @@ class ShadowEngine:
             )
             # BP50: only whitelisted assets reach the real-money executor —
             # alt entries are data collection, never execution signals.
+            # BP51: edge corridor — publish only below the edge cap (floor is
+            # inside passes_signal_filter). Oversized divergence = the market
+            # knows more than the model; see CURSOR.md BP51.
             if (
                 is_signal
                 and publish_window
+                and edge < settings.crypto_max_edge
                 and asset in settings.crypto_signal_assets
                 and market.condition_id not in self.published_conditions
             ):
@@ -912,10 +916,11 @@ class ShadowEngine:
     def _row_is_signal(row: dict[str, Any]) -> bool:
         """Settlement notifications must mirror the entry-side signal set.
 
-        BP49/BP50: entries are published from the execution-window bucket
-        (t60-90 by default) for whitelisted assets only — win/loss notices
-        key on the same variant and asset, or subscribers would get results
-        for trades they never saw open (and vice versa)."""
+        BP49/BP50/BP51: entries are published from the execution-window bucket
+        (t60-90 by default), for whitelisted assets, inside the edge corridor
+        — win/loss notices key on the same variant, asset and edge band, or
+        subscribers would get results for trades they never saw open (and
+        vice versa)."""
         exec_variant = (
             f"t{settings.crypto_signal_time_left_min_sec:g}"
             f"-{settings.crypto_signal_time_left_max_sec:g}"
@@ -923,6 +928,7 @@ class ShadowEngine:
         return (
             row.get("variant") == exec_variant
             and str(row.get("asset") or "") in settings.crypto_signal_assets
+            and float(row.get("edge") or 0) < settings.crypto_max_edge
             and passes_signal_filter(
                 float(row.get("edge") or 0),
                 float(row.get("spot") or 0),

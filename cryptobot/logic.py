@@ -48,6 +48,18 @@ def price_collapsed(
     return fresh_ask < signal_ask * (1.0 - max_drop_pct)
 
 
+def edge_exceeds_cap(edge: float | None, max_edge: float) -> bool:
+    """BP51 edge corridor (ceiling side; the floor lives in the shadow signal
+    filter). A model-market divergence ABOVE the cap flips from opportunity to
+    warning: over the full shadow history the market out-knew the model on
+    every 10%+ edge slice (-$134 in t60-90) while 7-8% stayed profitable in
+    all five weeks. Fails open on a missing edge — the publisher always sends
+    one, and the floor is enforced upstream."""
+    if edge is None:
+        return False
+    return edge >= max_edge
+
+
 def should_flag_stuck(window_end_ts: float, now_ts: float, threshold_sec: float) -> bool:
     """BP35 watchdog: an open trade whose window ended more than threshold_sec
     ago is stuck — the outcome is overdue and the user deserves a heartbeat."""
