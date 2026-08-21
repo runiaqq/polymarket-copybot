@@ -8,13 +8,11 @@ universe, and lets them prove themselves in shadow probation before any real
 money follows them. Celery wiring lives in worker/tasks/donor_scout.py.
 """
 
-import json
-
 import structlog
 
 log = structlog.get_logger(__name__)
 
-GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+CLOB_MARKETS_URL = "https://clob.polymarket.com/markets"
 _H = {"User-Agent": "Mozilla/5.0 (PolyMind donor scout)"}
 
 
@@ -101,45 +99,38 @@ def probation_pnl(
 
 
 def resolve_winning_outcomes(condition_ids: list[str]) -> dict[str, str]:
-    """Batch-resolve markets via Gamma: {condition_id: winning outcome name
-    (lowercase)}. Only markets that are closed with an unambiguous >=0.99
-    outcome price are included — everything else is treated as unresolved.
-    Network errors degrade to a partial map (scout must never crash on Gamma)."""
+    """Resolve markets via CLOB /markets/{condition_id}: {condition_id:
+    winning outcome name (lowercase)}. Unresolved / unknown markets are
+    simply absent from the map.
+
+    Seen live 08-21: Gamma's markets endpoint silently IGNORES unknown query
+    params and its condition_ids filter returned zero rows for real (esports)
+    conditions — every candidate scored resolved_count=0 and probation never
+    enrolled. The CLOB endpoint is authoritative (closed + per-token `winner`
+    flag); one call per condition with a politeness delay, tolerating
+    individual failures (scout must never crash on a market lookup)."""
+    import time as _time
+
     import httpx
 
     winners: dict[str, str] = {}
     ids = [c for c in dict.fromkeys(condition_ids) if c]
-    for i in range(0, len(ids), 40):
-        chunk = ids[i:i + 40]
-        try:
-            r = httpx.get(
-                GAMMA_MARKETS_URL,
-                params=[("condition_ids", c) for c in chunk] + [("limit", len(chunk))],
-                headers=_H,
-                timeout=20.0,
-            )
-            r.raise_for_status()
-            markets = r.json()
-        except Exception:
-            log.warning("gamma_resolve_failed", chunk=len(chunk))
-            continue
-        if not isinstance(markets, list):
-            continue
-        for m in markets:
-            cond = m.get("conditionId") or ""
-            if not cond or not m.get("closed"):
-                continue
+    with httpx.Client(headers=_H, timeout=15.0) as client:
+        for cond in ids:
             try:
-                outcomes = m.get("outcomes")
-                prices = m.get("outcomePrices")
-                if isinstance(outcomes, str):
-                    outcomes = json.loads(outcomes)
-                if isinstance(prices, str):
-                    prices = json.loads(prices)
-                for name, price in zip(outcomes or [], prices or []):
-                    if float(price) >= 0.99:
-                        winners[cond] = str(name).strip().lower()
+                r = client.get(f"{CLOB_MARKETS_URL}/{cond}")
+                if r.status_code != 200:
+                    continue
+                m = r.json()
+                if not m.get("closed"):
+                    continue
+                for tok in m.get("tokens") or []:
+                    if tok.get("winner"):
+                        name = str(tok.get("outcome") or "").strip().lower()
+                        if name:
+                            winners[cond] = name
                         break
-            except (TypeError, ValueError):
-                continue
+            except Exception:
+                log.warning("clob_resolve_failed", cond=cond[:16])
+            _time.sleep(0.05)
     return winners

@@ -6875,6 +6875,20 @@ Principle inversion: a quality donor is measured ONLY by our own pipeline.
 - add_tracked_wallet(mode=...) preserves an existing live donor's mode on
   re-add (a candidate insert cannot demote a live donor).
 
+### BP48.1 fix (2026-08-21): resolution step was dead — Gamma ignores the filter
+
+First live audit: harvest worked (17,747 sightings / 2,989 wallets in 2
+days), MM fingerprints worked (industrial 372-394 trades/day wallets
+correctly flagged), but ALL 475 scored candidates had resolved_count=0 —
+Gamma's /markets endpoint silently ignores unknown query params and its
+condition_ids filter returned zero rows for real (esports) conditions, so
+the WR tally was empty, scores froze at the 0.5 prior and probation
+enrollment (which requires resolved_count>0) never fired.
+resolve_winning_outcomes now uses CLOB /markets/{condition_id} (closed +
+per-token `winner` flag, authoritative), one call per condition with a
+politeness delay, failure-tolerant. Verified live: 25/34 sample conditions
+resolved; candidates now score properly (e.g. 12/14 wins -> 0.812).
+
 ## Blueprint 49: crypto entry window 60-90s (2026-08-19)
 
 ### The finding (full audit 08-19)
