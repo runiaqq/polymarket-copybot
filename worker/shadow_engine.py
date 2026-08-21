@@ -48,6 +48,9 @@ class SpotState:
     price: float | None = None
     timestamp_sec: float | None = None
     window_opens: dict[int, float] = field(default_factory=dict)
+    # BP50.1: monotonic clock of the last received tick, for the per-asset
+    # silence watchdog (payload timestamps can't be trusted for liveness).
+    last_rx_monotonic: float | None = None
 
 
 @dataclass(frozen=True)
@@ -189,6 +192,7 @@ class ShadowEngine:
         state.price = price
         state.timestamp_sec = timestamp_sec
         self.last_spot_rx_monotonic = time.monotonic()
+        state.last_rx_monotonic = self.last_spot_rx_monotonic
         state.volatility.update(price, timestamp_sec)
         state.fast_volatility.update(price, timestamp_sec)
         window_start = self._window_start(timestamp_sec)
@@ -198,6 +202,22 @@ class ShadowEngine:
         state.window_opens = {
             start: value for start, value in state.window_opens.items() if start >= oldest
         }
+
+    def _silent_assets(self, now_monotonic: float, connected_at: float) -> list[str]:
+        """BP50.1: subscribed assets with no tick for shadow_spot_asset_silence_sec.
+
+        Baseline is the later of the last tick and the current connection's
+        start, so every fresh connection gets a full grace period and state
+        surviving from the previous connection can't trigger an instant loop."""
+        threshold = settings.shadow_spot_asset_silence_sec
+        if threshold <= 0:
+            return []
+        silent = []
+        for asset in self.assets:
+            baseline = max(self.spots[asset].last_rx_monotonic or 0.0, connected_at)
+            if now_monotonic - baseline > threshold:
+                silent.append(asset)
+        return silent
 
     async def _handle_rtds_message(self, raw: str | bytes) -> None:
         if isinstance(raw, bytes):
@@ -264,6 +284,7 @@ class ShadowEngine:
                     last_rx = time.monotonic()
                     last_ping = 0.0
                     self.last_spot_rx_monotonic = time.monotonic()
+                    connected_at = time.monotonic()
                     while True:
                         now = time.monotonic()
                         if now - last_ping >= settings.shadow_rtds_ping_sec:
@@ -273,6 +294,21 @@ class ShadowEngine:
                             raise ConnectionError("Chainlink RTDS stream went silent")
                         if now - self.last_spot_rx_monotonic > settings.shadow_rtds_silence_sec:
                             raise ConnectionError("Chainlink RTDS has no price updates")
+                        # BP50.1: the checks above pass while ANY asset ticks,
+                        # masking a server-side drop of a single symbol's
+                        # subscription (live 08-21: btc flowed, alts starved
+                        # for hours -> no_window_open, zero alt data). A
+                        # reconnect re-subscribes every symbol.
+                        silent = self._silent_assets(now, connected_at)
+                        if silent:
+                            log.warning(
+                                "shadow_spot_asset_silent",
+                                assets=silent,
+                                threshold_sec=settings.shadow_spot_asset_silence_sec,
+                            )
+                            raise ConnectionError(
+                                f"RTDS silent for assets: {', '.join(silent)}"
+                            )
                         try:
                             raw = await asyncio.wait_for(
                                 websocket.recv(),

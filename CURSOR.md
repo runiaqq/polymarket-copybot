@@ -7043,3 +7043,31 @@ filter `sigma_fast/sigma < 1.0` on top of the corridor showed +$169.46
 / 88 (WR 93.2%, all thirds positive) but needs sigmas in the executor
 payload and halves the flow — add only after the corridor validates
 live, one variable at a time.
+
+## Blueprint 50.1: per-asset spot silence watchdog (2026-08-21)
+
+### Why
+
+After BP50 shipped, alts recorded ZERO rows while server logs showed
+eth/sol/xrp closing every window with `reason=no_window_open` for hours
+— i.e. not a single spot tick per asset (window open price is only set
+in the tick handler). Root cause is structural: the RTDS silence
+watchdog was global (`last_spot_rx_monotonic`), so as long as btc
+ticked, the connection looked healthy and a server-side drop of an
+individual symbol's subscription was never repaired. The alt dataset
+BP50 exists for silently stops growing, and nothing alerts.
+
+### Change
+
+- `SpotState.last_rx_monotonic` + `_silent_assets()`: any subscribed
+  asset with no tick for `shadow_spot_asset_silence_sec` (600s; healthy
+  Chainlink heartbeats every symbol at least ~1/min) triggers a logged
+  `shadow_spot_asset_silent` warning and a forced reconnect, which
+  re-subscribes every symbol. Baseline = max(last tick, connection
+  start), so fresh connections get a full grace period and stale state
+  can't cause a reconnect loop.
+- If RTDS genuinely never streams a symbol, the engine now reconnects
+  every 10 min and the warning makes that VISIBLE in logs instead of
+  silent starvation. EWMA/vol state lives outside the connection loop
+  and survives reconnects; alts still need vol warm-up after first
+  ticks arrive.

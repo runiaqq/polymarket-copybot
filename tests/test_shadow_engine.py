@@ -68,3 +68,43 @@ def test_insert_trade_allows_another_variant_for_same_condition(monkeypatch) -> 
 
     assert result == "inserted"
     assert table.inserted_payloads == [payload]
+
+
+class TestSilentAssets:
+    """BP50.1: per-asset spot silence watchdog (btc flowing must not mask
+    starved alt subscriptions)."""
+
+    def _engine(self) -> shadow_engine.ShadowEngine:
+        return shadow_engine.ShadowEngine()
+
+    def test_all_assets_ticking_reports_nothing(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            shadow_engine.settings, "shadow_spot_asset_silence_sec", 600.0
+        )
+        engine = self._engine()
+        for state in engine.spots.values():
+            state.last_rx_monotonic = 10_000.0
+        assert engine._silent_assets(10_100.0, connected_at=9_000.0) == []
+
+    def test_starved_asset_reported_while_others_tick(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            shadow_engine.settings, "shadow_spot_asset_silence_sec", 600.0
+        )
+        engine = self._engine()
+        for asset, state in engine.spots.items():
+            state.last_rx_monotonic = 400.0 if asset == "eth" else 10_000.0
+        assert engine._silent_assets(10_100.0, connected_at=400.0) == ["eth"]
+
+    def test_fresh_connection_gets_grace_period(self, monkeypatch) -> None:
+        # No asset has ever ticked, but the connection is younger than the
+        # threshold — must not flap-reconnect before subscriptions warm up.
+        monkeypatch.setattr(
+            shadow_engine.settings, "shadow_spot_asset_silence_sec", 600.0
+        )
+        engine = self._engine()
+        assert engine._silent_assets(10_100.0, connected_at=10_000.0) == []
+
+    def test_disabled_when_threshold_zero(self, monkeypatch) -> None:
+        monkeypatch.setattr(shadow_engine.settings, "shadow_spot_asset_silence_sec", 0.0)
+        engine = self._engine()
+        assert engine._silent_assets(99_999.0, connected_at=0.0) == []

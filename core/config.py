@@ -298,6 +298,14 @@ class Settings(BaseSettings):
     shadow_rtds_url: str = "wss://ws-live-data.polymarket.com"
     shadow_rtds_ping_sec: float = 5.0
     shadow_rtds_silence_sec: float = 15.0
+    # BP50.1: per-asset spot silence watchdog. The global silence check above
+    # is satisfied as long as ANY asset ticks, so when RTDS drops one symbol's
+    # subscription server-side (seen live 08-21: btc flowed while eth/sol/xrp
+    # logged no_window_open for hours) the engine never reconnects and the alt
+    # dataset silently stops growing. A healthy Chainlink stream heartbeats
+    # every symbol at least once a minute; 10 min of per-asset silence means
+    # the subscription is dead — force a reconnect, which re-subscribes all.
+    shadow_spot_asset_silence_sec: float = 600.0
     shadow_reconnect_initial_sec: float = 1.0
     shadow_reconnect_max_sec: float = 30.0
     # alpha≈0.003 on one-second returns gives an effective 10–15 minute EWMA.
