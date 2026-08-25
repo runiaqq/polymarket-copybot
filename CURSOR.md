@@ -7100,3 +7100,79 @@ BP48) was silently coupled to live users having money.
 Any "record-only" pipeline must be audited for hidden gates shared with
 the money path. The BP48 probation path was correct in isolation and
 dead in production for 4 days because of a gate 200 lines upstream.
+
+## Blueprint 52: rolling Platt calibration (2026-08-25)
+
+### Why — the BP51 corridor died out-of-sample
+
+Corridor live results (4 days after deploy): 27 signals, WR 70.4%,
+-$40.70; its first fully-out-of-sample week W35 lost -$59.51. Third
+filter in a row (0.89 ceiling -> BP49 window -> BP51 corridor) that
+looked robust on history and decayed forward. Root cause is upstream of
+all of them: the model is systematically overconfident (stated 90-95%
+realizes ~81%, stated 85-90% realizes ~77% over 3,953 t60-90 rows) and
+the error DRIFTS with regime — so any fixed slice of raw edge is a bet
+that the current miscalibration stays put. It doesn't.
+
+### The fix: price the overconfidence in, keep re-pricing it
+
+Rolling Platt scaling: q = sigmoid(a*logit(model_p) + b), (a, b) refit
+on a trailing window of resolved execution-variant rows. Honest edge =
+q - price - fee_per_share; publish only when it clears a bar.
+
+Walk-forward replay (fit strictly on the past, weekly refit, test
+08-05..25, same exec filters: ceiling 0.89 + strike >= 3bp):
+
+- calibrated edge >= 0.02: +$37.89 / 55 (WR 85.5%), EVERY week
+  positive incl. W35 (+$10.42) where raw rule lost -$192/339 and the
+  corridor -$59.51/19.
+- >= 0.03: +$44.37 / 37 (WR 89.2%). Threshold not knife-edge.
+- lookback 21d (+$37.89) beats 14d (-$24.85), matches 28d (+$27.89);
+  daily refit beats weekly (+$42.61, WR 89.8%) -> refit every 6h.
+- richer models (market-price blend, +vol-ratio, edge^2) tested: blend
+  at 0.02 = +$43.57/15 — better per trade, third the flow; not worth
+  the coupling for now. Platt chosen (2 params, ~monotone, hard to
+  overfit).
+- month bootstrap at the 0.02 bar, $15 stakes: median +$54,
+  p5 -$29, p25 +$20, p75 +$89, p95 +$138, P(negative month) = 14%.
+
+### Change
+
+- shadow_model: `fit_platt` (Newton MLE + ridge, None on degenerate
+  samples), `platt_probability`. Unit-tested (recovers a synthetic
+  shrink, identity on honest data, monotone).
+- shadow engine: `calibration_loop` refits every `shadow_cal_refit_sec`
+  (6h) on trailing `shadow_cal_lookback_days` (21d) of resolved
+  execution-variant rows for whitelisted assets;
+  `shadow_cal_min_train_rows`=200. Publish gate now: window + asset
+  whitelist + price <= 0.89 + strike >= 3bp + calibrated edge >=
+  `shadow_cal_min_edge` (0.02). Raw-edge floor (BP30.4) and corridor
+  (BP51) REMOVED from this gate — both were proxies for what
+  calibration now measures directly. `crypto_max_edge` deleted.
+  cal_edge is None until the first fit: real money FAILS CLOSED,
+  collection unaffected (is_signal/stats untouched).
+- payload carries `cal_edge`; executor re-checks via `cal_edge_ok`
+  (fails CLOSED on missing value — stale shadow build must not trade).
+- `_row_is_signal` recomputes calibrated edge from stored
+  model_p/price/fee (fee recovered from the entry identity
+  edge = p - price - fee), so settlement notices mirror the published
+  set across restarts. A refit between entry and resolution can flip a
+  threshold-straddling row — cosmetic only.
+- Telegram signal text now shows the calibrated edge.
+
+### Expectation
+
+~2.6 signals/day at the 0.02 bar. $15 stakes: ~+$40-55/month median,
+worst weeks ~flat instead of bleeding. Validation protocol unchanged:
+watch ~30 published signals in shadow; fund only if live WR tracks the
+replay (~85%+).
+
+### Lesson
+
+Stop carving filters on top of a miscalibrated probability; calibrate
+the probability. Every raw-edge rule was an indirect, brittle encoding
+of "the model exaggerates" — the direct encoding adapts and survives
+regime shifts. Note for the record: the study initially "proved" no
+edge exists anywhere — a sign error in the hand-rolled Newton step had
+the fit converging to the WORST coefficients. Sanity-check calibration
+outputs against base rates before believing conclusions.

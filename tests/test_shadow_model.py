@@ -7,6 +7,8 @@ from core.shadow_model import (
     calibrated_probability,
     divergence_exceeds_ceiling,
     fee_usdc,
+    fit_platt,
+    platt_probability,
     maker_bid_price,
     maker_fill,
     maker_should_cancel,
@@ -259,3 +261,47 @@ def test_walk_order_book_records_partial_depth() -> None:
     assert fill.filled_usdc == pytest.approx(3.0)
     assert fill.shares == pytest.approx(4.0)
     assert fill.effective_price == pytest.approx(0.75)
+
+
+class TestPlattCalibration:
+    """BP52: rolling Platt scaling for the systematically overconfident model."""
+
+    def test_recovers_overconfidence_shrink(self) -> None:
+        # Model claims p, reality delivers a logit-shrunk version (a=0.5).
+        # The fit must learn to pull stated probabilities toward reality.
+        import math
+        import random
+
+        rng = random.Random(42)
+        samples = []
+        for _ in range(3000):
+            p = rng.uniform(0.55, 0.98)
+            true_p = 1 / (1 + math.exp(-0.5 * math.log(p / (1 - p))))
+            samples.append((p, rng.random() < true_p))
+        coeffs = fit_platt(samples)
+        assert coeffs is not None
+        a, _b = coeffs
+        assert 0.3 < a < 0.7  # recovered the shrink, not identity
+        # Calibrated output must sit below the raw claim at high p.
+        assert platt_probability(0.95, *coeffs) < 0.95
+
+    def test_identity_when_model_is_honest(self) -> None:
+        import random
+
+        rng = random.Random(7)
+        samples = [(p, rng.random() < p) for p in
+                   (rng.uniform(0.1, 0.95) for _ in range(3000))]
+        coeffs = fit_platt(samples)
+        assert coeffs is not None
+        q = platt_probability(0.8, *coeffs)
+        assert abs(q - 0.8) < 0.05
+
+    def test_degenerate_samples_return_none(self) -> None:
+        assert fit_platt([]) is None
+        assert fit_platt([(0.9, True)] * 100) is None  # single class
+        assert fit_platt([(0.9, True), (0.8, False)] * 5) is None  # too small
+
+    def test_platt_probability_monotonic(self) -> None:
+        a, b = 0.6, -0.2
+        qs = [platt_probability(p, a, b) for p in (0.5, 0.7, 0.9, 0.99)]
+        assert qs == sorted(qs)

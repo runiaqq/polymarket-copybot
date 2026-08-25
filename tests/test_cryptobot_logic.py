@@ -4,8 +4,8 @@ import pytest
 
 from core.shadow_model import ask_depth_usdc
 from cryptobot.logic import (
+    cal_edge_ok,
     daily_loss_exceeded,
-    edge_exceeds_cap,
     entry_price_ok,
     pilot_stake,
     price_collapsed,
@@ -56,19 +56,19 @@ class TestEntryPriceOk:
         assert entry_price_ok(ask, 0.95) is expected
 
 
-class TestEdgeExceedsCap:
-    """BP51 edge corridor ceiling: block edges at or above the cap (0.08);
-    the floor is enforced upstream by the shadow signal filter."""
+class TestCalEdgeOk:
+    """BP52 calibrated-edge gate: pass at/above the bar, fail CLOSED on a
+    missing value (stale publisher build must not trade real money)."""
 
     @pytest.mark.parametrize(
-        ("edge", "expected"),
-        [(0.071, False), (0.079, False), (0.08, True), (0.102, True)],
+        ("cal_edge", "expected"),
+        [(0.02, True), (0.035, True), (0.019, False), (-0.01, False)],
     )
-    def test_cap(self, edge, expected):
-        assert edge_exceeds_cap(edge, 0.08) is expected
+    def test_bar(self, cal_edge, expected):
+        assert cal_edge_ok(cal_edge, 0.02) is expected
 
-    def test_fails_open_on_missing_edge(self):
-        assert edge_exceeds_cap(None, 0.08) is False
+    def test_fails_closed_on_missing_value(self):
+        assert cal_edge_ok(None, 0.02) is False
 
 
 class TestPriceCollapsed:

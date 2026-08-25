@@ -48,16 +48,13 @@ def price_collapsed(
     return fresh_ask < signal_ask * (1.0 - max_drop_pct)
 
 
-def edge_exceeds_cap(edge: float | None, max_edge: float) -> bool:
-    """BP51 edge corridor (ceiling side; the floor lives in the shadow signal
-    filter). A model-market divergence ABOVE the cap flips from opportunity to
-    warning: over the full shadow history the market out-knew the model on
-    every 10%+ edge slice (-$134 in t60-90) while 7-8% stayed profitable in
-    all five weeks. Fails open on a missing edge — the publisher always sends
-    one, and the floor is enforced upstream."""
-    if edge is None:
-        return False
-    return edge >= max_edge
+def cal_edge_ok(cal_edge: float | None, min_edge: float) -> bool:
+    """BP52 calibrated-edge gate (replaces the BP51 corridor, which died
+    out-of-sample). The publisher computes cal_edge from rolling-Platt-honest
+    win probability minus price minus fee; the executor re-checks it here.
+    Fails CLOSED on a missing value: a payload without cal_edge means a stale
+    shadow build, and real money must not trade on an uncalibrated claim."""
+    return cal_edge is not None and cal_edge >= min_edge
 
 
 def should_flag_stuck(window_end_ts: float, now_ts: float, threshold_sec: float) -> bool:

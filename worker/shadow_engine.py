@@ -24,12 +24,15 @@ from core.shadow_model import (
     build_entry_variants,
     calibrated_probability,
     divergence_exceeds_ceiling,
+    fit_platt,
     maker_bid_price,
     maker_fill,
     maker_should_cancel,
     passes_signal_filter,
+    platt_probability,
     probability_up,
     stressed_sigma,
+    strike_distance_bp,
     walk_order_book,
 )
 
@@ -137,6 +140,9 @@ class ShadowEngine:
         # publish per condition; in-memory — the executor's DB dedup is the
         # durable backstop across restarts).
         self.published_conditions: set[str] = set()
+        # BP52: rolling Platt coefficients (a, b), refit by calibration_loop.
+        # None until the first successful fit — publishing FAILS CLOSED.
+        self.cal_coeffs: tuple[float, float] | None = None
         self.db_retry_after = 0.0
         self.last_spot_rx_monotonic = time.monotonic()
         self._signal_tasks: set[asyncio.Task] = set()
@@ -802,13 +808,21 @@ class ShadowEngine:
             )
             # BP50: only whitelisted assets reach the real-money executor —
             # alt entries are data collection, never execution signals.
-            # BP51: edge corridor — publish only below the edge cap (floor is
-            # inside passes_signal_filter). Oversized divergence = the market
-            # knows more than the model; see CURSOR.md BP51.
+            # BP52: publish on CALIBRATED edge (replaces the BP51 raw-edge
+            # corridor and the BP30.4 raw-edge floor on this gate; both were
+            # symptoms of model overconfidence that calibration prices in).
+            # cal_edge is None until the first fit — real money fails closed.
+            cal_edge = self._calibrated_edge(
+                model_p, fill.effective_price, fill.fee_per_share
+            )
+            strike_bp = strike_distance_bp(state.price, open_price)
             if (
-                is_signal
-                and publish_window
-                and edge < settings.crypto_max_edge
+                publish_window
+                and cal_edge is not None
+                and cal_edge >= settings.shadow_cal_min_edge
+                and strike_bp is not None
+                and strike_bp >= settings.shadow_filter_min_strike_bp
+                and fill.effective_price <= settings.crypto_max_entry_price
                 and asset in settings.crypto_signal_assets
                 and market.condition_id not in self.published_conditions
             ):
@@ -833,6 +847,7 @@ class ShadowEngine:
                         "window_end": market.window_end,
                         "model_p": model_p,
                         "edge": edge,
+                        "cal_edge": cal_edge,
                         "depth_best_usdc": ask_depth_usdc(asks, best),
                         "depth_150bp_usdc": ask_depth_usdc(asks, best * 1.015),
                         "depth_300bp_usdc": ask_depth_usdc(asks, best * 1.03),
@@ -847,7 +862,7 @@ class ShadowEngine:
                 self._spawn_signal(
                     f"🎯 Сигнал: {asset.upper()} {side_label}\n"
                     f"Вход: {fill.effective_price:.3f} | Ставка: ${fill.filled_usdc:.2f}\n"
-                    f"Модель: {model_p:.0%} | Edge: {edge:+.1%}\n"
+                    f"Модель: {model_p:.0%} | Edge (кал.): {cal_edge:+.1%}\n"
                     f"Окно закрывается в {window_end_utc:%H:%M:%S} UTC"
                 )
             log.info(
@@ -864,6 +879,7 @@ class ShadowEngine:
                 depth_complete=fill.complete,
                 fee_usdc=fill.fee_usdc,
                 edge=round(edge, 6),
+                cal_edge=round(cal_edge, 6) if cal_edge is not None else None,
                 signal=is_signal,
             )
         observation.reason = (
@@ -948,31 +964,111 @@ class ShadowEngine:
             or []
         )
 
-    @staticmethod
-    def _row_is_signal(row: dict[str, Any]) -> bool:
-        """Settlement notifications must mirror the entry-side signal set.
+    # ── BP52: rolling Platt calibration ────────────────────────────────────────
 
-        BP49/BP50/BP51: entries are published from the execution-window bucket
-        (t60-90 by default), for whitelisted assets, inside the edge corridor
-        — win/loss notices key on the same variant, asset and edge band, or
-        subscribers would get results for trades they never saw open (and
-        vice versa)."""
+    def _fetch_calibration_rows(self) -> list[tuple[float, bool]]:
+        """Resolved rows of the execution variant over the trailing lookback:
+        the calibration must measure exactly the horizon it will gate."""
         exec_variant = (
             f"t{settings.crypto_signal_time_left_min_sec:g}"
             f"-{settings.crypto_signal_time_left_max_sec:g}"
         )
-        return (
-            row.get("variant") == exec_variant
-            and str(row.get("asset") or "") in settings.crypto_signal_assets
-            and float(row.get("edge") or 0) < settings.crypto_max_edge
-            and passes_signal_filter(
-                float(row.get("edge") or 0),
-                float(row.get("spot") or 0),
-                float(row.get("open_price") or 0),
-                min_edge=settings.shadow_filter_min_edge,
-                min_strike_bp=settings.shadow_filter_min_strike_bp,
+        since = datetime.now(
+            timezone.utc  # noqa: UP017 - production currently runs Python 3.10.
+        ) - timedelta(days=settings.shadow_cal_lookback_days)
+        supabase = get_supabase()
+        samples: list[tuple[float, bool]] = []
+        offset = 0
+        while True:
+            rows = (
+                supabase.table("shadow_trades")
+                .select("model_p,status")
+                .eq("variant", exec_variant)
+                .in_("status", ["win", "loss"])
+                .in_("asset", settings.crypto_signal_assets)
+                .gte("created_at", since.isoformat())
+                .order("id")
+                .range(offset, offset + 999)
+                .execute()
+                .data
+                or []
             )
+            samples += [
+                (float(r["model_p"]), r["status"] == "win")
+                for r in rows
+                if r.get("model_p") is not None
+            ]
+            if len(rows) < 1000:
+                break
+            offset += 1000
+        return samples
+
+    async def calibration_loop(self) -> None:
+        """Refit Platt coefficients every shadow_cal_refit_sec. Until the first
+        successful fit publishing fails closed (collection is unaffected)."""
+        while True:
+            try:
+                samples = await asyncio.to_thread(self._fetch_calibration_rows)
+                if len(samples) >= settings.shadow_cal_min_train_rows:
+                    coeffs = fit_platt(samples)
+                    if coeffs is not None:
+                        self.cal_coeffs = coeffs
+                        log.info(
+                            "shadow_cal_refit",
+                            a=round(coeffs[0], 4),
+                            b=round(coeffs[1], 4),
+                            n=len(samples),
+                        )
+                    else:
+                        log.warning("shadow_cal_fit_degenerate", n=len(samples))
+                else:
+                    log.warning("shadow_cal_too_few_rows", n=len(samples))
+            except Exception:
+                log.exception("shadow_cal_refit_failed")
+            await asyncio.sleep(settings.shadow_cal_refit_sec)
+
+    def _calibrated_edge(
+        self, model_p: float, eff_price: float, fee_per_share: float
+    ) -> float | None:
+        """Honest edge: calibrated probability minus price minus fee.
+        None while no coefficients are fitted (publish gate fails closed)."""
+        if self.cal_coeffs is None:
+            return None
+        a, b = self.cal_coeffs
+        return platt_probability(model_p, a, b) - eff_price - fee_per_share
+
+    def _row_is_signal(self, row: dict[str, Any]) -> bool:
+        """Settlement notifications must mirror the entry-side signal set.
+
+        BP49/BP50/BP52: entries are published from the execution-window bucket
+        (t60-90 by default), for whitelisted assets, on calibrated edge — the
+        same rule is recomputed here from the row's stored model_p/price/fee
+        so win/loss notices track what subscribers actually saw open. A refit
+        between entry and resolution can flip rows sitting exactly on the
+        threshold; that costs at most one cosmetic notice, never money."""
+        exec_variant = (
+            f"t{settings.crypto_signal_time_left_min_sec:g}"
+            f"-{settings.crypto_signal_time_left_max_sec:g}"
         )
+        if (
+            row.get("variant") != exec_variant
+            or str(row.get("asset") or "") not in settings.crypto_signal_assets
+        ):
+            return False
+        model_p = float(row.get("model_p") or 0)
+        price = float(row.get("sim_fill_price") or 0)
+        if not 0 < price <= settings.crypto_max_entry_price or not 0 < model_p < 1:
+            return False
+        strike_bp = strike_distance_bp(
+            float(row.get("spot") or 0), float(row.get("open_price") or 0)
+        )
+        if strike_bp is None or strike_bp < settings.shadow_filter_min_strike_bp:
+            return False
+        # Per-share fee is not stored directly; recover it from the identity
+        # edge = model_p - price - fee_per_share used at entry.
+        fee_ps = model_p - price - float(row.get("edge") or 0)
+        cal_edge = self._calibrated_edge(model_p, price, fee_ps)
+        return cal_edge is not None and cal_edge >= settings.shadow_cal_min_edge
 
     async def _resolve_trade(self, row: dict[str, Any], now: datetime) -> None:
         window_end = datetime.fromisoformat(str(row["window_end"]).replace("Z", "+00:00"))
@@ -1169,6 +1265,7 @@ class ShadowEngine:
             self.evaluation_loop(),
             self.resolution_loop(),
             self.digest_loop(),
+            self.calibration_loop(),
         )
 
 

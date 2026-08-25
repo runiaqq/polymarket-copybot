@@ -85,6 +85,59 @@ def calibrated_probability(model_p: float, market_price: float, lam: float) -> f
     return max(0.0, min(1.0, market_price + lam * (model_p - market_price)))
 
 
+def fit_platt(samples: list[tuple[float, bool]]) -> tuple[float, float] | None:
+    """BP52: Platt scaling — fit (a, b) so that sigmoid(a*logit(p) + b) matches
+    realized outcomes. `samples` = [(model_p, won), ...].
+
+    Newton-Raphson MLE with a light ridge; returns None when the sample is
+    degenerate (too small, single class, or a singular step). The raw model is
+    systematically overconfident (stated 90-95% realizes ~81%) and the error
+    drifts with regime, so coefficients must be refit on a trailing window,
+    never frozen."""
+    pts = [
+        (min(max(p, 1e-6), 1 - 1e-6), 1.0 if won else 0.0)
+        for p, won in samples
+        if 0.0 < p < 1.0 and math.isfinite(p)
+    ]
+    if len(pts) < 20 or len({y for _, y in pts}) < 2:
+        return None
+    a, b = 1.0, 0.0
+    for _ in range(60):
+        ga = gb = haa = hab = hbb = 0.0
+        for p, y in pts:
+            x = math.log(p / (1 - p))
+            mu = 1 / (1 + math.exp(-max(min(a * x + b, 30), -30)))
+            err = y - mu
+            var = mu * (1 - mu)
+            ga += err * x
+            gb += err
+            haa -= var * x * x
+            hab -= var * x
+            hbb -= var
+        ga -= 1e-3 * a
+        gb -= 1e-3 * b
+        haa -= 1e-3
+        hbb -= 1e-3
+        det = haa * hbb - hab * hab
+        if abs(det) < 1e-12:
+            return None
+        # Newton ascent on log-likelihood: solve H d = -g, then w += d.
+        da = (-ga * hbb + gb * hab) / det
+        db = (-gb * haa + ga * hab) / det
+        a += da
+        b += db
+        if max(abs(da), abs(db)) < 1e-9:
+            break
+    return (a, b) if math.isfinite(a) and math.isfinite(b) else None
+
+
+def platt_probability(model_p: float, a: float, b: float) -> float:
+    """Calibrated win probability under fitted Platt coefficients."""
+    p = min(max(model_p, 1e-6), 1 - 1e-6)
+    z = a * math.log(p / (1 - p)) + b
+    return 1 / (1 + math.exp(-max(min(z, 30), -30)))
+
+
 def divergence_exceeds_ceiling(model_p: float, market_price: float, ceiling: float) -> bool:
     """Return whether model probability is too far above execution price."""
     return model_p - market_price > ceiling

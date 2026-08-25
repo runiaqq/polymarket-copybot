@@ -550,16 +550,19 @@ class Settings(BaseSettings):
     # Alts are data-collection only until a per-asset model is validated on
     # a real sample (enforced both at publish and in the executor).
     crypto_signal_assets: list[str] = Field(default_factory=lambda: ["btc"])
-    # BP51 edge corridor: signals publish only when edge < this cap (the floor
-    # is shadow_filter_min_edge). Counter-intuitive but robust across the FULL
-    # two-month shadow history: in t60-90, edge 7-8% made +$134.53 / 143 trades
-    # (WR 87.4%) and was positive ALL five ISO weeks incl. the toxic W34
-    # (+$32.02), while 10%+ lost -$134. Mechanism: a huge model-market gap
-    # usually means the MARKET knows something the model doesn't (adverse
-    # selection against an overconfident model), a moderate gap is genuine
-    # mispricing. Both corridor halves are independently positive (7-7.5%:
-    # +$46.69, 7.5-8%: +$87.84), so it is not one lucky sliver.
-    crypto_max_edge: float = 0.08
+    # BP52 rolling calibration (replaces the BP51 edge corridor, which died
+    # out-of-sample: -$59.51 in its first fully live week W35). The raw model
+    # is systematically overconfident and the error drifts with regime, so the
+    # engine refits Platt coefficients on a trailing window and publishes only
+    # entries whose CALIBRATED edge (honest win probability minus price minus
+    # fee) clears the bar. Walk-forward replay 08-05..25: +$37.89/55 (WR 85.5%)
+    # at the 0.02 bar with EVERY week positive incl. W35 (+$10.42) where both
+    # the raw rule (-$192) and the corridor (-$59.51) bled. Lookback 21d beat
+    # 14d (-$24.85) and matched 28d; daily refit beat weekly (+$42.61).
+    shadow_cal_lookback_days: float = 21.0
+    shadow_cal_refit_sec: float = 21600.0  # 6h — between tested daily/weekly
+    shadow_cal_min_edge: float = 0.02
+    shadow_cal_min_train_rows: int = 200
     # Stop trading for the day when realized PnL <= -(mult × stake).
     # BP45 tried 2.0 and REVERTED to 3.0 the same day: full-sequence replay
     # showed a normal day routinely troughs at ~-$30 (two $15 losses) and
