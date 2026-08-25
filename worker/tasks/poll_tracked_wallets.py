@@ -93,9 +93,13 @@ def poll_tracked_wallets() -> dict:
     wallets = list_tracked_wallets()
     if not wallets:
         return {"skipped": "no_tracked_wallets"}
+    # BP48.2: no early return on empty/broke subscribers — probation recording
+    # (mode='candidate') is pure data collection and must not depend on user
+    # balances. Seen live 08-21..25: both subscribers dropped below $1, the poll
+    # bailed at the eligibility gate every cycle, and candidates recorded ZERO
+    # probation signals in 4 days while actively trading. Default donors are
+    # still skipped when nobody can copy (their dispatch semantics unchanged).
     subscribers = get_active_subscribers()
-    if not subscribers:
-        return {"skipped": "no_subscribers"}
 
     fast = get_fast_markets()
     sb = get_supabase()
@@ -145,7 +149,6 @@ def poll_tracked_wallets() -> dict:
     user_ids = [u["id"] for u in eligible_users]
     if not user_ids:
         log.info("poll_no_eligible_users", total_subs=len(subscribers))
-        return {"dispatched": 0, "skipped_no_balance": len(subscribers)}
 
     # ── Per-wallet fill collection → Redis accumulator ────────────────────────
     for w in wallets:
@@ -162,6 +165,11 @@ def poll_tracked_wallets() -> dict:
         if mode not in ("default", "candidate"):
             continue
         is_candidate = mode == "candidate"
+        # BP48.2: with nobody able to copy, polling a default donor is pointless
+        # (and recording its signal would burn the reentry dedup on a trade no
+        # one received). Candidates poll regardless: probation is record-only.
+        if not user_ids and not is_candidate:
+            continue
         # BP42: loss-streak circuit breaker — donor is on a cooldown.
         if donor_is_paused(w.get("paused_until"), now):
             log.debug("tracked_wallet_paused", wallet=addr[:10],

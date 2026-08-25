@@ -7071,3 +7071,32 @@ BP50 exists for silently stops growing, and nothing alerts.
   silent starvation. EWMA/vol state lives outside the connection loop
   and survives reconnects; alts still need vol warm-up after first
   ticks arrive.
+
+## Blueprint 48.2: probation must not depend on user balances (2026-08-25)
+
+### Why
+
+Weekly scout digest arrived with "нет резолвов" / PnL $0 for every
+probation candidate. Candidates were trading heavily ($1-4k Dota buys,
+16 buys/4d for one wallet), thresholds/market filters all passed, yet
+trade_signals had ZERO probation rows ever. Server logs showed the
+cause: both copytrade subscribers were below the $1 exchange minimum,
+so poll_tracked_wallets early-returned `poll_no_eligible_users` every
+cycle — BEFORE the per-wallet loop. Shadow probation (record-only,
+BP48) was silently coupled to live users having money.
+
+### Change
+
+- Removed the two early returns (`no_subscribers`, empty eligible set)
+  in poll_tracked_wallets. The poll now always walks the wallet list.
+- Default donors are skipped per-wallet when `user_ids` is empty:
+  nobody can copy, and recording a signal would burn the reentry dedup
+  on a trade no user received (dispatch semantics unchanged).
+- mode='candidate' wallets poll regardless — probation signals are pure
+  data collection.
+
+### Lesson
+
+Any "record-only" pipeline must be audited for hidden gates shared with
+the money path. The BP48 probation path was correct in isolation and
+dead in production for 4 days because of a gate 200 lines upstream.
