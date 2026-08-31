@@ -7176,3 +7176,13 @@ regime shifts. Note for the record: the study initially "proved" no
 edge exists anywhere — a sign error in the hand-rolled Newton step had
 the fit converging to the WORST coefficients. Sanity-check calibration
 outputs against base rates before believing conclusions.
+
+### BP52.1 hotfix (2026-08-31): dropped win/loss notices
+
+Live 08-25..31: entry signals arrived, outcome notices never did.
+`_row_is_signal` (BP52) recomputes calibrated edge from the resolution
+rows, but the `_open_trades` select was missing `model_p` — it read as
+0 and every notice was dropped. Fixed the select + regression test that
+asserts every `_row_is_signal` input column is selected. Lesson: when a
+filter's inputs come from a DB projection, the projection is part of
+the filter — test them together.
