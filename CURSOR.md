@@ -7186,3 +7186,56 @@ rows, but the `_open_trades` select was missing `model_p` — it read as
 asserts every `_row_is_signal` input column is selected. Lesson: when a
 filter's inputs come from a DB projection, the projection is part of
 the filter — test them together.
+
+## Blueprint 53 (2026-08-31) — donor scout retro-scoring
+
+Week one of BP48 probation produced zeros for 4/5 candidates: three
+wallets went quiet before the BP48.2 fix even landed, one traded a
+non-copyable universe, and the only active one (scout 0xd4fa) was a
+favorite-buyer whose would-be PnL was -$39.49 despite an 86% win rate.
+Live probation answers "is this wallet good" in a week — and only if
+the wallet keeps trading. The Data API answers it in minutes: a
+wallet's whole BUY history is public.
+
+Mechanics (`core/donor_scout.py` + `worker/tasks/donor_scout.py`):
+
+- `fetch_wallet_buys`: paginated Data-API pull of a wallet's own BUYs
+  over `scout_retro_days` (30d), capped at `scout_retro_max_trades`.
+- `retro_score`: would-be copy PnL at the nominal $15 stake against
+  CLOB resolutions, plus median entry price (the favorite-buyer
+  fingerprint that win-rate ranking rewards and PnL ranking punishes).
+- Nightly `score_donor_candidates` retro-scores the qualifying pool
+  (capped `scout_retro_pool_cap=15`/night; one shared resolve pass,
+  `scout_retro_max_markets=120` per wallet) and stores retro_* columns
+  (migration `029_scout_retro.sql`).
+- Probation enrollment gate flipped: seats go ONLY to wallets with
+  `retro_resolved >= 10` and `retro_pnl > 0`, ranked by retro PnL.
+  Probation is demoted to live confirmation of a positive retro verdict.
+- Digest shows each candidate's retro line + a "скамейка" of
+  retro-positive wallets waiting for seats. `scout_min_sightings` 5 → 3
+  (wider pool costs API calls, not seats).
+- 08-31 cleanup: the empty first batch removed from probation; 0xd4fa
+  dismissed, the four quiet ones reset to 'new' for fair retro re-judging.
+
+## Blueprint 54 (2026-08-31) — crypto entry window 60-90 → 30-60
+
+Under the BP52 calibrated rule the walk-forward window ranking flipped
+vs the BP49 raw-edge era: t30-60 +$23.84/66 (WR 86.4%) since 08-10 and
+8/8 +$15.65 since the BP52 deploy, while t60-90 decayed to +$3.29/43
+overall and -$19.46/8 post-deploy (only expensive 0.87-0.89 clips were
+passing, where a win pays +$1.7 and a loss costs -$15). One config
+change (`crypto_signal_time_left_min/max_sec` 30/60): the calibration
+fit, publish gate and notice filter all derive the exec variant from
+these settings. Caveat: FAK latency bites harder 30-60s from close —
+real fills may run worse than the shadow sim; watch the first live week.
+
+## Blueprint 55 (2026-08-31) — alt data firehose
+
+10 days of BP50 collection yielded only 46-77 resolved rows per alt
+(9-14 in the exec window) — months away from per-asset models. Now
+`shadow_alt_min_edge=-1.0` (every alt window with a valid book records,
+all variants) and the model-divergence ceiling is BTC-only: for alts a
+big model/market gap is exactly the training data a future per-asset
+model needs. Expected volume ~1700 rows/asset/day across variants →
+a week gives model-grade samples per alt per variant. Publishing is
+untouched: whitelist (`crypto_signal_assets=[btc]`) + calibrated gate.

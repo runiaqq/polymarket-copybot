@@ -6,6 +6,7 @@ from core.donor_scout import (
     candidate_qualifies,
     laplace_score,
     probation_pnl,
+    retro_score,
     tally_outcomes,
 )
 
@@ -108,3 +109,38 @@ class TestProbationPnl:
         signals = [{"market_id": "0xaaa", "outcome": "Yes", "price": 0.0}]
         st = probation_pnl(signals, self.WINNERS, stake=15.0)
         assert st["resolved"] == 0 and st["pnl"] == 0.0
+
+
+class TestRetroScore:
+    """BP53: replaying a wallet's own BUY history against resolutions."""
+
+    WINNERS = {"0xaaa": "yes", "0xbbb": "no"}
+
+    def test_pnl_and_median_price(self):
+        buys = [
+            {"condition_id": "0xaaa", "outcome": "Yes", "price": 0.5},  # +15
+            {"condition_id": "0xbbb", "outcome": "Yes", "price": 0.75},  # -15
+            {"condition_id": "0xccc", "outcome": "Yes", "price": 0.9},  # open
+        ]
+        st = retro_score(buys, self.WINNERS, stake=15.0)
+        assert st["trades"] == 3
+        assert st["resolved"] == 2 and st["wins"] == 1
+        assert st["pnl"] == 0.0
+        assert st["median_price"] == 0.75
+
+    def test_favorite_buyer_high_wr_negative_pnl(self):
+        # The scout 0xd4fa fingerprint: 4 wins at 0.93 don't cover one loss.
+        winners = {f"0x{i}": "up" for i in range(4)} | {"0x9": "down"}
+        buys = [
+            {"condition_id": f"0x{i}", "outcome": "Up", "price": 0.93}
+            for i in range(4)
+        ] + [{"condition_id": "0x9", "outcome": "Up", "price": 0.93}]
+        st = retro_score(buys, winners, stake=15.0)
+        assert st["wins"] == 4 and st["resolved"] == 5
+        assert st["pnl"] < 0  # PnL ranking punishes what WR ranking rewards
+        assert st["median_price"] == 0.93
+
+    def test_empty_history(self):
+        st = retro_score([], self.WINNERS, stake=15.0)
+        assert st == {"trades": 0, "resolved": 0, "wins": 0, "pnl": 0.0,
+                      "median_price": None}

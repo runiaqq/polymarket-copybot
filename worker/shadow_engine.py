@@ -720,7 +720,10 @@ class ShadowEngine:
             observation.best_edge = edge
             observation.model_p = model_p
             observation.ask = fill.best_ask
-        if divergence_exceeds_ceiling(
+        # BP55: the divergence ceiling protects SIGNAL quality, which is
+        # BTC-only — for alts a big model/market gap is exactly the data a
+        # future per-asset model needs, so their recording skips this gate.
+        if asset == "btc" and divergence_exceeds_ceiling(
             model_p,
             fill.effective_price,
             settings.shadow_max_model_divergence,
@@ -796,11 +799,11 @@ class ShadowEngine:
             inserted_any = True
             observation.entered = True
             observation.entered_variants.add(variant_name)
-            # BP49: the executor feed fires only inside the profitable entry
-            # window (60-90s to close; every earlier/later bucket is negative
-            # over the whole real-money era — see CURSOR.md BP49). Collection
-            # is untouched: all variants keep recording, so the wide 'full'
-            # stream still feeds the BP45 WR gate and future re-analysis.
+            # BP49/BP54: the executor feed fires only inside the configured
+            # entry window (30-60s to close since BP54 — the best calibrated
+            # bucket; see CURSOR.md). Collection is untouched: all variants
+            # keep recording, so the wide 'full' stream still feeds the BP45
+            # WR gate and future re-analysis.
             publish_window = (
                 settings.crypto_signal_time_left_min_sec
                 <= time_left

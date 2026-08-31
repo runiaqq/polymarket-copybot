@@ -286,7 +286,12 @@ class Settings(BaseSettings):
     # 18-26 resolved rows per alt (~0.7/day) — three orders of magnitude short
     # of model-fitting material. Shadow-only: real-money publishing is gated
     # to crypto_signal_assets regardless of what the shadow records.
-    shadow_alt_min_edge: float = 0.02
+    # BP55 (08-31): bar dropped to "record everything" — 10 days at 0.02
+    # yielded only 46-77 resolved rows per alt, months away from per-asset
+    # models. Negative bar = every alt window with a valid book is recorded
+    # (the model-divergence ceiling is also BTC-only now). Publishing is
+    # still whitelist+calibration gated, so this is pure data collection.
+    shadow_alt_min_edge: float = -1.0
     shadow_max_price: float = 0.95
     shadow_stake_usdc: float = 15.0
     shadow_window_sec: int = 300
@@ -396,7 +401,18 @@ class Settings(BaseSettings):
     scout_min_trade_usdc: float = 200.0
     # Sightings in 14d required before a wallet is worth scoring (one Data-API
     # pull per candidate per night — keep the pool tight).
-    scout_min_sightings: int = 5
+    # BP53: lowered 5 → 3; retro-scoring judges wallets on their own 30d
+    # history, so a wide pool costs API calls, not probation seats.
+    scout_min_sightings: int = 3
+    # BP53 retro-scoring: a sighting only tells us WHERE we met a wallet; the
+    # verdict comes from replaying its own recent BUY history against market
+    # resolutions — would-be copy PnL computed in minutes instead of a week
+    # of live probation showing zeros for wallets that went quiet.
+    scout_retro_days: float = 30.0
+    scout_retro_max_trades: int = 600  # Data-API pages of 500, cap the pull
+    scout_retro_max_markets: int = 120  # CLOB resolve calls per wallet cap
+    scout_retro_min_resolved: int = 10  # below this the PnL is luck, not skill
+    scout_retro_pool_cap: int = 15  # wallets retro-scored per nightly run
     # Max concurrent probation seats (mode='candidate' tracked wallets).
     scout_probation_slots: int = 5
     # Nominal stake for would-be PnL in probation reports (mirrors the typical
@@ -541,11 +557,16 @@ class Settings(BaseSettings):
     # t30-60 -$79, t20-30 -$13; real trades agree (60-90s: +$42.91/45 vs
     # 90-120s: -$90.38/246). Mechanism: at 90-120s the model pays a high ask
     # for its least reliable horizon; at 60-90s the same price buys a
-    # markedly sharper forecast. Late-edge t30-60 entries are ALSO negative
-    # (-$52/142), so the window closes at 60s, not 30s. Shadow collection is
-    # NOT affected — all variants keep recording the wide window.
-    crypto_signal_time_left_min_sec: float = 60.0
-    crypto_signal_time_left_max_sec: float = 90.0
+    # markedly sharper forecast. Shadow collection is NOT affected — all
+    # variants keep recording the wide window.
+    # BP54 (08-31): window moved 60-90 → 30-60. Under the BP52 calibrated
+    # rule the walk-forward ranking flipped: t30-60 +$23.84/66 (WR 86.4%)
+    # since 08-10 and 8/8 +$15.65 since the BP52 deploy, while t60-90 decayed
+    # to +$3.29/43 (and -$19.46/8 post-deploy). The BP49 numbers above were
+    # RAW-edge era; with calibration the sharper 30-60s horizon wins. The
+    # calibration fit follows this setting automatically (exec_variant).
+    crypto_signal_time_left_min_sec: float = 30.0
+    crypto_signal_time_left_max_sec: float = 60.0
     # BP50: assets the shadow engine may hand to the real-money executor.
     # Alts are data-collection only until a per-asset model is validated on
     # a real sample (enforced both at publish and in the executor).

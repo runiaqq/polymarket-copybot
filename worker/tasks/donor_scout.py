@@ -114,8 +114,10 @@ def score_donor_candidates() -> dict:
     from core.db import add_tracked_wallet, get_supabase, list_tracked_wallets
     from core.donor_scout import (
         candidate_qualifies,
+        fetch_wallet_buys,
         laplace_score,
         resolve_winning_outcomes,
+        retro_score,
         tally_outcomes,
     )
     from core.wallet_discovery import _activity_profile
@@ -145,12 +147,16 @@ def score_donor_candidates() -> dict:
                  wallets_seen=len(by_wallet))
         return {"scored": 0}
 
-    all_conds = [s["condition_id"] for ss in pool.values() for s in ss]
-    winners = resolve_winning_outcomes(all_conds)
+    # BP53: retro-scoring replays each qualifying wallet's own 30d BUY
+    # history against market resolutions — the verdict arrives tonight, not
+    # after a week of probation zeros. Cap the pool by sighting count: each
+    # wallet costs one history pull + up to scout_retro_max_markets resolves.
+    ranked = sorted(pool.items(), key=lambda kv: len(kv[1]), reverse=True)
+    ranked = ranked[: settings.scout_retro_pool_cap]
 
-    scored = 0
-    now_iso = datetime.now(timezone.utc).isoformat()
-    for wallet, ss in pool.items():
+    profiles: dict[str, tuple[dict, bool, str]] = {}
+    retro_buys: dict[str, list[dict]] = {}
+    for wallet, _ss in ranked:
         profile = _activity_profile(wallet)
         time.sleep(0.05)  # Data-API politeness between per-wallet pulls
         ok, reason = candidate_qualifies(
@@ -160,9 +166,39 @@ def score_donor_candidates() -> dict:
             min_avg_trade_size=settings.discovery_min_avg_trade_size,
             max_event_outcomes=settings.discovery_max_event_outcomes,
         )
+        profiles[wallet] = (profile, ok, reason)
+        if ok:
+            retro_buys[wallet] = fetch_wallet_buys(
+                wallet,
+                days=settings.scout_retro_days,
+                max_trades=settings.scout_retro_max_trades,
+            )
+
+    # One resolve pass over the union: sighted markets + each wallet's most
+    # recent retro markets (per-wallet cap keeps CLOB calls bounded).
+    all_conds = [s["condition_id"] for _, ss in ranked for s in ss]
+    for buys in retro_buys.values():
+        seen: list[str] = []
+        for b in buys:  # buys arrive newest-first from the Data API
+            c = b["condition_id"]
+            if c and c not in seen:
+                seen.append(c)
+            if len(seen) >= settings.scout_retro_max_markets:
+                break
+        all_conds += seen
+    winners = resolve_winning_outcomes(all_conds)
+
+    scored = 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for wallet, ss in ranked:
+        profile, ok, reason = profiles[wallet]
         resolved, wins = tally_outcomes(ss, winners)
         volume = sum(float(s.get("size_usdc") or 0) for s in ss)
         score = laplace_score(wins, resolved) if ok else 0.0
+        retro = retro_score(
+            retro_buys.get(wallet, []), winners,
+            settings.scout_probation_stake_usdc,
+        )
         payload = {
             "wallet": wallet,
             "sightings_14d": len(ss),
@@ -174,6 +210,11 @@ def score_donor_candidates() -> dict:
             "trades_per_day": profile.get("trades_per_day"),
             "is_mm": not ok,
             "score": round(score, 4),
+            "retro_trades": retro["trades"],
+            "retro_resolved": retro["resolved"],
+            "retro_wins": retro["wins"],
+            "retro_pnl": retro["pnl"],
+            "retro_median_price": retro["median_price"],
             "updated_at": now_iso,
         }
         try:
@@ -196,7 +237,12 @@ def score_donor_candidates() -> dict:
 
 def _enroll_probation(sb, add_tracked_wallet, list_tracked_wallets) -> int:
     """Fill free probation seats with the best fresh candidates. Only
-    status='new' rows are eligible — a dismissed wallet stays dismissed."""
+    status='new' rows are eligible — a dismissed wallet stays dismissed.
+
+    BP53: the gate is retro-scoring, not sighting win-rate — a seat goes only
+    to a wallet whose OWN 30d history would have been profitable to copy on a
+    real sample (>= scout_retro_min_resolved resolved markets). Probation is
+    demoted to a live confirmation of an already-positive retro verdict."""
     seats = settings.scout_probation_slots - sum(
         1 for w in list_tracked_wallets()
         if (w.get("mode") or "default") == "candidate"
@@ -206,11 +252,12 @@ def _enroll_probation(sb, add_tracked_wallet, list_tracked_wallets) -> int:
     try:
         rows = (
             sb.table("donor_candidates")
-            .select("wallet,score,resolved_count")
+            .select("wallet,score,retro_pnl,retro_resolved")
             .eq("status", "new")
             .eq("is_mm", False)
-            .gt("resolved_count", 0)
-            .order("score", desc=True)
+            .gte("retro_resolved", settings.scout_retro_min_resolved)
+            .gt("retro_pnl", 0)
+            .order("retro_pnl", desc=True)
             .limit(seats)
             .execute()
             .data or []
@@ -228,7 +275,7 @@ def _enroll_probation(sb, add_tracked_wallet, list_tracked_wallets) -> int:
             ).eq("wallet", r["wallet"]).execute()
             enrolled += 1
             log.info("probation_enrolled", wallet=r["wallet"][:10],
-                     score=r["score"])
+                     retro_pnl=r["retro_pnl"], retro_resolved=r["retro_resolved"])
         except Exception:
             log.exception("probation_enroll_failed", wallet=r["wallet"][:10])
     return enrolled
@@ -303,10 +350,27 @@ def donor_scout_digest() -> dict:
                                settings.scout_probation_stake_usdc)
             wr = (f"{st['wins']}/{st['resolved']}"
                   if st["resolved"] else "нет резолвов")
+            # BP53: probation zeros are ambiguous (quiet wallet vs no data);
+            # the retro verdict from the wallet's own history disambiguates.
+            retro_line = ""
+            try:
+                rc = (
+                    sb.table("donor_candidates")
+                    .select("retro_resolved,retro_wins,retro_pnl")
+                    .eq("wallet", addr).limit(1).execute().data or []
+                )
+                if rc and rc[0].get("retro_resolved"):
+                    r = rc[0]
+                    retro_line = (
+                        f"\n   ретро 30д: {r['retro_wins']}/{r['retro_resolved']}"
+                        f" | PnL: ${float(r['retro_pnl'] or 0):+.2f}"
+                    )
+            except Exception:
+                log.warning("digest_retro_fetch_failed", wallet=addr[:10])
             lines.append(
                 f"\n🧪 <b>{label}</b>\n<code>{addr}</code>\n"
                 f"   сигналов: {st['signals']} | исход: {wr} | "
-                f"PnL: <b>${st['pnl']:+.2f}</b>"
+                f"PnL: <b>${st['pnl']:+.2f}</b>{retro_line}"
             )
             keyboard.append([
                 {"text": f"✅ В бой: {label[:16]}", "callback_data": f"dc:p:{addr}"},
@@ -314,6 +378,33 @@ def donor_scout_digest() -> dict:
             ])
     else:
         lines.append("\nНа обкатке никого нет — скаут ищет кандидатов.")
+
+    # BP53: the retro bench — profitable-by-history wallets waiting for a
+    # seat, so the admin sees the pipeline even when probation is full.
+    try:
+        bench = (
+            sb.table("donor_candidates")
+            .select("wallet,retro_resolved,retro_wins,retro_pnl")
+            .eq("status", "new")
+            .eq("is_mm", False)
+            .gte("retro_resolved", settings.scout_retro_min_resolved)
+            .gt("retro_pnl", 0)
+            .order("retro_pnl", desc=True)
+            .limit(5)
+            .execute()
+            .data or []
+        )
+    except Exception:
+        bench = []
+    if bench:
+        lines.append("\n📋 <b>Скамейка</b> (ретро 30д, ждут места):")
+        for r in bench:
+            w = r["wallet"]
+            lines.append(
+                f"   <code>{w[:6]}…{w[-4:]}</code> "
+                f"{r['retro_wins']}/{r['retro_resolved']} "
+                f"| ${float(r['retro_pnl'] or 0):+.2f}"
+            )
 
     # Retirement hints for live donors: signals are the donor's pulse; a
     # 14d-silent donor blocks nothing but deserves a look. Never auto-removed.

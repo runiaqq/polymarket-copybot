@@ -98,6 +98,96 @@ def probation_pnl(
             "pnl": round(pnl, 2)}
 
 
+def retro_score(buys: list[dict], winners: dict[str, str], stake: float) -> dict:
+    """BP53: would-be result of having copied a wallet's own BUY fills at a
+    nominal fixed stake — the instant replacement for a week of live probation.
+    Uses the wallet's fill price (close to what a fast copy would get on these
+    fast markets). Also reports the median entry price: a 0.90+ median is the
+    favorite-buyer fingerprint (scout 0xd4fa: 86% WR, negative PnL) that a
+    win-rate ranking rewards and a PnL ranking correctly punishes."""
+    trades = len(buys)
+    resolved = wins = 0
+    pnl = 0.0
+    prices: list[float] = []
+    for b in buys:
+        price = float(b.get("price") or 0)
+        if 0 < price < 1:
+            prices.append(price)
+        win_outcome = winners.get(b.get("condition_id") or "")
+        outcome = (b.get("outcome") or "").strip().lower()
+        if not win_outcome or not outcome or not 0 < price < 1:
+            continue
+        resolved += 1
+        if outcome == win_outcome:
+            wins += 1
+            pnl += stake * (1 / price - 1)
+        else:
+            pnl -= stake
+    prices.sort()
+    median_price = prices[len(prices) // 2] if prices else None
+    return {
+        "trades": trades,
+        "resolved": resolved,
+        "wins": wins,
+        "pnl": round(pnl, 2),
+        "median_price": median_price,
+    }
+
+
+def fetch_wallet_buys(
+    addr: str, *, days: float, max_trades: int
+) -> list[dict]:
+    """BP53: a wallet's recent BUY fills from the public Data API — its whole
+    tradable history, not just the slice that crossed our tape. Paginated;
+    returns [{condition_id, outcome, price, size_usdc, timestamp}]. Empty on
+    any error: the scout treats an unreadable wallet as unscoreable, never
+    crashes."""
+    import time as _time
+
+    import httpx
+
+    cutoff = _time.time() - days * 86400
+    out: list[dict] = []
+    offset = 0
+    try:
+        with httpx.Client(headers=_H, timeout=15.0) as client:
+            while offset < max_trades:
+                r = client.get(
+                    "https://data-api.polymarket.com/trades",
+                    params={"user": addr, "limit": 500, "offset": offset},
+                )
+                r.raise_for_status()
+                raw = r.json()
+                if not isinstance(raw, list):
+                    raw = raw.get("data", []) if isinstance(raw, dict) else []
+                if not raw:
+                    break
+                stop = False
+                for t in raw:
+                    ts = int(t.get("timestamp") or 0)
+                    if ts and ts < cutoff:
+                        stop = True
+                        break
+                    if str(t.get("side") or "").upper() != "BUY":
+                        continue
+                    price = float(t.get("price") or 0)
+                    out.append({
+                        "condition_id": t.get("conditionId") or "",
+                        "outcome": t.get("outcome") or "",
+                        "price": price,
+                        "size_usdc": round(float(t.get("size") or 0) * price, 2),
+                        "timestamp": ts,
+                    })
+                if stop or len(raw) < 500:
+                    break
+                offset += 500
+                _time.sleep(0.1)
+    except Exception:
+        log.warning("retro_history_fetch_failed", wallet=addr[:10])
+        return []
+    return out
+
+
 def resolve_winning_outcomes(condition_ids: list[str]) -> dict[str, str]:
     """Resolve markets via CLOB /markets/{condition_id}: {condition_id:
     winning outcome name (lowercase)}. Unresolved / unknown markets are
