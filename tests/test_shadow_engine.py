@@ -70,6 +70,18 @@ def test_insert_trade_allows_another_variant_for_same_condition(monkeypatch) -> 
     assert table.inserted_payloads == [payload]
 
 
+def test_open_trades_selects_every_row_is_signal_column() -> None:
+    """BP52 regression: _row_is_signal recomputes calibrated edge from the
+    resolution-loop rows. Live bug 08-25..31: model_p was missing from the
+    _open_trades select, so every win/loss notice was silently dropped."""
+    import inspect
+
+    src = inspect.getsource(shadow_engine.ShadowEngine._open_trades)
+    for col in ("model_p", "sim_fill_price", "edge", "spot", "open_price",
+                "variant", "asset"):
+        assert col in src, f"_open_trades select is missing {col}"
+
+
 class TestSilentAssets:
     """BP50.1: per-asset spot silence watchdog (btc flowing must not mask
     starved alt subscriptions)."""

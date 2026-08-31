@@ -953,9 +953,12 @@ class ShadowEngine:
             get_supabase()
             .table("shadow_trades")
             .select(
+                # model_p is load-bearing since BP52: _row_is_signal recomputes
+                # the calibrated edge from it — without it every win/loss
+                # notice is silently dropped (live bug 08-25..31).
                 "id,condition_id,token_id,window_end,sim_shares,"
                 "stake_usdc,fee_usdc,asset,side,sim_fill_price,variant,"
-                "edge,spot,open_price"
+                "edge,spot,open_price,model_p"
             )
             .eq("status", "open")
             .order("window_end")
